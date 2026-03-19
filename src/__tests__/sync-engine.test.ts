@@ -1,0 +1,1735 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// vi.hoisted() runs before imports and vi.mock factories — no TDZ errors.
+const {
+  mockRequestUrl,
+  mockEncode,
+  mockDecode,
+  mockCreateDocument,
+  mockDocInstance,
+  MockWebSocket,
+  mockWsInstance,
+  mockVault,
+  mockAdapter,
+  MockMarkdownView,
+} = vi.hoisted(() => {
+  const mockDocInstance = {
+    get_text: vi.fn().mockReturnValue(''),
+    insert_text: vi.fn(),
+    delete_text: vi.fn(),
+    export_snapshot: vi.fn().mockReturnValue(new Uint8Array(64)),
+    import_snapshot: vi.fn(),
+    sync_from_disk: vi.fn(),
+    version: vi.fn().mockReturnValue(0),
+    text_matches: vi.fn().mockReturnValue(false),
+    export_vv_json: vi.fn().mockReturnValue('{}'),
+    export_delta_since_vv_json: vi.fn().mockReturnValue(new Uint8Array(32)),
+    import_and_diff: vi.fn().mockReturnValue(''),
+  };
+
+  const mockRequestUrl = vi.fn().mockResolvedValue({
+    json: { token: 'test-token' },
+  });
+
+  const mockEncode = vi.fn().mockImplementation((obj: unknown) =>
+    new TextEncoder().encode(JSON.stringify(obj))
+  );
+
+  const mockDecode = vi.fn();
+  const mockCreateDocument = vi.fn().mockReturnValue(mockDocInstance);
+
+  const mockWsInstance = {
+    readyState: 1, // OPEN
+    binaryType: '',
+    send: vi.fn(),
+    close: vi.fn(),
+    onopen: null as ((ev: Event) => void) | null,
+    onmessage: null as ((ev: MessageEvent) => void) | null,
+    onclose: null as ((ev: CloseEvent) => void) | null,
+    onerror: null as ((ev: Event) => void) | null,
+  };
+
+  const MockWebSocket = vi.fn(function () {
+    return mockWsInstance;
+  });
+  (MockWebSocket as any).OPEN = 1;
+  (MockWebSocket as any).CONNECTING = 0;
+  (MockWebSocket as any).CLOSING = 2;
+  (MockWebSocket as any).CLOSED = 3;
+
+  const mockAdapter = {
+    exists: vi.fn().mockResolvedValue(false),
+    readBinary: vi.fn().mockResolvedValue(new ArrayBuffer(0)),
+    writeBinary: vi.fn().mockResolvedValue(undefined),
+    mkdir: vi.fn().mockResolvedValue(undefined),
+    remove: vi.fn().mockResolvedValue(undefined),
+    list: vi.fn().mockResolvedValue({ files: [], folders: [] }),
+  };
+
+  const mockVault = {
+    adapter: mockAdapter,
+    getMarkdownFiles: vi.fn().mockReturnValue([]),
+    read: vi.fn().mockResolvedValue(''),
+    modify: vi.fn().mockResolvedValue(undefined),
+    create: vi.fn().mockResolvedValue(undefined),
+    createFolder: vi.fn().mockResolvedValue(undefined),
+    getAbstractFileByPath: vi.fn().mockReturnValue(null),
+    trash: vi.fn().mockResolvedValue(undefined),
+    on: vi.fn(),
+  };
+
+  class MockMarkdownView {}
+
+  return {
+    mockRequestUrl,
+    mockEncode,
+    mockDecode,
+    mockCreateDocument,
+    mockDocInstance,
+    MockWebSocket,
+    mockWsInstance,
+    mockVault,
+    mockAdapter,
+    MockMarkdownView,
+  };
+});
+
+vi.mock('obsidian', () => ({
+  requestUrl: mockRequestUrl,
+  App: vi.fn(),
+  TFile: vi.fn(),
+  MarkdownView: MockMarkdownView,
+  normalizePath: (p: string) => p,
+}));
+
+vi.mock('@msgpack/msgpack', () => ({
+  encode: mockEncode,
+  decode: mockDecode,
+}));
+
+vi.mock('../wasm-bridge', () => ({
+  createDocument: mockCreateDocument,
+}));
+
+vi.stubGlobal('WebSocket', MockWebSocket);
+
+import { SyncEngine } from '../sync-engine';
+import { TFile, MarkdownView } from 'obsidian';
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+const makeSettings = (overrides: Record<string, unknown> = {}) => ({
+  serverUrl: 'http://localhost:3737',
+  serverPassword: 'test-server-password',
+  apiKey: 'test-api-key',
+  peerId: 'peer-test',
+  vaultId: 'vault-abc',
+  debounceMs: 300,
+  syncOnStartup: true,
+  ...overrides,
+});
+
+const makeApp = (leaves: any[] = []) =>
+  ({
+    vault: mockVault,
+    workspace: {
+      on: vi.fn(),
+      iterateAllLeaves: vi.fn((cb: (leaf: any) => void) => {
+        for (const leaf of leaves) cb(leaf);
+      }),
+    },
+  }) as any;
+
+/** Drain the microtask queue N levels deep. */
+const flush = async (n = 10) => {
+  for (let i = 0; i < n; i++) await Promise.resolve();
+};
+
+/** Fire the WS onmessage handler with a decoded message object. */
+const fireMessage = (decoded: unknown) => {
+  mockDecode.mockReturnValueOnce(decoded);
+  mockWsInstance.onmessage!({ data: new ArrayBuffer(4) } as MessageEvent);
+};
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe('SyncEngine', () => {
+  let engine: SyncEngine;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockWsInstance.readyState = 1;
+    mockWsInstance.onopen = null;
+    mockWsInstance.onmessage = null;
+    mockWsInstance.onclose = null;
+    mockWsInstance.onerror = null;
+    mockVault.getMarkdownFiles.mockReturnValue([]);
+    mockVault.read.mockResolvedValue('');
+    mockDocInstance.get_text.mockReturnValue('');
+    mockDocInstance.text_matches.mockReturnValue(false);
+    mockDocInstance.export_vv_json.mockReturnValue('{}');
+    mockDocInstance.export_delta_since_vv_json.mockReturnValue(new Uint8Array(32));
+    mockDocInstance.import_and_diff.mockReturnValue('');
+    mockAdapter.exists.mockResolvedValue(false);
+    mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+    engine = new SyncEngine(makeApp(), makeSettings());
+  });
+
+  // ── auth ───────────────────────────────────────────────────────────────────
+
+  describe('auth', () => {
+    it('calls /auth/verify with vault_id, api_key, and registration_key', async () => {
+      await engine.start();
+      expect(mockRequestUrl).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: 'http://localhost:3737/auth/verify',
+          method: 'POST',
+          body: JSON.stringify({ vault_id: 'vault-abc', api_key: 'test-api-key', registration_key: 'test-server-password' }),
+        })
+      );
+    });
+
+    it('opens WebSocket with token and /ws path', async () => {
+      await engine.start();
+      expect(MockWebSocket).toHaveBeenCalledWith(
+        expect.stringContaining('/ws?token=test-token')
+      );
+    });
+
+    it('converts http:// to ws:// for WS URL', async () => {
+      await engine.start();
+      const wsUrl = (MockWebSocket as any).mock.calls[0][0] as string;
+      expect(wsUrl).toMatch(/^ws:\/\//);
+    });
+
+    it('converts https:// serverUrl to wss:// for WS URL', async () => {
+      engine = new SyncEngine(
+        makeApp(),
+        makeSettings({ serverUrl: 'https://example.com' })
+      );
+      await engine.start();
+      const wsUrl = (MockWebSocket as any).mock.calls[0][0] as string;
+      expect(wsUrl).toMatch(/^wss:\/\//);
+    });
+  });
+
+  // ── initialSync — server-only doc ─────────────────────────────────────────
+
+  describe('initialSync — server-only doc', () => {
+    it('sends sync_start with null VV, receives sync_delta, writes to vault', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([]);
+      mockDocInstance.get_text.mockReturnValue('remote content');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      // doc_list
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'a.md', updated_at: '2026-03-16T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      // sync_delta response (server sends full snapshot as delta since client has no VV)
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'a.md',
+        delta: new Uint8Array(64),
+        server_vv: new TextEncoder().encode('{"12345":5}'),
+      });
+
+      await syncPromise;
+
+      expect(mockDocInstance.import_snapshot).toHaveBeenCalledWith(expect.any(Uint8Array));
+      expect(mockVault.create).toHaveBeenCalledWith('a.md', 'remote content');
+
+      // Should have sent sync_start with null client_vv
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'a.md'
+      );
+      expect(syncStartCalls.length).toBe(1);
+      expect(syncStartCalls[0][0].client_vv).toBeNull();
+    });
+  });
+
+  // ── initialSync — local-only doc ──────────────────────────────────────────
+
+  describe('initialSync — local-only doc', () => {
+    it('creates doc from disk and pushes doc_create to server', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'local.md' }]);
+      mockVault.read.mockResolvedValue('local content');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      // Server has no docs
+      fireMessage({ type: 'doc_list', docs: [], tombstones: [] });
+
+      await syncPromise;
+
+      expect(mockDocInstance.sync_from_disk).toHaveBeenCalledWith('local content');
+      const createCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_create' && c[0]?.doc_uuid === 'local.md'
+      );
+      expect(createCalls.length).toBe(1);
+      expect(createCalls[0][0]).toMatchObject({
+        doc_uuid: 'local.md',
+        snapshot: expect.any(Uint8Array),
+        peer_id: 'peer-test',
+      });
+    });
+  });
+
+  // ── initialSync — overlap with bidirectional sync ─────────────────────────
+
+  describe('initialSync — overlapping doc with bidirectional sync', () => {
+    it('sends sync_start with client VV, imports delta, then pushes own delta', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'shared.md' }]);
+      mockVault.read.mockResolvedValue('local version');
+      // text_matches = true: Obsidian edits always persist CRDT state, so disk == CRDT on startup
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.version.mockReturnValue(3);
+      // Client and server share peer "12345" → shared history → normal merge
+      mockDocInstance.export_vv_json.mockReturnValue('{"999":3,"12345":2}');
+      mockDocInstance.get_text.mockReturnValue('merged version');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'shared.md', updated_at: '2026-03-16T00:00:00Z', vv_json: '{"12345":5}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      // sync_delta response
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'shared.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"12345":5}'),
+      });
+
+      await syncPromise;
+
+      // Should have imported the server delta
+      expect(mockDocInstance.import_snapshot).toHaveBeenCalled();
+
+      // Should have sent sync_start with client VV
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'shared.md'
+      );
+      expect(syncStartCalls.length).toBe(1);
+      expect(syncStartCalls[0][0].client_vv).toBeInstanceOf(Uint8Array);
+
+      // Should have sent sync_push with local delta
+      const syncPushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'shared.md'
+      );
+      expect(syncPushCalls.length).toBe(1);
+      expect(syncPushCalls[0][0]).toMatchObject({
+        delta: expect.any(Uint8Array),
+        peer_id: 'peer-test',
+      });
+    });
+
+    it('does not push sync_push if server VV covers client VV', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'same.md' }]);
+      mockVault.read.mockResolvedValue('same content');
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.version.mockReturnValue(3);
+      // Client VV is a subset of server VV — server already has all our ops
+      mockDocInstance.export_vv_json.mockReturnValue('{"12345":3}');
+      mockDocInstance.get_text.mockReturnValue('same content');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'same.md', updated_at: '2026-03-16T00:00:00Z', vv_json: '{"12345":5}' }],
+        tombstones: [],
+      });
+
+      await flush();
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'same.md',
+        delta: new Uint8Array(16),
+        server_vv: new TextEncoder().encode('{"12345":5}'),
+      });
+
+      await syncPromise;
+
+      const syncPushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'same.md'
+      );
+      expect(syncPushCalls.length).toBe(0);
+    });
+
+    it('pushes sync_push when client has ops server does not know about', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'offline.md' }]);
+      mockVault.read.mockResolvedValue('offline content');
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.version.mockReturnValue(5);
+      // Client has peer 999 ops that server doesn't know about
+      mockDocInstance.export_vv_json.mockReturnValue('{"999":5}');
+      mockDocInstance.get_text.mockReturnValue('offline content');
+      mockDocInstance.export_delta_since_vv_json.mockReturnValue(new Uint8Array(32));
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'offline.md', updated_at: '2026-03-16T00:00:00Z', vv_json: '{"12345":3}' }],
+        tombstones: [],
+      });
+
+      await flush();
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'offline.md',
+        delta: new Uint8Array(16),
+        server_vv: new TextEncoder().encode('{"12345":3}'),
+      });
+
+      await syncPromise;
+
+      const syncPushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'offline.md'
+      );
+      expect(syncPushCalls.length).toBe(1);
+    });
+  });
+
+  // ── initialSync — tombstone ────────────────────────────────────────────────
+
+  describe('initialSync — tombstone', () => {
+    it('calls vault.trash for a tombstoned file that exists locally', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'deleted.md' }]);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [],
+        tombstones: ['deleted.md'],
+      });
+
+      await syncPromise;
+
+      expect(mockVault.trash).toHaveBeenCalledWith(mockFile, true);
+    });
+
+    it('does not push a tombstoned local file', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'gone.md' }]);
+      mockVault.read.mockResolvedValue('content');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({ type: 'doc_list', docs: [], tombstones: ['gone.md'] });
+
+      await syncPromise;
+
+      const createCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_create'
+      );
+      expect(createCalls.length).toBe(0);
+    });
+  });
+
+  // ── onFileChanged (debounced) — sends delta not snapshot ──────────────────
+
+  describe('onFileChanged', () => {
+    const mockEditor = {
+      getValue: vi.fn().mockReturnValue('hello'),
+      setValue: vi.fn(),
+      getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+      setCursor: vi.fn(),
+      lastLine: vi.fn().mockReturnValue(0),
+      getLine: vi.fn().mockReturnValue(''),
+      offsetToPos: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+      transaction: vi.fn(),
+    };
+    const makeLeaf = (path: string) => ({
+      view: Object.assign(Object.create(MockMarkdownView.prototype), {
+        file: { path },
+        editor: mockEditor,
+      }),
+    });
+
+    it('is debounced and reads fresh content on fire', async () => {
+      vi.useFakeTimers();
+      engine = new SyncEngine(makeApp([makeLeaf('note.md')]), makeSettings());
+      await engine.start();
+
+      mockEditor.getValue.mockReturnValue('hello');
+      engine.onFileChanged('note.md');
+
+      // Before debounce fires
+      vi.advanceTimersByTime(200);
+      let pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push'
+      );
+      expect(pushCalls.length).toBe(0);
+
+      // After debounce fires
+      vi.advanceTimersByTime(150);
+      await flush();
+      pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push'
+      );
+      expect(pushCalls.length).toBe(1);
+      expect(pushCalls[0][0]).toMatchObject({
+        type: 'sync_push',
+        doc_uuid: 'note.md',
+        delta: expect.any(Uint8Array),
+        peer_id: 'peer-test',
+      });
+
+      vi.useRealTimers();
+    });
+
+    it('resets debounce on rapid edits', async () => {
+      vi.useFakeTimers();
+      engine = new SyncEngine(makeApp([makeLeaf('note.md')]), makeSettings());
+      await engine.start();
+
+      mockEditor.getValue.mockReturnValue('hello');
+      engine.onFileChanged('note.md');
+      vi.advanceTimersByTime(200);
+      engine.onFileChanged('note.md');
+      vi.advanceTimersByTime(200);
+      expect(
+        mockEncode.mock.calls.filter((c: any[]) => c[0]?.type === 'sync_push').length
+      ).toBe(0);
+
+      mockEditor.getValue.mockReturnValue('hello!');
+      vi.advanceTimersByTime(150);
+      await flush();
+      expect(
+        mockEncode.mock.calls.filter((c: any[]) => c[0]?.type === 'sync_push').length
+      ).toBe(1);
+
+      vi.useRealTimers();
+    });
+
+    it('flushes pending edits into CRDT before broadcast merge', async () => {
+      vi.useFakeTimers();
+      engine = new SyncEngine(makeApp([makeLeaf('note.md')]), makeSettings());
+      await engine.start();
+
+      // User types "hello" → debounce starts
+      mockEditor.getValue.mockReturnValue('hello');
+      mockDocInstance.text_matches.mockReturnValue(false);
+      engine.onFileChanged('note.md');
+
+      // Broadcast arrives during debounce window
+      const mockFile = Object.create(TFile.prototype);
+      mockFile.path = 'note.md';
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('merged result');
+      mockDocInstance.import_and_diff.mockReturnValue('');
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'note.md',
+        delta: new Uint8Array(64),
+        peer_id: 'other-peer',
+      });
+      await flush();
+
+      // sync_from_disk should have been called with fresh editor content
+      // BEFORE the broadcast delta was imported — this is the flush
+      expect(mockDocInstance.sync_from_disk).toHaveBeenCalledWith('hello');
+
+      // Debounce timer was cancelled by flush — should not fire again
+      mockEncode.mockClear();
+      vi.advanceTimersByTime(350);
+      await flush();
+
+      const pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push'
+      );
+      expect(pushCalls.length).toBe(0);
+
+      vi.useRealTimers();
+    });
+
+    it('captures user edits after broadcast correctly', async () => {
+      vi.useFakeTimers();
+      engine = new SyncEngine(makeApp([makeLeaf('note.md')]), makeSettings());
+      await engine.start();
+
+      // User types → debounce starts
+      mockEditor.getValue.mockReturnValue('hello');
+      engine.onFileChanged('note.md');
+
+      // Broadcast arrives
+      const mockFile = Object.create(TFile.prototype);
+      mockFile.path = 'note.md';
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('world');
+      mockDocInstance.import_and_diff.mockReturnValue('');
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'note.md',
+        delta: new Uint8Array(64),
+        peer_id: 'other-peer',
+      });
+      await flush();
+
+      // User types more after broadcast — resets debounce
+      mockEditor.getValue.mockReturnValue('world!');
+      engine.onFileChanged('note.md');
+
+      // Debounce fires — reads fresh "world!" which differs from broadcast
+      mockEncode.mockClear();
+      vi.advanceTimersByTime(350);
+      await flush();
+
+      const pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push'
+      );
+      expect(pushCalls.length).toBe(1);
+
+      vi.useRealTimers();
+    });
+
+    it('does not push when no editor is open for the file', async () => {
+      vi.useFakeTimers();
+      // No leaves — readCurrentContent returns null
+      engine = new SyncEngine(makeApp([]), makeSettings());
+      await engine.start();
+
+      engine.onFileChanged('note.md');
+
+      vi.advanceTimersByTime(350);
+      await flush();
+
+      const pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push'
+      );
+      expect(pushCalls.length).toBe(0);
+
+      vi.useRealTimers();
+    });
+  });
+
+  // ── delta_broadcast ────────────────────────────────────────────────────────
+
+  describe('delta_broadcast', () => {
+    it('imports delta via import_and_diff and writes content to vault', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('broadcast content');
+      mockDocInstance.import_and_diff.mockReturnValue('');
+
+      await engine.start();
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'remote.md',
+        delta: new Uint8Array(64),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      expect(mockDocInstance.import_and_diff).toHaveBeenCalledWith(expect.any(Uint8Array));
+      expect(mockVault.modify).toHaveBeenCalledWith(mockFile, 'broadcast content');
+    });
+
+    it('applies diff surgically to editor when open', async () => {
+      const mockEditor = {
+        offsetToPos: vi.fn().mockImplementation((offset: number) => ({ line: 0, ch: offset })),
+        transaction: vi.fn(),
+        getValue: vi.fn().mockReturnValue('Hello World'),
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 5 }),
+        setValue: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue('Hello World'),
+        setCursor: vi.fn(),
+      };
+
+      const mockView = new MockMarkdownView();
+      mockView.file = { path: 'test.md' };
+      mockView.editor = mockEditor;
+
+      const mockLeaf = { view: mockView };
+
+      // Recreate engine with editor leaf so iterateAllLeaves finds it
+      engine = new SyncEngine(makeApp([mockLeaf]), makeSettings());
+
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('Hello');
+      mockDocInstance.get_text.mockReturnValue('Hello World');
+      mockDocInstance.import_and_diff.mockReturnValue('[{"retain":5},{"insert":" World"}]');
+
+      await engine.start();
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'test.md',
+        delta: new Uint8Array(64),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      expect(mockDocInstance.import_and_diff).toHaveBeenCalledWith(expect.any(Uint8Array));
+      expect(mockEditor.transaction).toHaveBeenCalledWith({
+        changes: [
+          { from: { line: 0, ch: 5 }, text: ' World' },
+        ],
+      });
+      // Should NOT fall back to vault.modify since editor was updated
+      expect(mockVault.modify).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── onFileDeleted ─────────────────────────────────────────────────────────
+
+  describe('onFileDeleted', () => {
+    it('sends doc_delete message', async () => {
+      await engine.start();
+
+      engine.onFileDeleted('del.md');
+
+      const deleteCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_delete'
+      );
+      expect(deleteCalls.length).toBe(1);
+      expect(deleteCalls[0][0]).toMatchObject({
+        doc_uuid: 'del.md',
+      });
+    });
+  });
+
+  // ── onFileRenamed ─────────────────────────────────────────────────────────
+
+  describe('onFileRenamed', () => {
+    it('sends doc_delete for old path and sync_push for new path', async () => {
+      await engine.start();
+
+      engine.onFileRenamed('old.md', 'new.md', 'content');
+      await flush();
+
+      const deleteCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'old.md'
+      );
+      expect(deleteCalls.length).toBe(1);
+
+      const pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'new.md'
+      );
+      expect(pushCalls.length).toBe(1);
+    });
+  });
+
+  // ── isWritingFromRemote ────────────────────────────────────────────────────
+
+  describe('isWritingFromRemote', () => {
+    it('returns false for unknown paths', async () => {
+      await engine.start();
+      expect(engine.isWritingFromRemote('any.md')).toBe(false);
+    });
+
+    it('returns true during remote write and clears after timeout', async () => {
+      vi.useFakeTimers();
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+      mockVault.create.mockResolvedValue(undefined);
+      mockDocInstance.get_text.mockReturnValue('new content');
+
+      await engine.start();
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'guarded.md',
+        delta: new Uint8Array(8),
+        peer_id: 'peer',
+      });
+
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+      expect(engine.isWritingFromRemote('guarded.md')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(501);
+      expect(engine.isWritingFromRemote('guarded.md')).toBe(false);
+
+      vi.useRealTimers();
+    });
+  });
+
+  // ── status callbacks ───────────────────────────────────────────────────────
+
+  describe('status callbacks', () => {
+    it('calls statusCallback with offline on ws close', async () => {
+      const cb = vi.fn();
+      engine.statusCallback = cb;
+      await engine.start();
+      mockWsInstance.onclose!({} as CloseEvent);
+      expect(cb).toHaveBeenCalledWith('offline');
+    });
+
+    it('calls statusCallback with error on ws error', async () => {
+      const cb = vi.fn();
+      engine.statusCallback = cb;
+      await engine.start();
+      mockWsInstance.onerror!({} as Event);
+      expect(cb).toHaveBeenCalledWith('error');
+    });
+  });
+
+  // ── concurrent create conflict fork ────────────────────────────────────────
+
+  describe('concurrent create conflict fork', () => {
+    it('forks when local file has no CRDT history and server has different content', async () => {
+      // Local file exists with content, version()=0 (no persisted CRDT state)
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'clash.md' }]);
+      mockVault.read.mockResolvedValue('Local version');
+      mockDocInstance.version.mockReturnValue(0);
+      mockDocInstance.text_matches.mockReturnValue(false);
+      mockDocInstance.get_text.mockReturnValue('Server version');
+      mockVault.getAbstractFileByPath.mockReturnValue(null); // conflict path doesn't exist yet
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      // doc_list: server has clash.md
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'clash.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      // First sync_delta: conflict detection probe (null VV)
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'clash.md',
+        delta: new Uint8Array(64),
+        server_vv: new TextEncoder().encode('{"999":5}'),
+      });
+
+      await syncPromise;
+
+      // Should have created a conflict file
+      const createCalls = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(createCalls.length).toBe(1);
+      expect(createCalls[0][0]).toMatch(/clash \(conflict \d{4}-\d{2}-\d{2}\)\.md/);
+      expect(createCalls[0][1]).toBe('Local version');
+    });
+
+    it('no fork when VVs share peers (shared CRDT history)', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'persisted.md' }]);
+      mockVault.read.mockResolvedValue('Local content');
+      mockDocInstance.version.mockReturnValue(5);
+      // text_matches = true: Obsidian edits persist CRDT — no external disk change
+      mockDocInstance.text_matches.mockReturnValue(true);
+      // Client and server share peer "999" → shared history → no fork
+      mockDocInstance.export_vv_json.mockReturnValue('{"999":5}');
+      mockDocInstance.get_text.mockReturnValue('Merged content');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'persisted.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      // sync_delta for the normal overlapping flow (not conflict probe)
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'persisted.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"999":5}'),
+      });
+
+      await syncPromise;
+
+      // No conflict file should be created
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(0);
+    });
+
+    it('forks when persisted CRDT has disjoint VV from server', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'diverged.md' }]);
+      mockVault.read.mockResolvedValue('Local offline edit');
+      mockDocInstance.version.mockReturnValue(5);
+      // text_matches = true: disk == CRDT (Obsidian edits); disjoint-VV check still fires
+      mockDocInstance.text_matches.mockReturnValue(true);
+      // Client has peer-a, server has peer-b → disjoint → fork
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer-a":5}');
+      mockDocInstance.get_text.mockReturnValue('Server offline edit');
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'diverged.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{"peer-b":3}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'diverged.md',
+        delta: new Uint8Array(64),
+        server_vv: new TextEncoder().encode('{"peer-b":3}'),
+      });
+
+      await syncPromise;
+
+      // Should have created a conflict file with local content
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(1);
+      expect(conflictCreates[0][1]).toBe('Local offline edit');
+    });
+
+    it('no fork when disjoint VVs but same content', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'same-text.md' }]);
+      mockVault.read.mockResolvedValue('Identical content');
+      mockDocInstance.version.mockReturnValue(3);
+      mockDocInstance.text_matches.mockReturnValue(false);
+      // Disjoint VVs but content is the same → no fork needed
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer-x":3}');
+      mockDocInstance.get_text.mockReturnValue('Identical content');
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'same-text.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{"peer-y":2}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'same-text.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"peer-y":2}'),
+      });
+
+      await syncPromise;
+
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(0);
+    });
+
+    it('no fork when server text matches local', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'same.md' }]);
+      mockVault.read.mockResolvedValue('Same content');
+      mockDocInstance.version.mockReturnValue(0);
+      mockDocInstance.text_matches.mockReturnValue(false);
+      mockDocInstance.get_text.mockReturnValue('Same content');
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'same.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      // sync_delta: server has same content
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'same.md',
+        delta: new Uint8Array(64),
+        server_vv: new TextEncoder().encode('{"999":5}'),
+      });
+
+      await flush();
+
+      // Second sync_delta for the normal overlapping flow
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'same.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"999":5}'),
+      });
+
+      await syncPromise;
+
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(0);
+    });
+
+    it('conflict path increments counter if file exists', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'dup.md' }]);
+      mockVault.read.mockResolvedValue('Local dup');
+      mockDocInstance.version.mockReturnValue(0);
+      mockDocInstance.text_matches.mockReturnValue(false);
+      mockDocInstance.get_text.mockReturnValue('Server dup');
+
+      // First conflict path already exists, second (with " 2") doesn't
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) => {
+        if (p.includes('conflict') && !p.includes(' 2)')) {
+          return { path: p }; // exists
+        }
+        return null;
+      });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'dup.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'dup.md',
+        delta: new Uint8Array(64),
+        server_vv: new TextEncoder().encode('{"999":5}'),
+      });
+
+      await syncPromise;
+
+      const createCalls = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(createCalls.length).toBe(1);
+      expect(createCalls[0][0]).toMatch(/dup \(conflict \d{4}-\d{2}-\d{2} 2\)\.md/);
+    });
+  });
+
+  // ── echo guard ─────────────────────────────────────────────────────────────
+
+  describe('echo guard', () => {
+    it('suppresses push when content matches last remote write', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('remote content');
+
+      await engine.start();
+
+      // Simulate delta_broadcast → writeToVault sets lastRemoteWrite
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'echo.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+      await flush();
+
+      // Now simulate editor-change echoing the same content back
+      engine.onFileChangedImmediate('echo.md', 'remote content');
+      await flush();
+
+      // No sync_push should have been sent for the echo
+      const pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'echo.md'
+      );
+      expect(pushCalls.length).toBe(0);
+    });
+
+    it('allows push when content differs from last remote write', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('remote content');
+
+      await engine.start();
+
+      // Simulate delta_broadcast
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'echo2.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+      await flush();
+
+      // User types new content (not an echo)
+      engine.onFileChangedImmediate('echo2.md', 'user typed something new');
+      await flush();
+
+      // sync_push should have been sent
+      const pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'echo2.md'
+      );
+      expect(pushCalls.length).toBe(1);
+    });
+
+    it('echo guard is one-shot — second push with same content goes through', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('remote content');
+
+      await engine.start();
+
+      // Simulate delta_broadcast
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'echo3.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+      await flush();
+
+      // First echo — suppressed
+      engine.onFileChangedImmediate('echo3.md', 'remote content');
+      await flush();
+
+      // Second push with same content — should NOT be suppressed (guard consumed)
+      engine.onFileChangedImmediate('echo3.md', 'remote content');
+      await flush();
+
+      const pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'echo3.md'
+      );
+      // Only the second push goes through (first was echo-suppressed, second passes text_matches check)
+      // Since text_matches is mocked to return false, the second call should produce a push
+      expect(pushCalls.length).toBe(1);
+    });
+  });
+
+  // ── editor-level sync ──────────────────────────────────────────────────────
+
+  describe('editor-level sync', () => {
+    it('applies remote content directly to open editor instead of disk', async () => {
+      const mockEditor = {
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 5 }),
+        setValue: vi.fn(),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue('remote content'),
+      };
+      const mockLeaf = {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'editor.md' },
+          editor: mockEditor,
+        }),
+      };
+
+      engine = new SyncEngine(makeApp([mockLeaf]), makeSettings());
+      await engine.start();
+
+      mockDocInstance.get_text.mockReturnValue('remote content');
+      mockVault.getAbstractFileByPath.mockReturnValue(Object.create(TFile.prototype));
+      mockVault.read.mockResolvedValue('old content');
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'editor.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      // Editor should have been updated directly
+      expect(mockEditor.setValue).toHaveBeenCalledWith('remote content');
+      // Cursor should be restored
+      expect(mockEditor.setCursor).toHaveBeenCalled();
+      // Disk write should NOT have happened (editor strategy used)
+      expect(mockVault.modify).not.toHaveBeenCalled();
+    });
+
+    it('falls back to disk write when no editor is open', async () => {
+      // No leaves → applyToEditor returns false → disk fallback
+      engine = new SyncEngine(makeApp([]), makeSettings());
+      await engine.start();
+
+      mockDocInstance.get_text.mockReturnValue('remote fallback');
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('old');
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'closed.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      // Should have written to disk
+      expect(mockVault.modify).toHaveBeenCalledWith(mockFile, 'remote fallback');
+    });
+
+    it('updates all editors in split view', async () => {
+      const mockEditor1 = {
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        setValue: vi.fn(),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue('split content'),
+      };
+      const mockEditor2 = {
+        getCursor: vi.fn().mockReturnValue({ line: 1, ch: 3 }),
+        setValue: vi.fn(),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue('split content'),
+      };
+
+      const makeLeaf = (editor: any) => ({
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'split.md' },
+          editor,
+        }),
+      });
+
+      engine = new SyncEngine(makeApp([makeLeaf(mockEditor1), makeLeaf(mockEditor2)]), makeSettings());
+      await engine.start();
+
+      mockDocInstance.get_text.mockReturnValue('split content');
+      mockVault.getAbstractFileByPath.mockReturnValue(Object.create(TFile.prototype));
+      mockVault.read.mockResolvedValue('old');
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'split.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      expect(mockEditor1.setValue).toHaveBeenCalledWith('split content');
+      expect(mockEditor2.setValue).toHaveBeenCalledWith('split content');
+      expect(mockVault.modify).not.toHaveBeenCalled();
+    });
+
+    it('clamps cursor to valid range after content change', async () => {
+      const mockEditor = {
+        getCursor: vi.fn().mockReturnValue({ line: 10, ch: 50 }),
+        setValue: vi.fn(),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(2),
+        getLine: vi.fn().mockReturnValue('short'),
+      };
+      const mockLeaf = {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'clamp.md' },
+          editor: mockEditor,
+        }),
+      };
+
+      engine = new SyncEngine(makeApp([mockLeaf]), makeSettings());
+      await engine.start();
+
+      mockDocInstance.get_text.mockReturnValue('short\ntext\nend');
+      mockVault.getAbstractFileByPath.mockReturnValue(Object.create(TFile.prototype));
+      mockVault.read.mockResolvedValue('old');
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'clamp.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      // Cursor should be clamped: line 10→2, ch 50→5 (length of "short")
+      expect(mockEditor.setCursor).toHaveBeenCalledWith({ line: 2, ch: 5 });
+    });
+
+    it('falls back to disk for reading-mode view (no editor)', async () => {
+      const mockLeaf = {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'readonly.md' },
+          editor: undefined, // Reading mode has no editor
+        }),
+      };
+
+      engine = new SyncEngine(makeApp([mockLeaf]), makeSettings());
+      await engine.start();
+
+      mockDocInstance.get_text.mockReturnValue('read mode content');
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('old');
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'readonly.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      // Should fall back to disk write
+      expect(mockVault.modify).toHaveBeenCalledWith(mockFile, 'read mode content');
+    });
+
+    it('isUpdatingEditorFromRemote guard prevents echo', async () => {
+      const editorChangeGuardChecks: boolean[] = [];
+      const mockEditor = {
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        setValue: vi.fn().mockImplementation(() => {
+          // Simulate: during setValue, check if guard is active
+          editorChangeGuardChecks.push(engine.isUpdatingEditorFromRemote('guard-test.md'));
+        }),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue('guarded'),
+      };
+      const mockLeaf = {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'guard-test.md' },
+          editor: mockEditor,
+        }),
+      };
+
+      engine = new SyncEngine(makeApp([mockLeaf]), makeSettings());
+      await engine.start();
+
+      mockDocInstance.get_text.mockReturnValue('guarded');
+      mockVault.getAbstractFileByPath.mockReturnValue(Object.create(TFile.prototype));
+      mockVault.read.mockResolvedValue('old');
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'guard-test.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      // During setValue, the guard should have been active
+      expect(editorChangeGuardChecks).toEqual([true]);
+      // After setValue, the guard should be cleared
+      expect(engine.isUpdatingEditorFromRemote('guard-test.md')).toBe(false);
+    });
+  });
+
+  // ── getDocument ────────────────────────────────────────────────────────────
+
+  describe('getDocument', () => {
+    it('returns undefined for unknown paths without creating an empty CRDT', async () => {
+      await engine.start();
+      const doc = engine.getDocument('unknown.md');
+      expect(doc).toBeUndefined();
+      expect(mockCreateDocument).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── doc_deleted broadcast ─────────────────────────────────────────────────
+
+  describe('doc_deleted broadcast', () => {
+    it('trashes local file on doc_deleted message', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+
+      await engine.start();
+
+      fireMessage({ type: 'doc_deleted', doc_uuid: 'gone.md' });
+      await flush();
+
+      expect(mockVault.trash).toHaveBeenCalledWith(mockFile, true);
+    });
+  });
+
+  // ── delta_broadcast VV gap detection ──────────────────────────────────────
+
+  describe('delta_broadcast VV gap detection', () => {
+    it('triggers SyncStart catch-up when server_vv has missing peers', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('broadcast text');
+      // Local VV missing peer 888
+      mockDocInstance.export_vv_json.mockReturnValue('{"999":5}');
+
+      await engine.start();
+
+      // Fire broadcast with server_vv that includes peer 888 (local doesn't have it)
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'gap.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+        server_vv: new TextEncoder().encode('{"999":5,"888":3}'),
+      });
+
+      await flush();
+
+      // Should have sent a sync_start for catch-up
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'gap.md'
+      );
+      expect(syncStartCalls.length).toBe(1);
+      expect(syncStartCalls[0][0].client_vv).toBeInstanceOf(Uint8Array);
+
+      // Respond with the catch-up delta
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'gap.md',
+        delta: new Uint8Array(16),
+        server_vv: new TextEncoder().encode('{"999":5,"888":3}'),
+      });
+
+      await flush();
+
+      // import_and_diff for initial broadcast + import_snapshot for catch-up
+      expect(mockDocInstance.import_and_diff).toHaveBeenCalledTimes(1);
+      expect(mockDocInstance.import_snapshot).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT trigger catch-up when local VV covers server VV', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('covered text');
+      // Local VV covers server VV
+      mockDocInstance.export_vv_json.mockReturnValue('{"999":5,"888":3}');
+
+      await engine.start();
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'ok.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+        server_vv: new TextEncoder().encode('{"999":5,"888":3}'),
+      });
+
+      await flush();
+
+      // No sync_start should be sent
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start'
+      );
+      expect(syncStartCalls.length).toBe(0);
+    });
+
+    it('handles missing server_vv gracefully (backward compat)', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('compat text');
+
+      await engine.start();
+
+      // Broadcast without server_vv field
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'compat.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      // Normal import via import_and_diff + write, no crash, no sync_start
+      expect(mockDocInstance.import_and_diff).toHaveBeenCalled();
+      expect(mockVault.modify).toHaveBeenCalledWith(mockFile, 'compat text');
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start'
+      );
+      expect(syncStartCalls.length).toBe(0);
+    });
+
+    it('skips catch-up if already in progress for same doc', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.get_text.mockReturnValue('dup text');
+      mockDocInstance.export_vv_json.mockReturnValue('{"999":5}');
+
+      await engine.start();
+
+      // Fire two broadcasts with VV gap for the same doc quickly
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'dup-gap.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+        server_vv: new TextEncoder().encode('{"999":5,"888":3}'),
+      });
+
+      // Don't resolve the first catch-up yet — fire second broadcast
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'dup-gap.md',
+        delta: new Uint8Array(16),
+        peer_id: 'other-peer',
+        server_vv: new TextEncoder().encode('{"999":5,"888":3}'),
+      });
+
+      await flush();
+
+      // Only one sync_start should be sent (second was skipped)
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'dup-gap.md'
+      );
+      expect(syncStartCalls.length).toBe(1);
+    });
+  });
+
+  // ── doc_unknown ────────────────────────────────────────────────────────────
+
+  describe('doc_unknown', () => {
+    it('resolves sync_start promise with null', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([]);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'nosnapshot.md', updated_at: '2026-03-16T00:00:00Z', vv_json: null }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      fireMessage({ type: 'doc_unknown', doc_uuid: 'nosnapshot.md' });
+
+      await syncPromise;
+
+      // import_snapshot should NOT have been called
+      expect(mockDocInstance.import_snapshot).not.toHaveBeenCalled();
+      // File should NOT have been created
+      expect(mockVault.create).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── sync mode: pull skips push ──────────────────────────────────────────
+
+  describe('sync mode', () => {
+    it('pull mode downloads server docs but skips local-only push', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'local-only.md' }]);
+      mockVault.read.mockResolvedValue('local content');
+      mockDocInstance.get_text.mockReturnValue('server content');
+      mockDocInstance.version.mockReturnValue(0);
+
+      await engine.start();
+      const syncPromise = engine.initialSync(undefined, 'pull');
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'server.md', updated_at: '2026-03-16T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'server.md',
+        delta: new Uint8Array(64),
+        server_vv: new TextEncoder().encode('{"12345":5}'),
+      });
+
+      await syncPromise;
+
+      // Server doc should have been downloaded (import_snapshot called)
+      expect(mockDocInstance.import_snapshot).toHaveBeenCalled();
+
+      // sync_start should have been sent for server doc
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'server.md'
+      );
+      expect(syncStartCalls.length).toBe(1);
+
+      // Local-only doc should NOT have been pushed
+      const createCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_create' && c[0]?.doc_uuid === 'local-only.md'
+      );
+      expect(createCalls.length).toBe(0);
+    });
+
+    it('push mode skips server-only downloads but pushes local docs', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'push-me.md' }]);
+      mockVault.read.mockResolvedValue('push content');
+
+      await engine.start();
+      const syncPromise = engine.initialSync(undefined, 'push');
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'server-only.md', updated_at: '2026-03-16T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await syncPromise;
+
+      // Server-only doc should NOT have been downloaded (no sync_start sent)
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'server-only.md'
+      );
+      expect(syncStartCalls.length).toBe(0);
+
+      // Local doc should have been pushed
+      const createCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_create' && c[0]?.doc_uuid === 'push-me.md'
+      );
+      expect(createCalls.length).toBe(1);
+    });
+  });
+
+  // ── resumable sync ──────────────────────────────────────────────────────
+
+  describe('resumable sync', () => {
+    it('skips download for docs that already have persisted CRDT state', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([]);
+      // First getOrLoad returns doc with version > 0 (already downloaded)
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.get_text.mockReturnValue('already here');
+
+      await engine.start();
+      const progressCalls: [number, number][] = [];
+      const syncPromise = engine.initialSync((done, total) => {
+        progressCalls.push([done, total]);
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'cached.md', updated_at: '2026-03-16T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await syncPromise;
+
+      // No sync_start should have been sent (doc was skipped)
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'cached.md'
+      );
+      expect(syncStartCalls.length).toBe(0);
+
+      // Progress should still have been reported
+      expect(progressCalls.length).toBeGreaterThan(0);
+      expect(progressCalls[progressCalls.length - 1][0]).toBe(progressCalls[progressCalls.length - 1][1]);
+    });
+  });
+
+  // ── onInitialSync callback ──────────────────────────────────────────────
+
+  describe('onInitialSync callback', () => {
+    it('calls onInitialSync instead of auto-starting initialSync', async () => {
+      const onInitialSync = vi.fn();
+      engine.onInitialSync = onInitialSync;
+
+      await engine.start();
+      mockWsInstance.onopen!({} as Event);
+
+      expect(onInitialSync).toHaveBeenCalledWith(engine);
+    });
+
+    it('auto-starts initialSync when onInitialSync is null', async () => {
+      engine.onInitialSync = null;
+
+      await engine.start();
+
+      // Should have sent request_doc_list (first step of initialSync)
+      // The initialSync call happens in onopen which is triggered by start()
+      // We just verify no crash and onopen was set
+      expect(mockWsInstance.onopen).toBeTruthy();
+    });
+  });
+
+  // ── progress callback ──────────────────────────────────────────────────
+
+  describe('progress callback', () => {
+    it('reports progress for each phase', async () => {
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'local.md' }]);
+      mockVault.read.mockResolvedValue('content');
+      mockDocInstance.get_text.mockReturnValue('content');
+      mockDocInstance.version.mockReturnValue(0);
+
+      await engine.start();
+      const progress: [number, number][] = [];
+      const syncPromise = engine.initialSync((done, total) => {
+        progress.push([done, total]);
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'srv.md', updated_at: '2026-03-16T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      // sync_delta for server-only doc
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'srv.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"1":1}'),
+      });
+
+      await syncPromise;
+
+      // Should have progress entries (at least download + local-only push)
+      expect(progress.length).toBeGreaterThanOrEqual(2);
+      // Last entry should be done == total
+      const last = progress[progress.length - 1];
+      expect(last[0]).toBe(last[1]);
+    });
+  });
+});
