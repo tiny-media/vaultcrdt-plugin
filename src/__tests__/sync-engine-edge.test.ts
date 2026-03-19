@@ -115,12 +115,13 @@ import { SyncEngine } from '../sync-engine';
 
 const makeSettings = (overrides: Record<string, unknown> = {}) => ({
   serverUrl: 'http://localhost:3737',
-  serverPassword: 'test-server-password',
+  registrationKey: 'test-server-password',
   apiKey: 'test-api-key',
   peerId: 'peer-test',
   vaultId: 'vault-abc',
   debounceMs: 300,
   syncOnStartup: true,
+  onboardingComplete: false,
   ...overrides,
 });
 

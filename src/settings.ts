@@ -3,7 +3,7 @@ import type VaultCRDTPlugin from './main';
 
 export interface VaultCRDTSettings {
   serverUrl: string;
-  serverPassword: string;
+  registrationKey: string;
   apiKey: string;
   peerId: string;
   vaultId: string;
@@ -14,7 +14,7 @@ export interface VaultCRDTSettings {
 
 export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   serverUrl: 'http://localhost:3737',
-  serverPassword: '',
+  registrationKey: '',
   apiKey: '',
   peerId: '',
   vaultId: '',
@@ -23,7 +23,7 @@ export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   onboardingComplete: false,
 };
 
-const PLUGIN_VERSION = '2.0.2';
+const PLUGIN_VERSION = '0.1.0';
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -110,14 +110,14 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Server Password')
-      .setDesc('Required to register a new vault — get this from the server admin')
+      .setName('Registration Key')
+      .setDesc('Required to register a new vault — get this from the server admin (VAULTCRDT_ADMIN_TOKEN)')
       .addText((text) => {
         text
-          .setPlaceholder('server password')
-          .setValue(this.plugin.settings.serverPassword)
+          .setPlaceholder('registration key')
+          .setValue(this.plugin.settings.registrationKey)
           .onChange(async (value) => {
-            this.plugin.settings.serverPassword = value;
+            this.plugin.settings.registrationKey = value;
             await this.plugin.saveSettings();
           });
         text.inputEl.type = 'password';

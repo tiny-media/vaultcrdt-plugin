@@ -78,7 +78,10 @@ const {
     on: vi.fn(),
   };
 
-  class MockMarkdownView {}
+  class MockMarkdownView {
+    file: { path: string } | null = null;
+    editor: Record<string, unknown> | null = null;
+  }
 
   return {
     mockRequestUrl,
@@ -120,12 +123,13 @@ import { TFile, MarkdownView } from 'obsidian';
 
 const makeSettings = (overrides: Record<string, unknown> = {}) => ({
   serverUrl: 'http://localhost:3737',
-  serverPassword: 'test-server-password',
+  registrationKey: 'test-server-password',
   apiKey: 'test-api-key',
   peerId: 'peer-test',
   vaultId: 'vault-abc',
   debounceMs: 300,
   syncOnStartup: true,
+  onboardingComplete: false,
   ...overrides,
 });
 

@@ -180,7 +180,7 @@ export class SyncEngine {
       body: JSON.stringify({
         vault_id: this.settings.vaultId,
         api_key: this.settings.apiKey,
-        registration_key: this.settings.serverPassword,
+        registration_key: this.settings.registrationKey,
       }),
     });
     this.token = resp.json.token as string;
