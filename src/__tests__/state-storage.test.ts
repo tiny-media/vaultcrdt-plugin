@@ -84,9 +84,16 @@ describe('StateStorage', () => {
 
   it('path encoding handles slashes and dots', () => {
     expect(storage.stateKey('notes/daily/2026-03-16.md')).toBe(
-      'notes_daily_2026-03-16.loro'
+      'notes__daily__2026-03-16.loro'
     );
     expect(storage.stateKey('simple.md')).toBe('simple.loro');
-    expect(storage.stateKey('a/b/c.md')).toBe('a_b_c.loro');
+    expect(storage.stateKey('a/b/c.md')).toBe('a__b__c.loro');
+  });
+
+  it('path encoding avoids collisions between slash and underscore', () => {
+    // These must produce different keys
+    expect(storage.stateKey('notes/daily.md')).not.toBe(
+      storage.stateKey('notes_daily.md')
+    );
   });
 });

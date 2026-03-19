@@ -85,9 +85,11 @@ export default class VaultCRDTPlugin extends Plugin {
     };
 
     // Start: authenticate + connect (fire-and-forget, non-blocking)
-    this.syncEngine.start().catch((err) =>
-      console.error('[VaultCRDT] start error:', err)
-    );
+    if (this.settings.syncOnStartup) {
+      this.syncEngine.start().catch((err) =>
+        console.error('[VaultCRDT] start error:', err)
+      );
+    }
 
     console.log('[VaultCRDT] Plugin loaded');
   }

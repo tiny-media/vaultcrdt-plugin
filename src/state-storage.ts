@@ -11,9 +11,9 @@ export class StateStorage {
 
   constructor(private app: App) {}
 
-  /** `notes/daily/2026-03-16.md` → `notes_daily_2026-03-16.loro` */
+  /** `notes/daily/2026-03-16.md` → `notes__daily__2026-03-16.loro` */
   stateKey(filePath: string): string {
-    return filePath.replace(/\//g, '_').replace(/\.md$/, '') + '.loro';
+    return filePath.replace(/\.md$/, '').replace(/\//g, '__') + '.loro';
   }
 
   private statePath(filePath: string): string {
