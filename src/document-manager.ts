@@ -1,0 +1,83 @@
+import { App } from 'obsidian';
+import { createDocument, type WasmSyncDocument } from './wasm-bridge';
+import { StateStorage } from './state-storage';
+
+export class DocumentManager {
+  private documents = new Map<string, WasmSyncDocument>();
+  private storage: StateStorage;
+
+  constructor(app: App) {
+    this.storage = new StateStorage(app);
+  }
+
+  get(filePath: string): WasmSyncDocument | undefined {
+    return this.documents.get(filePath);
+  }
+
+  /** Load from in-memory cache, or create new doc and restore persisted CRDT state. */
+  async getOrLoad(filePath: string): Promise<WasmSyncDocument> {
+    const cached = this.documents.get(filePath);
+    if (cached) return cached;
+
+    const doc = createDocument();
+    const saved = await this.storage.load(filePath);
+    if (saved) {
+      doc.import_snapshot(saved);
+    }
+    this.documents.set(filePath, doc);
+    return doc;
+  }
+
+  /** Persist the CRDT snapshot for one file. */
+  async persist(filePath: string): Promise<void> {
+    const doc = this.documents.get(filePath);
+    if (!doc) return;
+    try {
+      const snapshot = doc.export_snapshot();
+      await this.storage.save(filePath, snapshot);
+    } catch (err) {
+      console.error('[VCRDT] persist failed:', filePath, err);
+    }
+  }
+
+  /** Persist all in-memory documents (called on plugin stop). */
+  async persistAll(): Promise<void> {
+    for (const [path] of this.documents) {
+      await this.persist(path);
+    }
+  }
+
+  /** Remove from memory and delete persisted state. */
+  async removeAndClean(filePath: string): Promise<void> {
+    this.documents.delete(filePath);
+    await this.storage.remove(filePath);
+  }
+
+  has(filePath: string): boolean {
+    return this.documents.has(filePath);
+  }
+
+  remove(filePath: string): void {
+    this.documents.delete(filePath);
+  }
+
+  paths(): string[] {
+    return [...this.documents.keys()];
+  }
+
+  entries(): IterableIterator<[string, WasmSyncDocument]> {
+    return this.documents.entries();
+  }
+
+  size(): number {
+    return this.documents.size;
+  }
+
+  async getStorageSizes(): Promise<Array<[string, number]>> {
+    return this.storage.sizes();
+  }
+
+  async loadPersistedSnapshot(filePath: string): Promise<Uint8Array | null> {
+    return this.storage.load(filePath);
+  }
+}
