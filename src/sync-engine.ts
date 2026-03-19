@@ -12,7 +12,7 @@ export type SyncMode = 'pull' | 'push' | 'merge';
 interface DocEntry {
   doc_uuid: string;
   updated_at: string;
-  vv_json: string | null;
+  server_vv: Uint8Array;
 }
 
 const HEARTBEAT_MS = 30_000;
@@ -474,7 +474,7 @@ export class SyncEngine {
             // that the server never received — the CRDT text is already correct locally,
             // but the server still has the old state).
             const clientVVAfterMerge = doc.export_vv_json();
-            if (!this.vvCoversServer(result.serverVV, clientVVAfterMerge)) {
+            if (!this.vvCovers(result.serverVV, clientVVAfterMerge)) {
               const delta = doc.export_delta_since_vv_json(result.serverVV);
               if (delta.length > 0) {
                 console.log(`${this.tag} overlapping push delta (VV gap)`, { path: file.path, deltaLen: delta.length });
@@ -540,20 +540,21 @@ export class SyncEngine {
       }
     } finally {
       this.initialSyncRunning = false;
-    }
 
-    // Process any broadcasts that arrived during initialSync
-    for (const queued of this.queuedBroadcasts) {
-      const type = queued.type as string;
-      if (type === 'delta_broadcast') {
-        await this.onDeltaBroadcast(queued);
-      } else if (type === 'doc_deleted') {
-        await this.onDocDeleted(queued.doc_uuid as string);
+      // Process any broadcasts that arrived during initialSync (even on error —
+      // already-synced docs should still receive updates)
+      for (const queued of this.queuedBroadcasts) {
+        const type = queued.type as string;
+        if (type === 'delta_broadcast') {
+          await this.onDeltaBroadcast(queued);
+        } else if (type === 'doc_deleted') {
+          await this.onDocDeleted(queued.doc_uuid as string);
+        }
       }
-    }
-    this.queuedBroadcasts = [];
+      this.queuedBroadcasts = [];
 
-    this.setStatus('connected');
+      this.setStatus('connected');
+    }
   }
 
   // ── Message handling ────────────────────────────────────────────────────────
@@ -666,7 +667,7 @@ export class SyncEngine {
       const serverVVStr = new TextDecoder().decode(serverVVRaw);
       const localVVStr = doc.export_vv_json();
 
-      if (!this.vvCoversServer(localVVStr, serverVVStr)) {
+      if (!this.vvCovers(localVVStr, serverVVStr)) {
         console.warn(`${this.tag} VV gap detected after broadcast`, { docUuid, localVV: localVVStr, serverVV: serverVVStr });
 
         if (!this.catchUpInProgress.has(docUuid)) {
@@ -1030,7 +1031,7 @@ export class SyncEngine {
           const from = editor.offsetToPos(offset);
           const to = editor.offsetToPos(offset + op.delete);
           changes.push({ from, to, text: '' });
-          // Don't advance offset — delete removes chars at current position
+          offset += op.delete; // Advance past deleted chars in original document
         }
       }
 
@@ -1101,13 +1102,13 @@ export class SyncEngine {
     return applied;
   }
 
-  /** Check if localVV covers all peers/counters in serverVV (no gaps). */
-  private vvCoversServer(localVV: string, serverVV: string): boolean {
+  /** Check if vvA covers all peers/counters in vvB (no gaps). */
+  private vvCovers(vvA: string, vvB: string): boolean {
     try {
-      const local = JSON.parse(localVV) as Record<string, number>;
-      const server = JSON.parse(serverVV) as Record<string, number>;
-      return Object.entries(server).every(
-        ([peer, counter]) => (local[peer] ?? 0) >= counter
+      const a = JSON.parse(vvA) as Record<string, number>;
+      const b = JSON.parse(vvB) as Record<string, number>;
+      return Object.entries(b).every(
+        ([peer, counter]) => (a[peer] ?? 0) >= counter
       );
     } catch {
       return true; // Parse error → assume covered (safe default)
