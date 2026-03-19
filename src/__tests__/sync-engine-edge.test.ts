@@ -120,7 +120,6 @@ const makeSettings = (overrides: Record<string, unknown> = {}) => ({
   peerId: 'peer-test',
   vaultId: 'vault-abc',
   debounceMs: 300,
-  syncOnStartup: true,
   onboardingComplete: false,
   ...overrides,
 });

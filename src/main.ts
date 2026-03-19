@@ -85,11 +85,9 @@ export default class VaultCRDTPlugin extends Plugin {
     };
 
     // Start: authenticate + connect (fire-and-forget, non-blocking)
-    if (this.settings.syncOnStartup) {
-      this.syncEngine.start().catch((err) =>
-        console.error('[VaultCRDT] start error:', err)
-      );
-    }
+    this.syncEngine.start().catch((err) =>
+      console.error('[VaultCRDT] start error:', err)
+    );
 
     console.log('[VaultCRDT] Plugin loaded');
   }
@@ -125,10 +123,10 @@ export default class VaultCRDTPlugin extends Plugin {
   private async runSyncWithProgress(engine: SyncEngine, mode: SyncMode, forceNotice = false): Promise<void> {
     let notice = null as Notice | null;
     try {
-      await engine.initialSync((done, total) => {
-        if (forceNotice || total > 5) {
+      await engine.initialSync((done, total, changed) => {
+        if (forceNotice || changed >= 5) {
           if (!notice) notice = new Notice('VaultCRDT: Starting sync...', 0);
-          notice.setMessage(`VaultCRDT: Syncing ${done}/${total}...`);
+          notice.setMessage(`VaultCRDT: Syncing ${done}/${total} (${changed} changed)...`);
         }
       }, mode);
       if (notice) {

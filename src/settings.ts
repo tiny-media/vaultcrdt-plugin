@@ -8,7 +8,6 @@ export interface VaultCRDTSettings {
   peerId: string;
   vaultId: string;
   debounceMs: number;
-  syncOnStartup: boolean;
   onboardingComplete: boolean;
 }
 
@@ -19,7 +18,6 @@ export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   peerId: '',
   vaultId: '',
   debounceMs: 700,
-  syncOnStartup: true,
   onboardingComplete: false,
 };
 
@@ -138,18 +136,6 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
         text.inputEl.type = 'password';
         return text;
       });
-
-    new Setting(containerEl)
-      .setName('Sync on startup')
-      .setDesc('Automatically run a full sync when the plugin loads')
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.syncOnStartup)
-          .onChange(async (value) => {
-            this.plugin.settings.syncOnStartup = value;
-            await this.plugin.saveSettings();
-          })
-      );
 
     new Setting(containerEl)
       .setName('Debounce (ms)')
