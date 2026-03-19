@@ -5,6 +5,7 @@ import { SyncEngine } from './sync-engine';
 import type { SyncMode } from './sync-engine';
 import { FileWatcherV2 } from './file-watcher';
 import { OnboardingModal } from './onboarding-modal';
+import { log, error } from './logger';
 
 export default class VaultCRDTPlugin extends Plugin {
   settings!: VaultCRDTSettings;
@@ -86,10 +87,10 @@ export default class VaultCRDTPlugin extends Plugin {
 
     // Start: authenticate + connect (fire-and-forget, non-blocking)
     this.syncEngine.start().catch((err) =>
-      console.error('[VaultCRDT] start error:', err)
+      error('start error:', err)
     );
 
-    console.log('[VaultCRDT] Plugin loaded');
+    log('Plugin loaded');
   }
 
   private async handleInitialSync(engine: SyncEngine): Promise<void> {
@@ -115,7 +116,7 @@ export default class VaultCRDTPlugin extends Plugin {
 
       await this.runSyncWithProgress(engine, mode, isOnboarding);
     } catch (err) {
-      console.error('[VaultCRDT] initialSync error:', err);
+      error('initialSync error:', err);
       new Notice('VaultCRDT: Sync failed — see console for details');
     }
   }
@@ -142,7 +143,7 @@ export default class VaultCRDTPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     await this.syncEngine.stop();
-    console.log('[VaultCRDT] Plugin unloaded');
+    log('Plugin unloaded');
   }
 
   async loadSettings(): Promise<void> {

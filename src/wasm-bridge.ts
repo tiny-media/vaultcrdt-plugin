@@ -20,6 +20,6 @@ export async function initWasm(): Promise<void> {
  * Create a new CRDT document.
  * Requires `initWasm()` to have been awaited first.
  */
-export function createDocument(): WasmSyncDocument {
-  return new WasmSyncDocument();
+export function createDocument(docUuid = 'temp', peerId = '0'): WasmSyncDocument {
+  return new WasmSyncDocument(docUuid, peerId);
 }

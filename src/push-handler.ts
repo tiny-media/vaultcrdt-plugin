@@ -2,6 +2,7 @@ import type { VaultCRDTSettings } from './settings';
 import type { DocumentManager } from './document-manager';
 import type { EditorIntegration } from './editor-integration';
 import type { WasmSyncDocument } from './wasm-bridge';
+import { log, warn, error } from './logger';
 
 export class PushHandler {
   private pushDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -71,10 +72,10 @@ export class PushHandler {
           const delta = doc.export_delta_since_vv_json(vvBefore);
           if (delta.length > 0) {
             this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
-            console.log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+            log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
           }
         } catch (err) {
-          console.warn(`${this.tag} flush push failed`, { path, err });
+          warn(`${this.tag} flush push failed`, { path, err });
         }
       }
     }
@@ -83,7 +84,7 @@ export class PushHandler {
   pushDocCreate(filePath: string, doc: WasmSyncDocument): void {
     try {
       const snapshot = doc.export_snapshot();
-      console.log(`${this.tag} doc_create`, { path: filePath, version: doc.version(), snapshotLen: snapshot.length });
+      log(`${this.tag} doc_create`, { path: filePath, version: doc.version(), snapshotLen: snapshot.length });
       this.send({
         type: 'doc_create',
         doc_uuid: filePath,
@@ -91,14 +92,14 @@ export class PushHandler {
         peer_id: this.settings.peerId,
       });
     } catch (err) {
-      console.error(`${this.tag} export_snapshot failed:`, filePath, err);
+      error(`${this.tag} export_snapshot failed:`, filePath, err);
     }
   }
 
   /** Flush queued offline deletes. */
   flushPendingDeletes(): void {
     for (const path of this.pendingDeletes) {
-      console.log(`${this.tag} flushing offline delete`, { path });
+      log(`${this.tag} flushing offline delete`, { path });
       this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId });
     }
     this.pendingDeletes.clear();
@@ -139,7 +140,7 @@ export class PushHandler {
     // Export delta since the VV before this edit
     try {
       const delta = doc.export_delta_since_vv_json(vvBefore);
-      console.log(`${this.tag} sync_push`, { path, version: doc.version(), deltaLen: delta.length });
+      log(`${this.tag} sync_push`, { path, version: doc.version(), deltaLen: delta.length });
       this.send({
         type: 'sync_push',
         doc_uuid: path,
@@ -147,7 +148,7 @@ export class PushHandler {
         peer_id: this.settings.peerId,
       });
     } catch (err) {
-      console.error(`${this.tag} export_delta failed, falling back to doc_create:`, path, err);
+      error(`${this.tag} export_delta failed, falling back to doc_create:`, path, err);
       this.pushDocCreate(path, doc);
     }
     await this.docs.persist(path);

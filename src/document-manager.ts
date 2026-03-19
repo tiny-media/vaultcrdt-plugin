@@ -1,6 +1,7 @@
 import { App } from 'obsidian';
 import { createDocument, type WasmSyncDocument } from './wasm-bridge';
 import { StateStorage } from './state-storage';
+import { error } from './logger';
 
 export class DocumentManager {
   private documents = new Map<string, WasmSyncDocument>();
@@ -36,7 +37,7 @@ export class DocumentManager {
       const snapshot = doc.export_snapshot();
       await this.storage.save(filePath, snapshot);
     } catch (err) {
-      console.error('[VCRDT] persist failed:', filePath, err);
+      error('[VCRDT] persist failed:', filePath, err);
     }
   }
 

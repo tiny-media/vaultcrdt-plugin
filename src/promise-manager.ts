@@ -1,3 +1,5 @@
+import { warn } from './logger';
+
 const WS_REQUEST_TIMEOUT_MS = 60_000;
 
 type PendingEntry = {
@@ -38,7 +40,7 @@ export class PromiseManager {
   rejectAll(reason: string, tag: string): void {
     const count = this.pending.size;
     if (count === 0) return;
-    console.warn(`${tag} rejecting ${count} pending promises: ${reason}`);
+    warn(`${tag} rejecting ${count} pending promises: ${reason}`);
     for (const [, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.reject(new Error(reason));

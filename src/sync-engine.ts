@@ -7,6 +7,7 @@ import { vvCovers, hasSharedHistory, conflictPath } from './conflict-utils';
 import { PromiseManager } from './promise-manager';
 import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
+import { log, warn, error } from './logger';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
 export type SyncMode = 'pull' | 'push' | 'merge';
@@ -136,7 +137,7 @@ export class SyncEngine {
         this.onInitialSync(this);
       } else {
         this.initialSync().catch((err) =>
-          console.error(`${this.tag} initialSync error:`, err)
+          error(`${this.tag} initialSync error:`, err)
         );
       }
     };
@@ -200,7 +201,7 @@ export class SyncEngine {
       const tombstoneSet = new Set(tombstones);
       const serverDocMap = new Map(serverDocs.map((d) => [d.doc_uuid, d]));
       const localPathSet = new Set(localContents.keys());
-      console.log(`${this.tag} initialSync start`, {
+      log(`${this.tag} initialSync start`, {
         serverDocs: serverDocs.length,
         localFiles: localFiles.length,
         tombstones,
@@ -223,7 +224,7 @@ export class SyncEngine {
       let downloadOk = 0;
       let downloadFail = 0;
       if (mode !== 'push') {
-        console.log(`${this.tag} downloading ${serverOnlyUuids.length} server-only docs (parallel=${PARALLEL_DOWNLOADS})`);
+        log(`${this.tag} downloading ${serverOnlyUuids.length} server-only docs (parallel=${PARALLEL_DOWNLOADS})`);
         // Parallel downloads with sliding window
         let wsAbortError: Error | null = null;
         const downloadOne = async (uuid: string): Promise<void> => {
@@ -249,7 +250,7 @@ export class SyncEngine {
             }
           } catch (err) {
             downloadFail++;
-            console.warn(`${this.tag} download failed for ${uuid}:`, err);
+            warn(`${this.tag} download failed for ${uuid}:`, err);
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
               wsAbortError = err as Error;
             }
@@ -271,7 +272,7 @@ export class SyncEngine {
         await Promise.all(inFlight);
 
         if (wsAbortError) {
-          console.warn(`${this.tag} WS closed during download, aborting (${downloadOk} ok, ${downloadFail} fail)`);
+          warn(`${this.tag} WS closed during download, aborting (${downloadOk} ok, ${downloadFail} fail)`);
           throw wsAbortError;
         }
       } else {
@@ -279,7 +280,7 @@ export class SyncEngine {
         stepsDone += serverOnlyUuids.length;
         onProgress?.(stepsDone, totalSteps, changed);
       }
-      console.log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
+      log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
 
       // 2. Overlapping docs — send local VV, import delta, push own ops if needed
       for (const file of localFiles) {
@@ -300,7 +301,7 @@ export class SyncEngine {
 
             if (serverText.trim() !== '' && serverText !== localContent) {
               const cPath = conflictPath(this.app, file.path);
-              console.warn(`${this.tag} concurrent create conflict`, { path: file.path, conflictPath: cPath });
+              warn(`${this.tag} concurrent create conflict`, { path: file.path, conflictPath: cPath });
               await this.app.vault.create(cPath, localContent);
 
               // Adopt server version
@@ -338,7 +339,7 @@ export class SyncEngine {
 
             if (serverText.trim() !== '' && serverText !== localContent) {
               const cPath = conflictPath(this.app, file.path);
-              console.warn(`${this.tag} concurrent external edit conflict`, { path: file.path, conflictPath: cPath });
+              warn(`${this.tag} concurrent external edit conflict`, { path: file.path, conflictPath: cPath });
               await this.app.vault.create(cPath, localContent);
 
               await this.docs.removeAndClean(file.path);
@@ -369,7 +370,7 @@ export class SyncEngine {
 
             if (serverText.trim() !== '' && localContent.trim() !== '' && serverText !== localContent) {
               const cPath = conflictPath(this.app, file.path);
-              console.warn(`${this.tag} disjoint VV conflict`, { path: file.path, conflictPath: cPath });
+              warn(`${this.tag} disjoint VV conflict`, { path: file.path, conflictPath: cPath });
               await this.app.vault.create(cPath, localContent);
 
               await this.docs.removeAndClean(file.path);
@@ -395,14 +396,14 @@ export class SyncEngine {
           const serverContent = doc.get_text();
 
           if (localContent.trim() === '' && serverContent.trim() !== '') {
-            console.log(`${this.tag} overlapping: empty local, adopting server`, { path: file.path });
+            log(`${this.tag} overlapping: empty local, adopting server`, { path: file.path });
             await this.editor.writeToVault(file.path, serverContent);
           } else {
             const clientVVAfterMerge = doc.export_vv_json();
             if (!vvCovers(result.serverVV, clientVVAfterMerge)) {
               const delta = doc.export_delta_since_vv_json(result.serverVV);
               if (delta.length > 0) {
-                console.log(`${this.tag} overlapping push delta (VV gap)`, { path: file.path, deltaLen: delta.length });
+                log(`${this.tag} overlapping push delta (VV gap)`, { path: file.path, deltaLen: delta.length });
                 docChanged = true;
                 this.send({
                   type: 'sync_push',
@@ -412,7 +413,7 @@ export class SyncEngine {
                 });
               }
             } else {
-              console.log(`${this.tag} overlapping match`, { path: file.path });
+              log(`${this.tag} overlapping match`, { path: file.path });
             }
 
             if (localContent !== serverContent) {
@@ -431,7 +432,7 @@ export class SyncEngine {
         for (const file of localFiles) {
           if (tombstoneSet.has(file.path) || serverDocMap.has(file.path)) continue;
           const content = localContents.get(file.path) ?? '';
-          console.log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
+          log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
           const doc = await this.docs.getOrLoad(file.path);
           doc.sync_from_disk(content);
           this.push.pushDocCreate(file.path, doc);
@@ -505,7 +506,7 @@ export class SyncEngine {
 
       case 'delta_broadcast':
         if (this.initialSyncRunning) {
-          console.log(`${this.tag} broadcast queued (initialSync running)`, { doc: msg.doc_uuid });
+          log(`${this.tag} broadcast queued (initialSync running)`, { doc: msg.doc_uuid });
           this.queuedBroadcasts.push(msg);
         } else {
           this.enqueueBroadcast(msg);
@@ -514,7 +515,7 @@ export class SyncEngine {
 
       case 'doc_deleted':
         if (this.initialSyncRunning) {
-          console.log(`${this.tag} delete queued (initialSync running)`, { doc: msg.doc_uuid });
+          log(`${this.tag} delete queued (initialSync running)`, { doc: msg.doc_uuid });
           this.queuedBroadcasts.push(msg);
         } else {
           void this.onDocDeleted(msg.doc_uuid as string);
@@ -529,7 +530,7 @@ export class SyncEngine {
         break;
 
       case 'error':
-        console.warn(`${this.tag} Server error:`, msg.message);
+        warn(`${this.tag} Server error:`, msg.message);
         break;
     }
   }
@@ -537,7 +538,7 @@ export class SyncEngine {
   private enqueueBroadcast(msg: Record<string, unknown>): void {
     this.broadcastQueue = this.broadcastQueue.then(() =>
       this.onDeltaBroadcast(msg).catch((err) => {
-        console.error(`${this.tag} broadcast handler FAILED`, { doc: msg.doc_uuid, err });
+        error(`${this.tag} broadcast handler FAILED`, { doc: msg.doc_uuid, err });
       })
     );
   }
@@ -555,24 +556,24 @@ export class SyncEngine {
     try {
       diffJson = doc.import_and_diff(delta);
     } catch (err) {
-      console.warn(`${this.tag} import_and_diff failed, falling back to import_snapshot`, { docUuid, err });
+      warn(`${this.tag} import_and_diff failed, falling back to import_snapshot`, { docUuid, err });
       try {
         doc.import_snapshot(delta);
       } catch (err2) {
-        console.error(`${this.tag} import_snapshot ALSO failed`, { docUuid, err2 });
+        error(`${this.tag} import_snapshot ALSO failed`, { docUuid, err2 });
         return;
       }
     }
     const textAfter = doc.get_text();
 
-    console.log(`${this.tag} delta broadcast received`, {
+    log(`${this.tag} delta broadcast received`, {
       docUuid,
       peer_id: msg.peer_id as string,
       deltaLen: (delta as Uint8Array).length,
     });
 
     if (Math.abs(textAfter.length - textBefore.length) > Math.max(textBefore.length, 1) * 0.5) {
-      console.warn(`${this.tag} large merge delta`, {
+      warn(`${this.tag} large merge delta`, {
         path: docUuid, beforeLen: textBefore.length, afterLen: textAfter.length,
       });
     }
@@ -584,7 +585,7 @@ export class SyncEngine {
       const localVVStr = doc.export_vv_json();
 
       if (!vvCovers(localVVStr, serverVVStr)) {
-        console.warn(`${this.tag} VV gap detected after broadcast`, { docUuid, localVV: localVVStr, serverVV: serverVVStr });
+        warn(`${this.tag} VV gap detected after broadcast`, { docUuid, localVV: localVVStr, serverVV: serverVVStr });
 
         if (!this.catchUpInProgress.has(docUuid)) {
           this.catchUpInProgress.add(docUuid);
@@ -614,7 +615,7 @@ export class SyncEngine {
         return;
       }
     } catch (err) {
-      console.warn(`${this.tag} applyDiffToEditor failed, falling back to writeToVault`, { docUuid, err });
+      warn(`${this.tag} applyDiffToEditor failed, falling back to writeToVault`, { docUuid, err });
     }
 
     await this.editor.writeToVault(docUuid, textAfter);

@@ -22,3 +22,15 @@ jobs:
 
       - name: Type check
         run: bunx tsc --noEmit
+
+      - name: Build
+        run: bun run build
+
+      - name: Check build size
+        run: |
+          SIZE=$(stat --format=%s main.js)
+          echo "main.js size: $SIZE bytes ($(( SIZE / 1024 / 1024 )) MB)"
+          if [ "$SIZE" -gt 3145728 ]; then
+            echo "::error::main.js exceeds 3 MB ($SIZE bytes)"
+            exit 1
+          fi

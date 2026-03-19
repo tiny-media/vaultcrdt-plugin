@@ -21,7 +21,7 @@ export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   onboardingComplete: false,
 };
 
-const PLUGIN_VERSION = '0.1.0';
+const PLUGIN_VERSION = '0.2.0';
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';

@@ -55,10 +55,16 @@ describe('initWasm', () => {
 });
 
 describe('createDocument', () => {
-  it('constructs a WasmSyncDocument with no arguments', () => {
+  it('constructs a WasmSyncDocument with default arguments', () => {
     const doc = createDocument();
-    expect(MockWasmSyncDocument).toHaveBeenCalledWith();
+    expect(MockWasmSyncDocument).toHaveBeenCalledWith('temp', '0');
     expect(doc).toBe(mockDocInstance);
+  });
+
+  it('passes custom docUuid and peerId to constructor', () => {
+    MockWasmSyncDocument.mockClear();
+    createDocument('my-doc', 'peer-1');
+    expect(MockWasmSyncDocument).toHaveBeenCalledWith('my-doc', 'peer-1');
   });
 
   it('returned document exposes get_text()', () => {

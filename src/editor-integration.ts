@@ -1,4 +1,5 @@
 import { App, TFile, MarkdownView } from 'obsidian';
+import { log, warn } from './logger';
 
 export class EditorIntegration {
   private updatingEditorFromRemote = new Set<string>();
@@ -27,7 +28,7 @@ export class EditorIntegration {
   }
 
   async writeToVault(filePath: string, content: string): Promise<void> {
-    console.log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
+    log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);
 
     // Skip write if content is already identical
@@ -114,7 +115,7 @@ export class EditorIntegration {
 
       // Verification: ensure editor content matches CRDT state
       if (editor.getValue() !== expectedText) {
-        console.warn(`${this.tag} diff apply mismatch, falling back to setValue`, { filePath });
+        warn(`${this.tag} diff apply mismatch, falling back to setValue`, { filePath });
         this.updatingEditorFromRemote.add(filePath);
         try {
           const cursor = editor.getCursor();

@@ -6,11 +6,11 @@ This plugin does not connect to any cloud service. It requires a running instanc
 
 ## Status
 
-Pre-release (0.x). The protocol and storage format may change between versions. Not yet listed in the Obsidian community plugin directory.
+Pre-release (0.2.x). The protocol and storage format may change between versions. Not yet listed in the Obsidian community plugin directory.
 
 ## Requirements
 
-- Obsidian 1.12 or later
+- Obsidian 1.12 or later (tested with 1.8.9+)
 - A running instance of vaultcrdt-server with a valid API key
 
 ## Installation
@@ -42,10 +42,13 @@ On first connect, a modal prompts you to choose how the initial sync should proc
 
 After the initial sync, all modes behave identically: edits are synchronised bidirectionally in real time.
 
+## Conflict handling
+
+When two clients diverge without a shared CRDT history (e.g. one client is offline for a long time and the local state is cleared), the plugin creates a conflict copy rather than silently overwriting. The conflict file is named `<original> (conflict <date>).md` and both versions are preserved.
+
 ## What it does not do
 
 - End-to-end encryption. Data is transmitted in plaintext over the WebSocket connection. Use TLS (WSS) on the server to encrypt data in transit.
-- Conflict files. When two clients diverge without a shared CRDT history (e.g. one client is offline for a long time and the local state is cleared), the server creates a conflict copy rather than silently overwriting.
 - Binary file sync. Only Markdown notes and text files are synchronised.
 
 ## Network usage
