@@ -35,11 +35,11 @@ class DocumentManager {
   }
 
   /** Load from in-memory cache, or create new doc and restore persisted CRDT state. */
-  async getOrLoad(filePath: string, peerId: string): Promise<WasmSyncDocument> {
+  async getOrLoad(filePath: string): Promise<WasmSyncDocument> {
     const cached = this.documents.get(filePath);
     if (cached) return cached;
 
-    const doc = createDocument(filePath, peerId);
+    const doc = createDocument();
     const saved = await this.storage.load(filePath);
     if (saved) {
       doc.import_snapshot(saved);
@@ -299,7 +299,7 @@ export class SyncEngine {
         let wsAbortError: Error | null = null;
         const downloadOne = async (uuid: string): Promise<void> => {
           // Resumable: skip docs that already have persisted CRDT state
-          const existing = await this.docs.getOrLoad(uuid, this.settings.peerId);
+          const existing = await this.docs.getOrLoad(uuid);
           if (existing.version() > 0) {
             downloadOk++;
             stepsDone++;
@@ -310,7 +310,7 @@ export class SyncEngine {
           try {
             const result = await this.requestSyncStart(uuid, null);
             if (result) {
-              const doc = await this.docs.getOrLoad(uuid, this.settings.peerId);
+              const doc = await this.docs.getOrLoad(uuid);
               doc.import_snapshot(result.delta);
               this.lastServerVV.set(uuid, result.serverVV);
               await this.writeToVault(uuid, doc.get_text());
@@ -356,7 +356,7 @@ export class SyncEngine {
         if (tombstoneSet.has(file.path)) continue;
         if (!serverDocMap.has(file.path)) continue;
 
-        const doc = await this.docs.getOrLoad(file.path, this.settings.peerId);
+        const doc = await this.docs.getOrLoad(file.path);
         const localContent = localContents.get(file.path) ?? '';
         const hadPersistedState = doc.version() > 0;
 
@@ -364,7 +364,7 @@ export class SyncEngine {
         if (!hadPersistedState && localContent.trim() !== '') {
           const result = await this.requestSyncStart(file.path, null);
           if (result && result.delta.length > 0) {
-            const tempDoc = createDocument(file.path + '-temp', this.settings.peerId);
+            const tempDoc = createDocument();
             tempDoc.import_snapshot(result.delta);
             const serverText = tempDoc.get_text();
 
@@ -404,7 +404,7 @@ export class SyncEngine {
           // pure server text and compare — if different from local, create conflict.
           if (result.delta.length > 0 && hadLocalDiskChange) {
             const persistedSnapshot = await this.docs.loadPersistedSnapshot(file.path);
-            const tempDoc = createDocument(file.path + '-conflict-check', this.settings.peerId);
+            const tempDoc = createDocument();
             if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
             tempDoc.import_snapshot(result.delta);
             const serverText = tempDoc.get_text();
@@ -416,7 +416,7 @@ export class SyncEngine {
 
               // Adopt server version: request full snapshot (our delta is VV-relative)
               await this.docs.removeAndClean(file.path);
-              const freshDoc = await this.docs.getOrLoad(file.path, this.settings.peerId);
+              const freshDoc = await this.docs.getOrLoad(file.path);
               const fullResult = await this.requestSyncStart(file.path, null);
               if (fullResult && fullResult.delta.length > 0) {
                 freshDoc.import_snapshot(fullResult.delta);
@@ -436,7 +436,7 @@ export class SyncEngine {
             clientVV !== '{}' &&
             !this.hasSharedHistory(clientVV, result.serverVV)
           ) {
-            const tempDoc = createDocument(file.path + '-temp', this.settings.peerId);
+            const tempDoc = createDocument();
             tempDoc.import_snapshot(result.delta);
             const serverText = tempDoc.get_text();
 
@@ -447,7 +447,7 @@ export class SyncEngine {
 
               // Reset CRDT state and adopt server version cleanly
               await this.docs.removeAndClean(file.path);
-              const freshDoc = await this.docs.getOrLoad(file.path, this.settings.peerId);
+              const freshDoc = await this.docs.getOrLoad(file.path);
               freshDoc.import_snapshot(result.delta);
               this.lastServerVV.set(file.path, result.serverVV);
               await this.writeToVault(file.path, freshDoc.get_text());
@@ -506,7 +506,7 @@ export class SyncEngine {
           if (tombstoneSet.has(file.path) || serverDocMap.has(file.path)) continue;
           const content = localContents.get(file.path) ?? '';
           console.log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
-          const doc = await this.docs.getOrLoad(file.path, this.settings.peerId);
+          const doc = await this.docs.getOrLoad(file.path);
           doc.sync_from_disk(content);
           this.pushDocCreate(file.path, doc);
           await this.docs.persist(file.path);
@@ -521,7 +521,7 @@ export class SyncEngine {
       // 4. Flush queued offline deletes
       for (const path of this.pendingDeletes) {
         console.log(`${this.tag} flushing offline delete`, { path });
-        this.send({ type: 'doc_delete', doc_uuid: path });
+        this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId });
       }
       this.pendingDeletes.clear();
 
@@ -630,7 +630,7 @@ export class SyncEngine {
     // would be lost when the merged result overwrites the editor.
     await this.flushPendingEdits(docUuid);
 
-    const doc = await this.docs.getOrLoad(docUuid, this.settings.peerId);
+    const doc = await this.docs.getOrLoad(docUuid);
     const textBefore = doc.get_text();
 
     // Try import_and_diff for surgical editor updates; fall back to import_snapshot
@@ -743,7 +743,7 @@ export class SyncEngine {
     this.docs.remove(path);
     this.lastServerVV.delete(path);
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.send({ type: 'doc_delete', doc_uuid: path });
+      this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId });
     } else {
       this.pendingDeletes.add(path);
     }
@@ -786,7 +786,7 @@ export class SyncEngine {
     this.pushDebounceTimers.delete(path);
     const freshContent = this.readCurrentContent(path);
     if (freshContent !== null) {
-      const doc = await this.docs.getOrLoad(path, this.settings.peerId);
+      const doc = await this.docs.getOrLoad(path);
       if (!doc.text_matches(freshContent)) {
         const vvBefore = doc.export_vv_json();
         doc.sync_from_disk(freshContent);
@@ -838,7 +838,7 @@ export class SyncEngine {
     }
     this.lastRemoteWrite.delete(path);
 
-    const doc = await this.docs.getOrLoad(path, this.settings.peerId);
+    const doc = await this.docs.getOrLoad(path);
     if (doc.text_matches(content)) return;
 
     // Capture VV before applying disk change

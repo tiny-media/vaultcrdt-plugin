@@ -55,37 +55,35 @@ describe('initWasm', () => {
 });
 
 describe('createDocument', () => {
-  it('constructs a WasmSyncDocument with the given uuid and peerId', () => {
-    const doc = createDocument('my-doc-uuid', 'peer-42');
-    expect(MockWasmSyncDocument).toHaveBeenCalledWith('my-doc-uuid', 'peer-42');
+  it('constructs a WasmSyncDocument with no arguments', () => {
+    const doc = createDocument();
+    expect(MockWasmSyncDocument).toHaveBeenCalledWith();
     expect(doc).toBe(mockDocInstance);
   });
 
   it('returned document exposes get_text()', () => {
-    const doc = createDocument('doc-1', 'peer-1');
+    const doc = createDocument();
     expect(doc.get_text()).toBe('');
   });
 
   it('returned document exposes version()', () => {
-    const doc = createDocument('doc-1', 'peer-1');
+    const doc = createDocument();
     expect(doc.version()).toBe(0);
   });
 
   it('returned document exposes export_vv_json()', () => {
-    const doc = createDocument('doc-1', 'peer-1');
+    const doc = createDocument();
     expect(doc.export_vv_json()).toBe('{}');
   });
 
   it('returned document exposes export_snapshot()', () => {
-    const doc = createDocument('doc-1', 'peer-1');
+    const doc = createDocument();
     expect(doc.export_snapshot()).toBeInstanceOf(Uint8Array);
   });
 
-  it('returns distinct documents for different uuids', () => {
-    const doc1 = createDocument('doc-1', 'peer-1');
-    const doc2 = createDocument('doc-2', 'peer-1');
-    expect(MockWasmSyncDocument).toHaveBeenCalledWith('doc-1', 'peer-1');
-    expect(MockWasmSyncDocument).toHaveBeenCalledWith('doc-2', 'peer-1');
+  it('returns a document on each call', () => {
+    const doc1 = createDocument();
+    const doc2 = createDocument();
     expect(doc1).toBeDefined();
     expect(doc2).toBeDefined();
   });
