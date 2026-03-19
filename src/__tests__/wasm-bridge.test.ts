@@ -4,18 +4,17 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // variables available to factory functions without TDZ errors.
 const { mockInitWasmModule, MockWasmSyncDocument, mockDocInstance } = vi.hoisted(() => {
   const mockDocInstance = {
-    get_text: vi.fn().mockReturnValue(''),
     insert_text: vi.fn(),
     delete_text: vi.fn(),
-    content_hash: vi.fn().mockReturnValue('abc123def456'),
-    export_encrypted_delta: vi.fn().mockReturnValue({
-      salt: new Uint8Array(16),
-      blob: new Uint8Array(32),
-    }),
-    import_encrypted_delta: vi.fn(),
-    sync_from_disk: vi.fn(),
+    get_text: vi.fn().mockReturnValue(''),
     version: vi.fn().mockReturnValue(0),
+    sync_from_disk: vi.fn(),
     export_snapshot: vi.fn().mockReturnValue(new Uint8Array(64)),
+    import_snapshot: vi.fn(),
+    export_vv_json: vi.fn().mockReturnValue('{}'),
+    export_delta_since_vv_json: vi.fn().mockReturnValue(new Uint8Array(0)),
+    text_matches: vi.fn().mockReturnValue(false),
+    import_and_diff: vi.fn().mockReturnValue(''),
   };
   const MockWasmSyncDocument = vi.fn(function() { return mockDocInstance; });
   const mockInitWasmModule = vi.fn().mockResolvedValue(undefined);
@@ -23,12 +22,12 @@ const { mockInitWasmModule, MockWasmSyncDocument, mockDocInstance } = vi.hoisted
 });
 
 // Mock the WASM binary (esbuild inlines this as Uint8Array at build time)
-vi.mock('../../../crates/vaultcrdt-wasm/pkg/vaultcrdt_wasm_bg.wasm', () => ({
+vi.mock('../../wasm/vaultcrdt_wasm_bg.wasm', () => ({
   default: new Uint8Array([0, 97, 115, 109]),
 }));
 
 // Mock the WASM JS bindings
-vi.mock('../../../crates/vaultcrdt-wasm/pkg/vaultcrdt_wasm', () => ({
+vi.mock('../../wasm/vaultcrdt_wasm', () => ({
   default: mockInitWasmModule,
   WasmSyncDocument: MockWasmSyncDocument,
 }));
@@ -67,30 +66,24 @@ describe('createDocument', () => {
     expect(doc.get_text()).toBe('');
   });
 
-  it('returned document exposes content_hash()', () => {
-    const doc = createDocument('doc-1', 'peer-1');
-    expect(doc.content_hash()).toBe('abc123def456');
-  });
-
-  it('returned document exposes export_encrypted_delta()', () => {
-    const doc = createDocument('doc-1', 'peer-1');
-    const result = doc.export_encrypted_delta('password');
-    expect(result.salt).toBeInstanceOf(Uint8Array);
-    expect(result.blob).toBeInstanceOf(Uint8Array);
-    expect(result.salt.length).toBe(16);
-    expect(result.blob.length).toBe(32);
-  });
-
   it('returned document exposes version()', () => {
     const doc = createDocument('doc-1', 'peer-1');
     expect(doc.version()).toBe(0);
   });
 
+  it('returned document exposes export_vv_json()', () => {
+    const doc = createDocument('doc-1', 'peer-1');
+    expect(doc.export_vv_json()).toBe('{}');
+  });
+
+  it('returned document exposes export_snapshot()', () => {
+    const doc = createDocument('doc-1', 'peer-1');
+    expect(doc.export_snapshot()).toBeInstanceOf(Uint8Array);
+  });
+
   it('returns distinct documents for different uuids', () => {
     const doc1 = createDocument('doc-1', 'peer-1');
     const doc2 = createDocument('doc-2', 'peer-1');
-    // Both point to the same mock instance (expected for a mock), but the
-    // constructor was called with different arguments.
     expect(MockWasmSyncDocument).toHaveBeenCalledWith('doc-1', 'peer-1');
     expect(MockWasmSyncDocument).toHaveBeenCalledWith('doc-2', 'peer-1');
     expect(doc1).toBeDefined();
