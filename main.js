@@ -52,6 +52,7 @@ var DEFAULT_SETTINGS = {
   vaultId: "",
   deviceName: "",
   debounceMs: 700,
+  showSyncStatus: true,
   onboardingComplete: false
 };
 function formatBytes(bytes) {
@@ -140,6 +141,13 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
     const devicesContainer = devicesDetails.createDiv();
     this.loadPeers(devicesContainer);
     containerEl.createEl("h2", { text: "Sync" });
+    new import_obsidian.Setting(containerEl).setName("Status bar indicator").setDesc("Show a small sync status icon in the bottom status bar").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.showSyncStatus).onChange(async (value) => {
+        this.plugin.settings.showSyncStatus = value;
+        await this.plugin.saveSettings();
+        this.plugin.updateStatusBar();
+      })
+    );
     new import_obsidian.Setting(containerEl).setName("Sync delay").setDesc("How long to wait after your last keystroke before sending changes (300\u20132000 ms)").addSlider(
       (slider) => slider.setLimits(300, 2e3, 50).setValue(this.plugin.settings.debounceMs).setDynamicTooltip().onChange(async (value) => {
         this.plugin.settings.debounceMs = value;
@@ -2870,6 +2878,8 @@ var SyncEngine = class {
     /** Set to true after stop() — prevents reconnect after intentional close. */
     __publicField(this, "stopped", false);
     __publicField(this, "statusCallback", null);
+    /** Fires on every message received from the server (pong, ack, delta, etc.). */
+    __publicField(this, "onServerActivity", null);
     /** Called on WS open instead of auto-starting initialSync — allows main.ts to show onboarding modal. */
     __publicField(this, "onInitialSync", null);
     this.docs = new DocumentManager(app);
@@ -3227,8 +3237,10 @@ var SyncEngine = class {
   }
   // ── Message handling ────────────────────────────────────────────────────────
   onMessage(data) {
+    var _a;
     const msg = decode(new Uint8Array(data));
     const type = msg.type;
+    (_a = this.onServerActivity) == null ? void 0 : _a.call(this);
     switch (type) {
       case "doc_list":
         this.promises.resolve("doc_list", {
@@ -3513,12 +3525,15 @@ var OnboardingModal = class extends import_obsidian4.Modal {
 };
 
 // src/main.ts
+var ACTIVITY_TIMEOUT_MS = 6e4;
 var VaultCRDTPlugin = class extends import_obsidian5.Plugin {
   constructor() {
     super(...arguments);
     __publicField(this, "settings");
     __publicField(this, "syncEngine");
     __publicField(this, "fileWatcher");
+    __publicField(this, "statusBarEl", null);
+    __publicField(this, "activityTimer", null);
   }
   async onload() {
     await this.loadSettings();
@@ -3571,6 +3586,7 @@ var VaultCRDTPlugin = class extends import_obsidian5.Plugin {
       });
     }
     this.addSettingTab(new VaultCRDTSettingsTab(this.app, this));
+    this.setupStatusBar();
     this.syncEngine.onInitialSync = (engine) => {
       void this.handleInitialSync(engine);
     };
@@ -3618,7 +3634,60 @@ var VaultCRDTPlugin = class extends import_obsidian5.Plugin {
       throw err;
     }
   }
+  setupStatusBar() {
+    this.syncEngine.statusCallback = (status) => {
+      if (!this.statusBarEl) return;
+      if (status === "offline" || status === "error") {
+        this.clearActivityTimer();
+        this.setStatusBarConnected(false);
+      }
+    };
+    this.syncEngine.onServerActivity = () => {
+      if (!this.statusBarEl) return;
+      this.setStatusBarConnected(true);
+      this.resetActivityTimer();
+    };
+    this.updateStatusBar();
+  }
+  updateStatusBar() {
+    var _a;
+    if (this.settings.showSyncStatus) {
+      if (!this.statusBarEl) {
+        this.statusBarEl = this.addStatusBarItem();
+        this.statusBarEl.addClass("vcrdt-status");
+      }
+      this.setStatusBarConnected(false);
+    } else {
+      this.clearActivityTimer();
+      (_a = this.statusBarEl) == null ? void 0 : _a.remove();
+      this.statusBarEl = null;
+    }
+  }
+  resetActivityTimer() {
+    this.clearActivityTimer();
+    this.activityTimer = setTimeout(() => {
+      this.setStatusBarConnected(false);
+    }, ACTIVITY_TIMEOUT_MS);
+  }
+  clearActivityTimer() {
+    if (this.activityTimer) {
+      clearTimeout(this.activityTimer);
+      this.activityTimer = null;
+    }
+  }
+  setStatusBarConnected(connected) {
+    if (!this.statusBarEl) return;
+    this.statusBarEl.empty();
+    this.statusBarEl.appendText("sync\u2002");
+    const dot = this.statusBarEl.createSpan({ text: connected ? "\u25CF" : "\u25CB" });
+    dot.style.fontSize = "0.55em";
+    dot.style.position = "relative";
+    dot.style.top = "0.05em";
+    this.statusBarEl.setAttribute("aria-label", connected ? "VaultCRDT: connected" : "VaultCRDT: not connected");
+    this.statusBarEl.style.color = connected ? "var(--text-muted)" : "var(--text-faint)";
+  }
   async onunload() {
+    this.clearActivityTimer();
     await this.syncEngine.stop();
     log("Plugin unloaded");
   }

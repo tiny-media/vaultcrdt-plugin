@@ -129,6 +129,7 @@ const makeSettings = (overrides: Record<string, unknown> = {}) => ({
   vaultId: 'vault-abc',
   deviceName: 'test-device',
   debounceMs: 300,
+  showSyncStatus: true,
   onboardingComplete: false,
   ...overrides,
 });

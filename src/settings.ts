@@ -9,6 +9,7 @@ export interface VaultCRDTSettings {
   vaultId: string;
   deviceName: string;
   debounceMs: number;
+  showSyncStatus: boolean;
   onboardingComplete: boolean;
 }
 
@@ -20,6 +21,7 @@ export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   vaultId: '',
   deviceName: '',
   debounceMs: 700,
+  showSyncStatus: true,
   onboardingComplete: false,
 };
 
@@ -160,6 +162,17 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
 
     // ── Sync ──────────────────────────────────────────────────────────────
     containerEl.createEl('h2', { text: 'Sync' });
+
+    new Setting(containerEl)
+      .setName('Status bar indicator')
+      .setDesc('Show a small sync status icon in the bottom status bar')
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.showSyncStatus).onChange(async (value) => {
+          this.plugin.settings.showSyncStatus = value;
+          await this.plugin.saveSettings();
+          this.plugin.updateStatusBar();
+        })
+      );
 
     new Setting(containerEl)
       .setName('Sync delay')

@@ -28,7 +28,7 @@ Open Settings > VaultCRDT and set:
 
 - **Server URL** — WebSocket URL of your vaultcrdt-server instance, e.g. `wss://your-server.example.com`
 - **Vault ID** — identifier for this vault on the server
-- **API Key** — credential issued by the server
+- **Vault Secret** — shared secret for this vault (must be identical on every device)
 
 ## Sync Modes
 

@@ -52,6 +52,8 @@ export class SyncEngine {
   private stopped = false;
 
   statusCallback: ((s: SyncStatus) => void) | null = null;
+  /** Fires on every message received from the server (pong, ack, delta, etc.). */
+  onServerActivity: (() => void) | null = null;
   /** Called on WS open instead of auto-starting initialSync — allows main.ts to show onboarding modal. */
   onInitialSync: ((engine: SyncEngine) => void) | null = null;
 
@@ -486,6 +488,7 @@ export class SyncEngine {
   private onMessage(data: ArrayBuffer): void {
     const msg = decode(new Uint8Array(data)) as Record<string, unknown>;
     const type = msg.type as string;
+    this.onServerActivity?.();
 
     switch (type) {
       case 'doc_list':

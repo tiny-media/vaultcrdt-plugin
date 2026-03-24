@@ -7,10 +7,16 @@ import { FileWatcherV2 } from './file-watcher';
 import { OnboardingModal } from './onboarding-modal';
 import { log, error } from './logger';
 
+/** If no server response (pong/ack/delta) for this long, show disconnected. */
+const ACTIVITY_TIMEOUT_MS = 60_000;
+
 export default class VaultCRDTPlugin extends Plugin {
   settings!: VaultCRDTSettings;
   syncEngine!: SyncEngine;
   fileWatcher!: FileWatcherV2;
+  private statusBarEl: HTMLElement | null = null;
+  private activityTimer: ReturnType<typeof setTimeout> | null = null;
+
   async onload(): Promise<void> {
     await this.loadSettings();
     await initWasm();
@@ -79,6 +85,7 @@ export default class VaultCRDTPlugin extends Plugin {
     }
 
     this.addSettingTab(new VaultCRDTSettingsTab(this.app, this));
+    this.setupStatusBar();
 
     // Wire up onboarding modal + progress notice
     this.syncEngine.onInitialSync = (engine) => {
@@ -141,7 +148,66 @@ export default class VaultCRDTPlugin extends Plugin {
     }
   }
 
+  private setupStatusBar(): void {
+    this.syncEngine.statusCallback = (status) => {
+      if (!this.statusBarEl) return;
+      if (status === 'offline' || status === 'error') {
+        this.clearActivityTimer();
+        this.setStatusBarConnected(false);
+      }
+      // 'connected' and 'syncing' are ignored here — only actual server
+      // responses (via onServerActivity) flip the indicator to ●.
+    };
+    this.syncEngine.onServerActivity = () => {
+      if (!this.statusBarEl) return;
+      this.setStatusBarConnected(true);
+      this.resetActivityTimer();
+    };
+    this.updateStatusBar();
+  }
+
+  updateStatusBar(): void {
+    if (this.settings.showSyncStatus) {
+      if (!this.statusBarEl) {
+        this.statusBarEl = this.addStatusBarItem();
+        this.statusBarEl.addClass('vcrdt-status');
+      }
+      this.setStatusBarConnected(false);
+    } else {
+      this.clearActivityTimer();
+      this.statusBarEl?.remove();
+      this.statusBarEl = null;
+    }
+  }
+
+  private resetActivityTimer(): void {
+    this.clearActivityTimer();
+    this.activityTimer = setTimeout(() => {
+      this.setStatusBarConnected(false);
+    }, ACTIVITY_TIMEOUT_MS);
+  }
+
+  private clearActivityTimer(): void {
+    if (this.activityTimer) {
+      clearTimeout(this.activityTimer);
+      this.activityTimer = null;
+    }
+  }
+
+  private setStatusBarConnected(connected: boolean): void {
+    if (!this.statusBarEl) return;
+    this.statusBarEl.empty();
+    this.statusBarEl.appendText('sync\u2002');
+    const dot = this.statusBarEl.createSpan({ text: connected ? '●' : '○' });
+    dot.style.fontSize = '0.55em';
+    dot.style.position = 'relative';
+    dot.style.top = '0.05em';
+    this.statusBarEl.setAttribute('aria-label', connected ? 'VaultCRDT: connected' : 'VaultCRDT: not connected');
+    this.statusBarEl.style.color = connected ? 'var(--text-muted)' : 'var(--text-faint)';
+  }
+
   async onunload(): Promise<void> {
+    this.clearActivityTimer();
     await this.syncEngine.stop();
     log('Plugin unloaded');
   }
