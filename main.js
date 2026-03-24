@@ -47,7 +47,7 @@ var import_obsidian = require("obsidian");
 var DEFAULT_SETTINGS = {
   serverUrl: "http://localhost:3737",
   registrationKey: "",
-  apiKey: "",
+  vaultSecret: "",
   peerId: "",
   vaultId: "",
   deviceName: "",
@@ -122,8 +122,8 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
       return text;
     });
     new import_obsidian.Setting(containerEl).setName("Vault Secret").setDesc("Shared secret for this vault. Must be identical on every device that syncs this vault.").addText((text) => {
-      text.setPlaceholder("vault secret").setValue(this.plugin.settings.apiKey).onChange(async (value) => {
-        this.plugin.settings.apiKey = value;
+      text.setPlaceholder("vault secret").setValue(this.plugin.settings.vaultSecret).onChange(async (value) => {
+        this.plugin.settings.vaultSecret = value;
         await this.plugin.saveSettings();
       });
       text.inputEl.type = "password";
@@ -135,6 +135,10 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+    const devicesDetails = containerEl.createEl("details");
+    devicesDetails.createEl("summary", { text: "Synced Devices", cls: "setting-item-heading" });
+    const devicesContainer = devicesDetails.createDiv();
+    this.loadPeers(devicesContainer);
     containerEl.createEl("h2", { text: "Sync" });
     new import_obsidian.Setting(containerEl).setName("Sync delay").setDesc("How long to wait after your last keystroke before sending changes (300\u20132000 ms)").addSlider(
       (slider) => slider.setLimits(300, 2e3, 50).setValue(this.plugin.settings.debounceMs).setDynamicTooltip().onChange(async (value) => {
@@ -209,6 +213,49 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
       container.createEl("p", { text: `Error loading stats: ${err}`, cls: "setting-item-description" });
     }
   }
+  async loadPeers(container) {
+    var _a, _b, _c;
+    container.createEl("p", { text: "Loading...", cls: "setting-item-description" });
+    const httpBase = this.plugin.settings.serverUrl.replace(/^ws:\/\//, "http://").replace(/^wss:\/\//, "https://");
+    try {
+      const authResp = await (0, import_obsidian.requestUrl)({
+        url: `${httpBase}/auth/verify`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          vault_id: this.plugin.settings.vaultId,
+          api_key: this.plugin.settings.vaultSecret
+        })
+      });
+      const token = (_a = authResp.json) == null ? void 0 : _a.token;
+      if (!token) {
+        container.empty();
+        container.createEl("p", { text: "Not authenticated", cls: "setting-item-description" });
+        return;
+      }
+      const resp = await (0, import_obsidian.requestUrl)({
+        url: `${httpBase}/vault/peers`,
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const peers = (_c = (_b = resp.json) == null ? void 0 : _b.peers) != null ? _c : [];
+      container.empty();
+      if (peers.length === 0) {
+        container.createEl("p", { text: "No devices have synced yet.", cls: "setting-item-description" });
+        return;
+      }
+      const myPeerId = this.plugin.settings.peerId;
+      for (const peer of peers) {
+        const isMe = peer.peer_id === myPeerId;
+        const name = peer.device_name || peer.peer_id.slice(0, 8);
+        const label = isMe ? `${name} (this device)` : name;
+        new import_obsidian.Setting(container).setName(label).setDesc(`Last synced: ${peer.last_seen_at}`);
+      }
+    } catch (e) {
+      container.empty();
+      container.createEl("p", { text: "Could not load (server unreachable or not authenticated)", cls: "setting-item-description" });
+    }
+  }
   async loadServerStats(container) {
     var _a, _b;
     const httpBase = this.plugin.settings.serverUrl.replace(/^ws:\/\//, "http://").replace(/^wss:\/\//, "https://");
@@ -219,7 +266,7 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           vault_id: this.plugin.settings.vaultId,
-          api_key: this.plugin.settings.apiKey
+          api_key: this.plugin.settings.vaultSecret
         })
       });
       const token = (_a = authResp.json) == null ? void 0 : _a.token;
@@ -2870,7 +2917,7 @@ var SyncEngine = class {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         vault_id: this.settings.vaultId,
-        api_key: this.settings.apiKey,
+        api_key: this.settings.vaultSecret,
         registration_key: this.settings.registrationKey
       })
     });
@@ -2882,7 +2929,8 @@ var SyncEngine = class {
   connect() {
     var _a;
     const device = encodeURIComponent(this.settings.deviceName || "unknown");
-    const url = `${this.wsUrl()}?token=${(_a = this.token) != null ? _a : ""}&device=${device}`;
+    const peerId = encodeURIComponent(this.settings.peerId || "");
+    const url = `${this.wsUrl()}?token=${(_a = this.token) != null ? _a : ""}&device=${device}&peer_id=${peerId}`;
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
@@ -3575,7 +3623,12 @@ var VaultCRDTPlugin = class extends import_obsidian5.Plugin {
     log("Plugin unloaded");
   }
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const data = await this.loadData();
+    if (data && "apiKey" in data && !("vaultSecret" in data)) {
+      data.vaultSecret = data.apiKey;
+      delete data.apiKey;
+    }
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
   async saveSettings() {
     await this.saveData(this.settings);
