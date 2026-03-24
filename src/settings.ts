@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting, requestUrl, Notice } from 'obsidian';
+import { App, Platform, PluginSettingTab, Setting, requestUrl, Notice } from 'obsidian';
 import type VaultCRDTPlugin from './main';
 
 export interface VaultCRDTSettings {
@@ -7,6 +7,7 @@ export interface VaultCRDTSettings {
   apiKey: string;
   peerId: string;
   vaultId: string;
+  deviceName: string;
   debounceMs: number;
   onboardingComplete: boolean;
 }
@@ -17,11 +18,10 @@ export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   apiKey: '',
   peerId: '',
   vaultId: '',
+  deviceName: '',
   debounceMs: 700,
   onboardingComplete: false,
 };
-
-const PLUGIN_VERSION = '0.2.0';
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -29,6 +29,20 @@ function formatBytes(bytes: number): string {
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   const value = bytes / Math.pow(1024, i);
   return `${value.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function defaultDeviceName(): string {
+  if (Platform.isDesktopApp) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const os = require('os') as { hostname: () => string; userInfo: () => { username: string } };
+      const user = os.userInfo().username;
+      const host = os.hostname();
+      return `${user}@${host}`;
+    } catch { /* fallback */ }
+  }
+  if (Platform.isMobileApp) return 'mobile';
+  return 'device';
 }
 
 export class VaultCRDTSettingsTab extends PluginSettingTab {
@@ -43,47 +57,35 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    // Auto-generate IDs if empty
+    // Auto-generate IDs and device name if empty
+    let needsSave = false;
     if (!this.plugin.settings.peerId) {
       this.plugin.settings.peerId = crypto.randomUUID();
-      void this.plugin.saveSettings();
+      needsSave = true;
     }
     if (!this.plugin.settings.vaultId) {
       this.plugin.settings.vaultId = crypto.randomUUID();
-      void this.plugin.saveSettings();
+      needsSave = true;
     }
+    if (!this.plugin.settings.deviceName) {
+      this.plugin.settings.deviceName = defaultDeviceName();
+      needsSave = true;
+    }
+    if (needsSave) void this.plugin.saveSettings();
 
-    // ── Status & Info ───────────────────────────────────────────────────────
-    containerEl.createEl('h2', { text: 'Status & Info' });
+    const pluginVersion: string = this.plugin.manifest.version;
+
+    // ── Status ────────────────────────────────────────────────────────────
+    containerEl.createEl('h2', { text: 'Status' });
 
     new Setting(containerEl)
       .setName('Plugin version')
-      .setDesc(`v${PLUGIN_VERSION}`);
+      .setDesc(`v${pluginVersion}`);
 
     const healthSetting = new Setting(containerEl)
       .setName('Server status')
       .setDesc('Checking...');
     this.checkServerHealth(healthSetting);
-
-    new Setting(containerEl)
-      .setName('Vault ID')
-      .setDesc(this.plugin.settings.vaultId)
-      .addButton((btn) =>
-        btn.setButtonText('Copy').onClick(() => {
-          void navigator.clipboard.writeText(this.plugin.settings.vaultId);
-          new Notice('Vault ID copied to clipboard');
-        })
-      );
-
-    new Setting(containerEl)
-      .setName('Peer ID')
-      .setDesc(this.plugin.settings.peerId)
-      .addButton((btn) =>
-        btn.setButtonText('Copy').onClick(() => {
-          void navigator.clipboard.writeText(this.plugin.settings.peerId);
-          new Notice('Peer ID copied to clipboard');
-        })
-      );
 
     // ── Storage Info ──────────────────────────────────────────────────────
     const storageDetails = containerEl.createEl('details');
@@ -91,28 +93,28 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
     const storageContainer = storageDetails.createDiv();
     this.loadStorageInfo(storageContainer);
 
-    // ── Connection & Sync ───────────────────────────────────────────────────
-    containerEl.createEl('h2', { text: 'Connection & Sync' });
+    // ── Connection ────────────────────────────────────────────────────────
+    containerEl.createEl('h2', { text: 'Connection' });
 
     new Setting(containerEl)
-      .setName('Server URL')
-      .setDesc('URL of the VaultCRDT sync server (http:// or https://)')
+      .setName('Server')
+      .setDesc('Address of your VaultCRDT server. WebSocket connection is derived automatically.')
       .addText((text) =>
         text
-          .setPlaceholder('http://localhost:3737')
+          .setPlaceholder('https://obsidian-sync.example.com')
           .setValue(this.plugin.settings.serverUrl)
           .onChange(async (value) => {
-            this.plugin.settings.serverUrl = value;
+            this.plugin.settings.serverUrl = value.trim();
             await this.plugin.saveSettings();
           })
       );
 
     new Setting(containerEl)
-      .setName('Registration Key')
-      .setDesc('Required to register a new vault — get this from the server admin (VAULTCRDT_ADMIN_TOKEN)')
+      .setName('Admin Token')
+      .setDesc('Only needed once when setting up a new vault. Your server admin can provide this.')
       .addText((text) => {
         text
-          .setPlaceholder('registration key')
+          .setPlaceholder('admin token')
           .setValue(this.plugin.settings.registrationKey)
           .onChange(async (value) => {
             this.plugin.settings.registrationKey = value;
@@ -123,11 +125,11 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName('API Key')
-      .setDesc('Your vault key — must match on all devices sharing this vault')
+      .setName('Vault Secret')
+      .setDesc('Shared secret for this vault. Must be identical on every device that syncs this vault.')
       .addText((text) => {
         text
-          .setPlaceholder('my-secret-key')
+          .setPlaceholder('vault secret')
           .setValue(this.plugin.settings.apiKey)
           .onChange(async (value) => {
             this.plugin.settings.apiKey = value;
@@ -138,11 +140,27 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName('Debounce (ms)')
-      .setDesc('Delay before pushing edits to the server (100–2000)')
+      .setName('Device name')
+      .setDesc('Shown in server logs and to other connected devices. Auto-detected from your system.')
+      .addText((text) =>
+        text
+          .setPlaceholder(defaultDeviceName())
+          .setValue(this.plugin.settings.deviceName)
+          .onChange(async (value) => {
+            this.plugin.settings.deviceName = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    // ── Sync ──────────────────────────────────────────────────────────────
+    containerEl.createEl('h2', { text: 'Sync' });
+
+    new Setting(containerEl)
+      .setName('Sync delay')
+      .setDesc('How long to wait after your last keystroke before sending changes (300–2000 ms)')
       .addSlider((slider) =>
         slider
-          .setLimits(100, 2000, 50)
+          .setLimits(300, 2000, 50)
           .setValue(this.plugin.settings.debounceMs)
           .setDynamicTooltip()
           .onChange(async (value) => {
@@ -153,7 +171,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
 
     const syncSetting = new Setting(containerEl)
       .setName('Force full sync')
-      .setDesc('Pull all server docs and push all local files')
+      .setDesc('Re-sync everything: pull all documents from the server and push all local files')
       .addButton((btn) =>
         btn.setButtonText('Sync now').onClick(async () => {
           btn.setDisabled(true);
@@ -162,7 +180,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
             await this.plugin.syncEngine.initialSync((done, total) => {
               syncSetting.setDesc(`${done} / ${total}`);
             });
-            syncSetting.setDesc('Pull all server docs and push all local files');
+            syncSetting.setDesc('Re-sync everything: pull all documents from the server and push all local files');
             btn.setButtonText('Done!');
           } catch {
             btn.setButtonText('Failed');
@@ -183,38 +201,21 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
 
     new Setting(advancedContainer)
       .setName('Peer ID')
-      .setDesc('Changing this will make the server treat this device as a new peer')
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.peerId)
-          .onChange(async (value) => {
-            this.plugin.settings.peerId = value;
-            await this.plugin.saveSettings();
-          })
+      .setDesc(`Unique identifier for this device: ${this.plugin.settings.peerId}`)
+      .addButton((btn) =>
+        btn.setButtonText('Copy').onClick(() => {
+          void navigator.clipboard.writeText(this.plugin.settings.peerId);
+          new Notice('Peer ID copied');
+        })
       );
 
     new Setting(advancedContainer)
       .setName('Vault ID')
-      .setDesc('Must match on all devices sharing this vault')
-      .addText((text) =>
-        text
-          .setValue(this.plugin.settings.vaultId)
-          .onChange(async (value) => {
-            this.plugin.settings.vaultId = value;
-            await this.plugin.saveSettings();
-          })
-      )
-      .addButton((btn) =>
-        btn.setButtonText('Generate').onClick(async () => {
-          this.plugin.settings.vaultId = crypto.randomUUID();
-          await this.plugin.saveSettings();
-          this.display();
-        })
-      )
+      .setDesc(`Identifies this vault on the server: ${this.plugin.settings.vaultId}`)
       .addButton((btn) =>
         btn.setButtonText('Copy').onClick(() => {
           void navigator.clipboard.writeText(this.plugin.settings.vaultId);
-          new Notice('Vault ID copied to clipboard');
+          new Notice('Vault ID copied');
         })
       );
   }

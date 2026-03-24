@@ -124,7 +124,8 @@ export class SyncEngine {
   }
 
   private connect(): void {
-    const url = `${this.wsUrl()}?token=${this.token ?? ''}`;
+    const device = encodeURIComponent(this.settings.deviceName || 'unknown');
+    const url = `${this.wsUrl()}?token=${this.token ?? ''}&device=${device}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     this.ws = ws;

@@ -119,6 +119,7 @@ const makeSettings = (overrides: Record<string, unknown> = {}) => ({
   apiKey: 'test-api-key',
   peerId: 'peer-test',
   vaultId: 'vault-abc',
+  deviceName: 'test-device',
   debounceMs: 300,
   onboardingComplete: false,
   ...overrides,

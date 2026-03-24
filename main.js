@@ -50,16 +50,29 @@ var DEFAULT_SETTINGS = {
   apiKey: "",
   peerId: "",
   vaultId: "",
+  deviceName: "",
   debounceMs: 700,
   onboardingComplete: false
 };
-var PLUGIN_VERSION = "0.1.0";
 function formatBytes(bytes) {
   if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   const value = bytes / Math.pow(1024, i);
   return `${value.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+function defaultDeviceName() {
+  if (import_obsidian.Platform.isDesktopApp) {
+    try {
+      const os = require("os");
+      const user = os.userInfo().username;
+      const host = os.hostname();
+      return `${user}@${host}`;
+    } catch (e) {
+    }
+  }
+  if (import_obsidian.Platform.isMobileApp) return "mobile";
+  return "device";
 }
 var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
@@ -70,64 +83,66 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    let needsSave = false;
     if (!this.plugin.settings.peerId) {
       this.plugin.settings.peerId = crypto.randomUUID();
-      void this.plugin.saveSettings();
+      needsSave = true;
     }
     if (!this.plugin.settings.vaultId) {
       this.plugin.settings.vaultId = crypto.randomUUID();
-      void this.plugin.saveSettings();
+      needsSave = true;
     }
-    containerEl.createEl("h2", { text: "Status & Info" });
-    new import_obsidian.Setting(containerEl).setName("Plugin version").setDesc(`v${PLUGIN_VERSION}`);
+    if (!this.plugin.settings.deviceName) {
+      this.plugin.settings.deviceName = defaultDeviceName();
+      needsSave = true;
+    }
+    if (needsSave) void this.plugin.saveSettings();
+    const pluginVersion = this.plugin.manifest.version;
+    containerEl.createEl("h2", { text: "Status" });
+    new import_obsidian.Setting(containerEl).setName("Plugin version").setDesc(`v${pluginVersion}`);
     const healthSetting = new import_obsidian.Setting(containerEl).setName("Server status").setDesc("Checking...");
     this.checkServerHealth(healthSetting);
-    new import_obsidian.Setting(containerEl).setName("Vault ID").setDesc(this.plugin.settings.vaultId).addButton(
-      (btn) => btn.setButtonText("Copy").onClick(() => {
-        void navigator.clipboard.writeText(this.plugin.settings.vaultId);
-        new import_obsidian.Notice("Vault ID copied to clipboard");
-      })
-    );
-    new import_obsidian.Setting(containerEl).setName("Peer ID").setDesc(this.plugin.settings.peerId).addButton(
-      (btn) => btn.setButtonText("Copy").onClick(() => {
-        void navigator.clipboard.writeText(this.plugin.settings.peerId);
-        new import_obsidian.Notice("Peer ID copied to clipboard");
-      })
-    );
     const storageDetails = containerEl.createEl("details");
     storageDetails.createEl("summary", { text: "Storage Info", cls: "setting-item-heading" });
     const storageContainer = storageDetails.createDiv();
     this.loadStorageInfo(storageContainer);
-    containerEl.createEl("h2", { text: "Connection & Sync" });
-    new import_obsidian.Setting(containerEl).setName("Server URL").setDesc("URL of the VaultCRDT sync server (http:// or https://)").addText(
-      (text) => text.setPlaceholder("http://localhost:3737").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
-        this.plugin.settings.serverUrl = value;
+    containerEl.createEl("h2", { text: "Connection" });
+    new import_obsidian.Setting(containerEl).setName("Server").setDesc("Address of your VaultCRDT server. WebSocket connection is derived automatically.").addText(
+      (text) => text.setPlaceholder("https://obsidian-sync.example.com").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
+        this.plugin.settings.serverUrl = value.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Registration Key").setDesc("Required to register a new vault \u2014 get this from the server admin (VAULTCRDT_ADMIN_TOKEN)").addText((text) => {
-      text.setPlaceholder("registration key").setValue(this.plugin.settings.registrationKey).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Admin Token").setDesc("Only needed once when setting up a new vault. Your server admin can provide this.").addText((text) => {
+      text.setPlaceholder("admin token").setValue(this.plugin.settings.registrationKey).onChange(async (value) => {
         this.plugin.settings.registrationKey = value;
         await this.plugin.saveSettings();
       });
       text.inputEl.type = "password";
       return text;
     });
-    new import_obsidian.Setting(containerEl).setName("API Key").setDesc("Your vault key \u2014 must match on all devices sharing this vault").addText((text) => {
-      text.setPlaceholder("my-secret-key").setValue(this.plugin.settings.apiKey).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Vault Secret").setDesc("Shared secret for this vault. Must be identical on every device that syncs this vault.").addText((text) => {
+      text.setPlaceholder("vault secret").setValue(this.plugin.settings.apiKey).onChange(async (value) => {
         this.plugin.settings.apiKey = value;
         await this.plugin.saveSettings();
       });
       text.inputEl.type = "password";
       return text;
     });
-    new import_obsidian.Setting(containerEl).setName("Debounce (ms)").setDesc("Delay before pushing edits to the server (100\u20132000)").addSlider(
-      (slider) => slider.setLimits(100, 2e3, 50).setValue(this.plugin.settings.debounceMs).setDynamicTooltip().onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Device name").setDesc("Shown in server logs and to other connected devices. Auto-detected from your system.").addText(
+      (text) => text.setPlaceholder(defaultDeviceName()).setValue(this.plugin.settings.deviceName).onChange(async (value) => {
+        this.plugin.settings.deviceName = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    containerEl.createEl("h2", { text: "Sync" });
+    new import_obsidian.Setting(containerEl).setName("Sync delay").setDesc("How long to wait after your last keystroke before sending changes (300\u20132000 ms)").addSlider(
+      (slider) => slider.setLimits(300, 2e3, 50).setValue(this.plugin.settings.debounceMs).setDynamicTooltip().onChange(async (value) => {
         this.plugin.settings.debounceMs = value;
         await this.plugin.saveSettings();
       })
     );
-    const syncSetting = new import_obsidian.Setting(containerEl).setName("Force full sync").setDesc("Pull all server docs and push all local files").addButton(
+    const syncSetting = new import_obsidian.Setting(containerEl).setName("Force full sync").setDesc("Re-sync everything: pull all documents from the server and push all local files").addButton(
       (btn) => btn.setButtonText("Sync now").onClick(async () => {
         btn.setDisabled(true);
         btn.setButtonText("Syncing...");
@@ -135,7 +150,7 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
           await this.plugin.syncEngine.initialSync((done, total) => {
             syncSetting.setDesc(`${done} / ${total}`);
           });
-          syncSetting.setDesc("Pull all server docs and push all local files");
+          syncSetting.setDesc("Re-sync everything: pull all documents from the server and push all local files");
           btn.setButtonText("Done!");
         } catch (e) {
           btn.setButtonText("Failed");
@@ -150,27 +165,16 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
     const details = containerEl.createEl("details");
     details.createEl("summary", { text: "Advanced", cls: "setting-item-heading" });
     const advancedContainer = details.createDiv();
-    new import_obsidian.Setting(advancedContainer).setName("Peer ID").setDesc("Changing this will make the server treat this device as a new peer").addText(
-      (text) => text.setValue(this.plugin.settings.peerId).onChange(async (value) => {
-        this.plugin.settings.peerId = value;
-        await this.plugin.saveSettings();
+    new import_obsidian.Setting(advancedContainer).setName("Peer ID").setDesc(`Unique identifier for this device: ${this.plugin.settings.peerId}`).addButton(
+      (btn) => btn.setButtonText("Copy").onClick(() => {
+        void navigator.clipboard.writeText(this.plugin.settings.peerId);
+        new import_obsidian.Notice("Peer ID copied");
       })
     );
-    new import_obsidian.Setting(advancedContainer).setName("Vault ID").setDesc("Must match on all devices sharing this vault").addText(
-      (text) => text.setValue(this.plugin.settings.vaultId).onChange(async (value) => {
-        this.plugin.settings.vaultId = value;
-        await this.plugin.saveSettings();
-      })
-    ).addButton(
-      (btn) => btn.setButtonText("Generate").onClick(async () => {
-        this.plugin.settings.vaultId = crypto.randomUUID();
-        await this.plugin.saveSettings();
-        this.display();
-      })
-    ).addButton(
+    new import_obsidian.Setting(advancedContainer).setName("Vault ID").setDesc(`Identifies this vault on the server: ${this.plugin.settings.vaultId}`).addButton(
       (btn) => btn.setButtonText("Copy").onClick(() => {
         void navigator.clipboard.writeText(this.plugin.settings.vaultId);
-        new import_obsidian.Notice("Vault ID copied to clipboard");
+        new import_obsidian.Notice("Vault ID copied");
       })
     );
   }
@@ -2877,7 +2881,8 @@ var SyncEngine = class {
   }
   connect() {
     var _a;
-    const url = `${this.wsUrl()}?token=${(_a = this.token) != null ? _a : ""}`;
+    const device = encodeURIComponent(this.settings.deviceName || "unknown");
+    const url = `${this.wsUrl()}?token=${(_a = this.token) != null ? _a : ""}&device=${device}`;
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
