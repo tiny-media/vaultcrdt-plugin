@@ -116,7 +116,7 @@ import { SyncEngine } from '../sync-engine';
 const makeSettings = (overrides: Record<string, unknown> = {}) => ({
   serverUrl: 'http://localhost:3737',
   registrationKey: 'test-server-password',
-  apiKey: 'test-api-key',
+  vaultSecret: 'test-api-key',
   peerId: 'peer-test',
   vaultId: 'vault-abc',
   deviceName: 'test-device',

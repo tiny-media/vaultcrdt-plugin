@@ -4,7 +4,7 @@ import type VaultCRDTPlugin from './main';
 export interface VaultCRDTSettings {
   serverUrl: string;
   registrationKey: string;
-  apiKey: string;
+  vaultSecret: string;
   peerId: string;
   vaultId: string;
   deviceName: string;
@@ -15,7 +15,7 @@ export interface VaultCRDTSettings {
 export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   serverUrl: 'http://localhost:3737',
   registrationKey: '',
-  apiKey: '',
+  vaultSecret: '',
   peerId: '',
   vaultId: '',
   deviceName: '',
@@ -130,9 +130,9 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       .addText((text) => {
         text
           .setPlaceholder('vault secret')
-          .setValue(this.plugin.settings.apiKey)
+          .setValue(this.plugin.settings.vaultSecret)
           .onChange(async (value) => {
-            this.plugin.settings.apiKey = value;
+            this.plugin.settings.vaultSecret = value;
             await this.plugin.saveSettings();
           });
         text.inputEl.type = 'password';
@@ -151,6 +151,12 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
+
+    // ── Synced Devices ────────────────────────────────────────────────────
+    const devicesDetails = containerEl.createEl('details');
+    devicesDetails.createEl('summary', { text: 'Synced Devices', cls: 'setting-item-heading' });
+    const devicesContainer = devicesDetails.createDiv();
+    this.loadPeers(devicesContainer);
 
     // ── Sync ──────────────────────────────────────────────────────────────
     containerEl.createEl('h2', { text: 'Sync' });
@@ -277,6 +283,59 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
     }
   }
 
+  private async loadPeers(container: HTMLElement): Promise<void> {
+    container.createEl('p', { text: 'Loading...', cls: 'setting-item-description' });
+
+    const httpBase = this.plugin.settings.serverUrl
+      .replace(/^ws:\/\//, 'http://')
+      .replace(/^wss:\/\//, 'https://');
+
+    try {
+      const authResp = await requestUrl({
+        url: `${httpBase}/auth/verify`,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          vault_id: this.plugin.settings.vaultId,
+          api_key: this.plugin.settings.vaultSecret,
+        }),
+      });
+      const token: string = authResp.json?.token;
+      if (!token) {
+        container.empty();
+        container.createEl('p', { text: 'Not authenticated', cls: 'setting-item-description' });
+        return;
+      }
+
+      const resp = await requestUrl({
+        url: `${httpBase}/vault/peers`,
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const peers: Array<{ peer_id: string; device_name: string; last_seen_at: string }> = resp.json?.peers ?? [];
+
+      container.empty();
+
+      if (peers.length === 0) {
+        container.createEl('p', { text: 'No devices have synced yet.', cls: 'setting-item-description' });
+        return;
+      }
+
+      const myPeerId = this.plugin.settings.peerId;
+      for (const peer of peers) {
+        const isMe = peer.peer_id === myPeerId;
+        const name = peer.device_name || peer.peer_id.slice(0, 8);
+        const label = isMe ? `${name} (this device)` : name;
+        new Setting(container)
+          .setName(label)
+          .setDesc(`Last synced: ${peer.last_seen_at}`);
+      }
+    } catch {
+      container.empty();
+      container.createEl('p', { text: 'Could not load (server unreachable or not authenticated)', cls: 'setting-item-description' });
+    }
+  }
+
   private async loadServerStats(container: HTMLElement): Promise<void> {
     const httpBase = this.plugin.settings.serverUrl
       .replace(/^ws:\/\//, 'http://')
@@ -290,7 +349,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           vault_id: this.plugin.settings.vaultId,
-          api_key: this.plugin.settings.apiKey,
+          api_key: this.plugin.settings.vaultSecret,
         }),
       });
       const token: string = authResp.json?.token;

@@ -108,7 +108,7 @@ export class SyncEngine {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         vault_id: this.settings.vaultId,
-        api_key: this.settings.apiKey,
+        api_key: this.settings.vaultSecret,
         registration_key: this.settings.registrationKey,
       }),
     });
@@ -125,7 +125,8 @@ export class SyncEngine {
 
   private connect(): void {
     const device = encodeURIComponent(this.settings.deviceName || 'unknown');
-    const url = `${this.wsUrl()}?token=${this.token ?? ''}&device=${device}`;
+    const peerId = encodeURIComponent(this.settings.peerId || '');
+    const url = `${this.wsUrl()}?token=${this.token ?? ''}&device=${device}&peer_id=${peerId}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     this.ws = ws;

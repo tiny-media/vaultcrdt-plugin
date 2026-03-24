@@ -147,7 +147,13 @@ export default class VaultCRDTPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const data = await this.loadData() as Record<string, unknown> | null;
+    // Migrate legacy "apiKey" → "vaultSecret"
+    if (data && 'apiKey' in data && !('vaultSecret' in data)) {
+      data.vaultSecret = data.apiKey;
+      delete data.apiKey;
+    }
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
 
   async saveSettings(): Promise<void> {
