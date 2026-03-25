@@ -94,6 +94,60 @@ export class StateStorage {
     }
   }
 
+  // ── Orphan cleanup ──────────────────────────────────────────────────────
+
+  /**
+   * Remove .loro files that don't match any known doc path.
+   * validPaths should contain all file paths that are either local or on the server.
+   * Returns the number of orphans removed.
+   */
+  async cleanOrphans(validPaths: Set<string>): Promise<number> {
+    const validKeys = new Set<string>();
+    for (const p of validPaths) validKeys.add(this.stateKey(p));
+
+    const allKeys = await this.list();
+    const adapter = this.app.vault.adapter;
+    let removed = 0;
+
+    for (const key of allKeys) {
+      if (key === 'vv-cache.json') continue;
+      if (validKeys.has(key)) continue;
+      try {
+        await adapter.remove(`${STATE_DIR}/${key}`);
+        removed++;
+      } catch {
+        // ignore — file may already be gone
+      }
+    }
+    return removed;
+  }
+
+  // ── VV Cache ──────────────────────────────────────────────────────────────
+
+  private vvCachePath = `${STATE_DIR}/vv-cache.json`;
+
+  /** Persist the lastServerVV map so the next initialSync can skip unchanged docs. */
+  async saveVVCache(map: Map<string, string>): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const obj: Record<string, string> = {};
+    for (const [k, v] of map) obj[k] = v;
+    await adapter.write(this.vvCachePath, JSON.stringify(obj));
+  }
+
+  /** Load the persisted VV cache, or null if none exists. */
+  async loadVVCache(): Promise<Map<string, string> | null> {
+    const adapter = this.app.vault.adapter;
+    try {
+      const exists = await adapter.exists(this.vvCachePath);
+      if (!exists) return null;
+      const raw = await adapter.read(this.vvCachePath);
+      const obj = JSON.parse(raw) as Record<string, string>;
+      return new Map(Object.entries(obj));
+    } catch {
+      return null;
+    }
+  }
+
   /** Delete all persisted state (full reset). */
   async clear(): Promise<void> {
     const adapter = this.app.vault.adapter;

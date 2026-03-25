@@ -2318,6 +2318,8 @@ var StateStorage = class {
   constructor(app) {
     this.app = app;
     __publicField(this, "dirEnsured", false);
+    // ── VV Cache ──────────────────────────────────────────────────────────────
+    __publicField(this, "vvCachePath", `${STATE_DIR}/vv-cache.json`);
   }
   /** `notes/daily/2026-03-16.md` → `notes__daily__2026-03-16.loro` */
   stateKey(filePath) {
@@ -2389,6 +2391,49 @@ var StateStorage = class {
       return entries;
     } catch (e) {
       return [];
+    }
+  }
+  // ── Orphan cleanup ──────────────────────────────────────────────────────
+  /**
+   * Remove .loro files that don't match any known doc path.
+   * validPaths should contain all file paths that are either local or on the server.
+   * Returns the number of orphans removed.
+   */
+  async cleanOrphans(validPaths) {
+    const validKeys = /* @__PURE__ */ new Set();
+    for (const p of validPaths) validKeys.add(this.stateKey(p));
+    const allKeys = await this.list();
+    const adapter = this.app.vault.adapter;
+    let removed = 0;
+    for (const key of allKeys) {
+      if (key === "vv-cache.json") continue;
+      if (validKeys.has(key)) continue;
+      try {
+        await adapter.remove(`${STATE_DIR}/${key}`);
+        removed++;
+      } catch (e) {
+      }
+    }
+    return removed;
+  }
+  /** Persist the lastServerVV map so the next initialSync can skip unchanged docs. */
+  async saveVVCache(map) {
+    const adapter = this.app.vault.adapter;
+    const obj = {};
+    for (const [k, v] of map) obj[k] = v;
+    await adapter.write(this.vvCachePath, JSON.stringify(obj));
+  }
+  /** Load the persisted VV cache, or null if none exists. */
+  async loadVVCache() {
+    const adapter = this.app.vault.adapter;
+    try {
+      const exists = await adapter.exists(this.vvCachePath);
+      if (!exists) return null;
+      const raw = await adapter.read(this.vvCachePath);
+      const obj = JSON.parse(raw);
+      return new Map(Object.entries(obj));
+    } catch (e) {
+      return null;
     }
   }
   /** Delete all persisted state (full reset). */
@@ -2481,6 +2526,15 @@ var DocumentManager = class {
   async loadPersistedSnapshot(filePath) {
     return this.storage.load(filePath);
   }
+  async cleanOrphans(validPaths) {
+    return this.storage.cleanOrphans(validPaths);
+  }
+  async saveVVCache(map) {
+    return this.storage.saveVVCache(map);
+  }
+  async loadVVCache() {
+    return this.storage.loadVVCache();
+  }
 };
 
 // src/conflict-utils.ts
@@ -2505,6 +2559,18 @@ function hasSharedHistory(clientVV, serverVV) {
     return Object.keys(client).some((peer) => peer in server);
   } catch (e) {
     return true;
+  }
+}
+function vvEquals(vvA, vvB) {
+  try {
+    const a = JSON.parse(vvA);
+    const b = JSON.parse(vvB);
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    return keysA.every((k) => a[k] === b[k]) && keysB.every((k) => k in a);
+  } catch (e) {
+    return false;
   }
 }
 function conflictPath(app, path) {
@@ -3002,12 +3068,21 @@ var SyncEngine = class {
       }
       const { docs: serverDocs, tombstones } = await this.requestDocList();
       const tombstoneSet = new Set(tombstones);
-      const serverDocMap = new Map(serverDocs.map((d) => [d.doc_uuid, d]));
       const localPathSet = new Set(localContents.keys());
+      const serverVVStrings = /* @__PURE__ */ new Map();
+      const serverDocMap = /* @__PURE__ */ new Map();
+      for (const d of serverDocs) {
+        serverDocMap.set(d.doc_uuid, d);
+        if (d.server_vv && d.server_vv.length > 0) {
+          serverVVStrings.set(d.doc_uuid, new TextDecoder().decode(d.server_vv));
+        }
+      }
+      const cachedVVs = await this.docs.loadVVCache();
       log(`${this.tag} initialSync start`, {
         serverDocs: serverDocs.length,
         localFiles: localFiles.length,
-        tombstones
+        tombstones,
+        hasCachedVVs: cachedVVs !== null
       });
       const serverOnlyUuids = [...serverDocMap.keys()].filter(
         (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid)
@@ -3076,124 +3151,48 @@ var SyncEngine = class {
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
       }
       log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
-      for (const file of localFiles) {
-        if (tombstoneSet.has(file.path)) continue;
-        if (!serverDocMap.has(file.path)) continue;
-        const doc = await this.docs.getOrLoad(file.path);
+      let skippedVVMatch = 0;
+      for (const file of overlappingFiles) {
         const localContent = (_a = localContents.get(file.path)) != null ? _a : "";
-        const hadPersistedState = doc.version() > 0;
-        if (!hadPersistedState && localContent.trim() !== "") {
-          const result2 = await this.requestSyncStart(file.path, null);
-          if (result2 && result2.delta.length > 0) {
-            const tempDoc = createDocument();
-            tempDoc.import_snapshot(result2.delta);
-            const serverText = tempDoc.get_text();
-            if (serverText.trim() !== "" && serverText !== localContent) {
-              const cPath = conflictPath(this.app, file.path);
-              warn(`${this.tag} concurrent create conflict`, { path: file.path, conflictPath: cPath });
-              await this.app.vault.create(cPath, localContent);
-              doc.import_snapshot(result2.delta);
-              this.lastServerVV.set(file.path, result2.serverVV);
-              await this.editor.writeToVault(file.path, doc.get_text());
-              await this.docs.persist(file.path);
+        const currentServerVV = serverVVStrings.get(file.path);
+        const cachedServerVV = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
+        if (cachedServerVV && currentServerVV && vvEquals(currentServerVV, cachedServerVV)) {
+          const doc = await this.docs.getOrLoad(file.path);
+          const hadPersistedState = doc.version() > 0;
+          if (hadPersistedState && doc.text_matches(localContent)) {
+            this.lastServerVV.set(file.path, currentServerVV);
+            skippedVVMatch++;
+            stepsDone++;
+            onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+            continue;
+          }
+          if (hadPersistedState && localContent.trim() !== "") {
+            doc.sync_from_disk(localContent);
+            const delta = doc.export_delta_since_vv_json(currentServerVV);
+            if (delta.length > 0) {
+              log(`${this.tag} offline edit push (VV match)`, { path: file.path, deltaLen: delta.length });
+              this.send({
+                type: "sync_push",
+                doc_uuid: file.path,
+                delta,
+                peer_id: this.settings.peerId
+              });
               changed++;
-              stepsDone++;
-              onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-              continue;
             }
+            this.lastServerVV.set(file.path, currentServerVV);
+            await this.docs.persist(file.path);
+            stepsDone++;
+            onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+            continue;
           }
         }
-        const hadLocalDiskChange = !doc.text_matches(localContent) && localContent.trim() !== "";
-        if (hadLocalDiskChange) {
-          doc.sync_from_disk(localContent);
-        }
-        const clientVV = doc.export_vv_json();
-        const result = await this.requestSyncStart(file.path, clientVV);
-        if (result) {
-          if (result.delta.length > 0 && hadLocalDiskChange) {
-            const persistedSnapshot = await this.docs.loadPersistedSnapshot(file.path);
-            const tempDoc = createDocument();
-            if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
-            tempDoc.import_snapshot(result.delta);
-            const serverText = tempDoc.get_text();
-            if (serverText.trim() !== "" && serverText !== localContent) {
-              const cPath = conflictPath(this.app, file.path);
-              warn(`${this.tag} concurrent external edit conflict`, { path: file.path, conflictPath: cPath });
-              await this.app.vault.create(cPath, localContent);
-              await this.docs.removeAndClean(file.path);
-              const freshDoc = await this.docs.getOrLoad(file.path);
-              const fullResult = await this.requestSyncStart(file.path, null);
-              if (fullResult && fullResult.delta.length > 0) {
-                freshDoc.import_snapshot(fullResult.delta);
-                this.lastServerVV.set(file.path, fullResult.serverVV);
-              }
-              await this.editor.writeToVault(file.path, freshDoc.get_text());
-              await this.docs.persist(file.path);
-              changed++;
-              stepsDone++;
-              onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-              continue;
-            }
-          }
-          if (result.delta.length > 0 && clientVV !== "{}" && !hasSharedHistory(clientVV, result.serverVV)) {
-            const tempDoc = createDocument();
-            tempDoc.import_snapshot(result.delta);
-            const serverText = tempDoc.get_text();
-            if (serverText.trim() !== "" && localContent.trim() !== "" && serverText !== localContent) {
-              const cPath = conflictPath(this.app, file.path);
-              warn(`${this.tag} disjoint VV conflict`, { path: file.path, conflictPath: cPath });
-              await this.app.vault.create(cPath, localContent);
-              await this.docs.removeAndClean(file.path);
-              const freshDoc = await this.docs.getOrLoad(file.path);
-              freshDoc.import_snapshot(result.delta);
-              this.lastServerVV.set(file.path, result.serverVV);
-              await this.editor.writeToVault(file.path, freshDoc.get_text());
-              await this.docs.persist(file.path);
-              changed++;
-              stepsDone++;
-              onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-              continue;
-            }
-          }
-          let docChanged = result.delta.length > 0;
-          if (docChanged) {
-            doc.import_snapshot(result.delta);
-          }
-          this.lastServerVV.set(file.path, result.serverVV);
-          const serverContent = doc.get_text();
-          if (localContent.trim() === "" && serverContent.trim() !== "") {
-            log(`${this.tag} overlapping: empty local, adopting server`, { path: file.path });
-            await this.editor.writeToVault(file.path, serverContent);
-          } else {
-            const clientVVAfterMerge = doc.export_vv_json();
-            if (!vvCovers(result.serverVV, clientVVAfterMerge)) {
-              const delta = doc.export_delta_since_vv_json(result.serverVV);
-              if (delta.length > 0) {
-                log(`${this.tag} overlapping push delta (VV gap)`, { path: file.path, deltaLen: delta.length });
-                docChanged = true;
-                this.send({
-                  type: "sync_push",
-                  doc_uuid: file.path,
-                  delta,
-                  peer_id: this.settings.peerId
-                });
-              }
-            } else {
-              log(`${this.tag} overlapping match`, { path: file.path });
-            }
-            if (localContent !== serverContent) {
-              await this.editor.writeToVault(file.path, serverContent);
-            }
-          }
-          if (docChanged) changed++;
-        }
-        await this.docs.persist(file.path);
+        await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
         stepsDone++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
       }
+      log(`${this.tag} overlapping done: ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
       if (mode !== "pull") {
-        for (const file of localFiles) {
-          if (tombstoneSet.has(file.path) || serverDocMap.has(file.path)) continue;
+        for (const file of localOnlyFiles) {
           const content = (_b = localContents.get(file.path)) != null ? _b : "";
           log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
           const doc = await this.docs.getOrLoad(file.path);
@@ -3221,6 +3220,12 @@ var SyncEngine = class {
           }
         }
       }
+      await this.docs.saveVVCache(this.lastServerVV);
+      const validPaths = /* @__PURE__ */ new Set([...localPathSet, ...serverDocMap.keys()]);
+      const orphansRemoved = await this.docs.cleanOrphans(validPaths);
+      if (orphansRemoved > 0) {
+        log(`${this.tag} cleaned ${orphansRemoved} orphaned state files`);
+      }
     } finally {
       this.initialSyncRunning = false;
       for (const queued of this.queuedBroadcasts) {
@@ -3234,6 +3239,105 @@ var SyncEngine = class {
       this.queuedBroadcasts = [];
       this.setStatus("connected");
     }
+  }
+  /** Full sync for a single overlapping doc — conflict detection + merge + push. */
+  async syncOverlappingDoc(path, localContent, serverDocMap) {
+    const doc = await this.docs.getOrLoad(path);
+    const hadPersistedState = doc.version() > 0;
+    if (!hadPersistedState && localContent.trim() !== "") {
+      const result2 = await this.requestSyncStart(path, null);
+      if (result2 && result2.delta.length > 0) {
+        const tempDoc = createDocument();
+        tempDoc.import_snapshot(result2.delta);
+        const serverText = tempDoc.get_text();
+        if (serverText.trim() !== "" && serverText !== localContent) {
+          const cPath = conflictPath(this.app, path);
+          warn(`${this.tag} concurrent create conflict`, { path, conflictPath: cPath });
+          await this.app.vault.create(cPath, localContent);
+          doc.import_snapshot(result2.delta);
+          this.lastServerVV.set(path, result2.serverVV);
+          await this.editor.writeToVault(path, doc.get_text());
+          await this.docs.persist(path);
+          return;
+        }
+      }
+    }
+    const hadLocalDiskChange = !doc.text_matches(localContent) && localContent.trim() !== "";
+    if (hadLocalDiskChange) {
+      doc.sync_from_disk(localContent);
+    }
+    const clientVV = doc.export_vv_json();
+    const result = await this.requestSyncStart(path, clientVV);
+    if (result) {
+      if (result.delta.length > 0 && hadLocalDiskChange) {
+        const persistedSnapshot = await this.docs.loadPersistedSnapshot(path);
+        const tempDoc = createDocument();
+        if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
+        tempDoc.import_snapshot(result.delta);
+        const serverText = tempDoc.get_text();
+        if (serverText.trim() !== "" && serverText !== localContent) {
+          const cPath = conflictPath(this.app, path);
+          warn(`${this.tag} concurrent external edit conflict`, { path, conflictPath: cPath });
+          await this.app.vault.create(cPath, localContent);
+          await this.docs.removeAndClean(path);
+          const freshDoc = await this.docs.getOrLoad(path);
+          const fullResult = await this.requestSyncStart(path, null);
+          if (fullResult && fullResult.delta.length > 0) {
+            freshDoc.import_snapshot(fullResult.delta);
+            this.lastServerVV.set(path, fullResult.serverVV);
+          }
+          await this.editor.writeToVault(path, freshDoc.get_text());
+          await this.docs.persist(path);
+          return;
+        }
+      }
+      if (result.delta.length > 0 && clientVV !== "{}" && !hasSharedHistory(clientVV, result.serverVV)) {
+        const tempDoc = createDocument();
+        tempDoc.import_snapshot(result.delta);
+        const serverText = tempDoc.get_text();
+        if (serverText.trim() !== "" && localContent.trim() !== "" && serverText !== localContent) {
+          const cPath = conflictPath(this.app, path);
+          warn(`${this.tag} disjoint VV conflict`, { path, conflictPath: cPath });
+          await this.app.vault.create(cPath, localContent);
+          await this.docs.removeAndClean(path);
+          const freshDoc = await this.docs.getOrLoad(path);
+          freshDoc.import_snapshot(result.delta);
+          this.lastServerVV.set(path, result.serverVV);
+          await this.editor.writeToVault(path, freshDoc.get_text());
+          await this.docs.persist(path);
+          return;
+        }
+      }
+      if (result.delta.length > 0) {
+        doc.import_snapshot(result.delta);
+      }
+      this.lastServerVV.set(path, result.serverVV);
+      const serverContent = doc.get_text();
+      if (localContent.trim() === "" && serverContent.trim() !== "") {
+        log(`${this.tag} overlapping: empty local, adopting server`, { path });
+        await this.editor.writeToVault(path, serverContent);
+      } else {
+        const clientVVAfterMerge = doc.export_vv_json();
+        if (!vvCovers(result.serverVV, clientVVAfterMerge)) {
+          const delta = doc.export_delta_since_vv_json(result.serverVV);
+          if (delta.length > 0) {
+            log(`${this.tag} overlapping push delta (VV gap)`, { path, deltaLen: delta.length });
+            this.send({
+              type: "sync_push",
+              doc_uuid: path,
+              delta,
+              peer_id: this.settings.peerId
+            });
+          }
+        } else {
+          log(`${this.tag} overlapping match`, { path });
+        }
+        if (localContent !== serverContent) {
+          await this.editor.writeToVault(path, serverContent);
+        }
+      }
+    }
+    await this.docs.persist(path);
   }
   // ── Message handling ────────────────────────────────────────────────────────
   onMessage(data) {

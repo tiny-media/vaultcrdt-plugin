@@ -81,4 +81,16 @@ export class DocumentManager {
   async loadPersistedSnapshot(filePath: string): Promise<Uint8Array | null> {
     return this.storage.load(filePath);
   }
+
+  async cleanOrphans(validPaths: Set<string>): Promise<number> {
+    return this.storage.cleanOrphans(validPaths);
+  }
+
+  async saveVVCache(map: Map<string, string>): Promise<void> {
+    return this.storage.saveVVCache(map);
+  }
+
+  async loadVVCache(): Promise<Map<string, string> | null> {
+    return this.storage.loadVVCache();
+  }
 }

@@ -24,6 +24,20 @@ export function hasSharedHistory(clientVV: string, serverVV: string): boolean {
   }
 }
 
+/** Check if two VV JSON strings represent the same version vector. */
+export function vvEquals(vvA: string, vvB: string): boolean {
+  try {
+    const a = JSON.parse(vvA) as Record<string, number>;
+    const b = JSON.parse(vvB) as Record<string, number>;
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    return keysA.every((k) => a[k] === b[k]) && keysB.every((k) => k in a);
+  } catch {
+    return false;
+  }
+}
+
 /** Generate a conflict file path with date and optional counter. */
 export function conflictPath(app: App, path: string): string {
   const date = new Date().toISOString().slice(0, 10);
