@@ -73,7 +73,6 @@ export class SyncEngine {
       this.lastServerVV,
       (s) => this.setStatus(s),
       () => this.ws?.readyState === WebSocket.OPEN,
-      () => this.initialSyncRunning,
       this.tag,
     );
   }
@@ -194,9 +193,6 @@ export class SyncEngine {
     this.setStatus('syncing');
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
-    const hotDocPaths = new Set<string>();
-    const serverVVStrings = new Map<string, string>();
-    const contentHashes = new Map<string, number>();
 
     try {
       // Build local file index (metadata only — no content reads yet)
@@ -209,6 +205,9 @@ export class SyncEngine {
       const { docs: serverDocs, tombstones } = await this.requestDocList();
       const tombstoneSet = new Set(tombstones);
       const localPathSet = new Set(localFileMap.keys());
+
+      // Decode server VVs from binary to JSON strings for comparison
+      const serverVVStrings = new Map<string, string>();
       const serverDocMap = new Map<string, DocEntry>();
       for (const d of serverDocs) {
         serverDocMap.set(d.doc_uuid, d);
@@ -240,7 +239,7 @@ export class SyncEngine {
       const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
       let stepsDone = 0;
       let changed = 0;
-      // contentHashes declared before try — shared with finally for hot doc sync
+      const contentHashes = new Map<string, number>(); // path → fnv1a hash (for VV cache)
 
       let downloadOk = 0;
       let downloadFail = 0;
@@ -310,21 +309,10 @@ export class SyncEngine {
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs?.get(file.path);
 
-        // Prefer editor buffer over disk — editor has the user's live typing
-        const editorContent = this.editor.readCurrentContent(file.path);
-        const localContent = editorContent ?? await this.app.vault.read(file);
+        // Always read content (needed for hash check or sync)
+        const localContent = await this.app.vault.read(file);
         const hash = fnv1aHash(localContent);
         contentHashes.set(file.path, hash);
-
-        // Hot doc: editor is open — skip in overlapping loop, sync separately
-        // after initialSync via import_and_diff + applyDiffToEditor (surgical diffs,
-        // no setValue) to avoid overwriting keystrokes typed during sync.
-        if (editorContent !== null) {
-          hotDocPaths.add(file.path);
-          stepsDone++;
-          onProgress?.(stepsDone, totalSteps, changed);
-          continue;
-        }
 
         // Tier 1: VV match + content hash match → skip (no CRDT load)
         if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
@@ -337,11 +325,11 @@ export class SyncEngine {
             continue;
           }
 
-          // Hash mismatch → check if CRDT already matches disk (e.g. cache migration sentinel)
+          // Hash mismatch → check if CRDT already matches disk (e.g. cache migration)
           const doc = await this.docs.getOrLoad(file.path);
           if (doc.version() > 0 && localContent.trim() !== '') {
             if (doc.text_matches(localContent)) {
-              // CRDT already matches disk — hash was stale (cache migration), no push needed
+              // CRDT already matches disk — hash was stale, no push needed
               log(`${this.tag} hash-only update (CRDT matches disk)`, { path: file.path });
               this.lastServerVV.set(file.path, currentServerVV);
               stepsDone++;
@@ -369,7 +357,7 @@ export class SyncEngine {
         }
 
         // Tier 2: Full sync — server VV changed, no cache, or no persisted CRDT state
-        await this.syncOverlappingDoc(file.path, localContent, serverDocMap, editorContent !== null);
+        await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
         stepsDone++;
         onProgress?.(stepsDone, totalSteps, changed);
       }
@@ -426,19 +414,6 @@ export class SyncEngine {
         log(`${this.tag} cleaned ${orphansRemoved} orphaned state files`);
       }
     } finally {
-      // Sync hot docs (open editors) separately — surgical diffs, no setValue.
-      for (const path of hotDocPaths) {
-        try {
-          await this.syncHotDoc(path, serverVVStrings.get(path) ?? null, contentHashes);
-        } catch (err) {
-          warn(`${this.tag} syncHotDoc failed`, { path, err });
-        }
-      }
-
-      // Reconcile open editors BEFORE clearing the flag — deferred pushes must
-      // wait until reconciliation is done to avoid racing on the same CRDT.
-      await this.reconcileOpenEditors();
-
       this.initialSyncRunning = false;
 
       for (const queued of this.queuedBroadcasts) {
@@ -455,15 +430,11 @@ export class SyncEngine {
     }
   }
 
-  /** Full sync for a single overlapping doc — conflict detection + merge + push.
-   *  @param isLiveEdit true when localContent came from an open editor (live typing),
-   *         false when it came from vault.read() (offline disk change). Conflict
-   *         detection is skipped for live edits — the CRDT merge handles them correctly. */
+  /** Full sync for a single overlapping doc — conflict detection + merge + push. */
   private async syncOverlappingDoc(
     path: string,
     localContent: string,
     serverDocMap: Map<string, DocEntry>,
-    isLiveEdit = false,
   ): Promise<void> {
     const doc = await this.docs.getOrLoad(path);
     const hadPersistedState = doc.version() > 0;
@@ -502,9 +473,8 @@ export class SyncEngine {
     const result = await this.requestSyncStart(path, clientVV);
 
     if (result) {
-      // Concurrent external-edit conflict detection (skip for live editor typing —
-      // the CRDT merge handles concurrent edits correctly without conflict files)
-      if (result.delta.length > 0 && hadLocalDiskChange && !isLiveEdit) {
+      // Concurrent external-edit conflict detection
+      if (result.delta.length > 0 && hadLocalDiskChange) {
         const persistedSnapshot = await this.docs.loadPersistedSnapshot(path);
         const tempDoc = createDocument();
         if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
@@ -529,12 +499,11 @@ export class SyncEngine {
         }
       }
 
-      // Disjoint-VV conflict detection (skip for live editor typing)
+      // Disjoint-VV conflict detection
       if (
         result.delta.length > 0 &&
         clientVV !== '{}' &&
-        !hasSharedHistory(clientVV, result.serverVV) &&
-        !isLiveEdit
+        !hasSharedHistory(clientVV, result.serverVV)
       ) {
         const tempDoc = createDocument();
         tempDoc.import_snapshot(result.delta);
@@ -589,109 +558,6 @@ export class SyncEngine {
       }
     }
     await this.docs.persist(path);
-  }
-
-  /** Reconcile open editors after initialSync — push any edits that happened during sync. */
-  private async reconcileOpenEditors(): Promise<void> {
-    const openEditors = this.editor.getOpenEditorPaths();
-    for (const [path, editorContent] of openEditors) {
-      const doc = this.docs.get(path);
-      if (!doc || doc.text_matches(editorContent)) continue;
-
-      log(`${this.tag} reconcile: editor diverged during initialSync`, { path });
-      doc.sync_from_disk(editorContent);
-
-      const serverVV = this.lastServerVV.get(path);
-      if (serverVV) {
-        const delta = doc.export_delta_since_vv_json(serverVV);
-        if (delta.length > 0) {
-          this.send({
-            type: 'sync_push',
-            doc_uuid: path,
-            delta,
-            peer_id: this.settings.peerId,
-          });
-        }
-      }
-      await this.docs.persist(path);
-    }
-  }
-
-  /** Sync a "hot doc" (open in editor) after initialSync.
-   *  Uses import_and_diff + applyDiffToEditor (surgical diffs) instead of
-   *  writeToVault to avoid overwriting keystrokes typed during sync. */
-  private async syncHotDoc(
-    path: string,
-    currentServerVV: string | null,
-    contentHashes: Map<string, number>,
-  ): Promise<void> {
-    const editorContent = this.editor.readCurrentContent(path);
-    if (editorContent === null) {
-      // Editor was closed during sync — nothing to do, reconcile will handle it
-      return;
-    }
-
-    const doc = await this.docs.getOrLoad(path);
-
-    // Sync local typing into CRDT BEFORE requesting server delta
-    if (!doc.text_matches(editorContent)) {
-      doc.sync_from_disk(editorContent);
-    }
-
-    const clientVV = doc.export_vv_json();
-    const result = await this.requestSyncStart(path, clientVV);
-
-    if (result) {
-      // Import server delta with surgical diff
-      if (result.delta.length > 0) {
-        let diffJson: string | null = null;
-        try {
-          diffJson = doc.import_and_diff(result.delta);
-        } catch (err) {
-          warn(`${this.tag} syncHotDoc import_and_diff failed, fallback to import_snapshot`, { path, err });
-          doc.import_snapshot(result.delta);
-        }
-
-        // Apply surgical diff to editor (no setValue)
-        try {
-          if (diffJson && this.editor.applyDiffToEditor(path, diffJson, doc.get_text())) {
-            this.lastRemoteWrite.set(path, doc.get_text());
-          } else {
-            await this.editor.writeToVault(path, doc.get_text());
-          }
-        } catch (err) {
-          warn(`${this.tag} syncHotDoc applyDiff failed, fallback to writeToVault`, { path, err });
-          await this.editor.writeToVault(path, doc.get_text());
-        }
-      }
-
-      this.lastServerVV.set(path, result.serverVV);
-
-      // Push local ops not yet on server (VV gap)
-      const clientVVAfterMerge = doc.export_vv_json();
-      if (!vvCovers(result.serverVV, clientVVAfterMerge)) {
-        const delta = doc.export_delta_since_vv_json(result.serverVV);
-        if (delta.length > 0) {
-          log(`${this.tag} syncHotDoc push delta (VV gap)`, { path, deltaLen: delta.length });
-          this.send({
-            type: 'sync_push',
-            doc_uuid: path,
-            delta,
-            peer_id: this.settings.peerId,
-          });
-        }
-      }
-    } else if (currentServerVV) {
-      // Server returned null (doc_unknown) but we had a server VV — keep it
-      this.lastServerVV.set(path, currentServerVV);
-    }
-
-    // Update content hash for VV cache
-    const freshContent = this.editor.readCurrentContent(path) ?? doc.get_text();
-    contentHashes.set(path, fnv1aHash(freshContent));
-
-    await this.docs.persist(path);
-    log(`${this.tag} syncHotDoc complete`, { path });
   }
 
   // ── Message handling ────────────────────────────────────────────────────────

@@ -2678,18 +2678,6 @@ var EditorIntegration = class {
     });
     return content;
   }
-  /** Return all paths that currently have an open editor with content. */
-  getOpenEditorPaths() {
-    const result = /* @__PURE__ */ new Map();
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      if (!(leaf.view instanceof import_obsidian2.MarkdownView)) return;
-      const file = leaf.view.file;
-      if (!file || result.has(file.path)) return;
-      const editor = leaf.view.editor;
-      if (editor) result.set(file.path, editor.getValue());
-    });
-    return result;
-  }
   async writeToVault(filePath, content) {
     log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);
@@ -2821,7 +2809,7 @@ var EditorIntegration = class {
 
 // src/push-handler.ts
 var PushHandler = class {
-  constructor(docs, editor, send, settings, lastRemoteWrite, lastServerVV, setStatus, isWsOpen, isInitialSyncing, tag) {
+  constructor(docs, editor, send, settings, lastRemoteWrite, lastServerVV, setStatus, isWsOpen, tag) {
     this.docs = docs;
     this.editor = editor;
     this.send = send;
@@ -2830,7 +2818,6 @@ var PushHandler = class {
     this.lastServerVV = lastServerVV;
     this.setStatus = setStatus;
     this.isWsOpen = isWsOpen;
-    this.isInitialSyncing = isInitialSyncing;
     this.tag = tag;
     __publicField(this, "pushDebounceTimers", /* @__PURE__ */ new Map());
     __publicField(this, "pendingDeletes", /* @__PURE__ */ new Set());
@@ -2842,15 +2829,11 @@ var PushHandler = class {
       path,
       setTimeout(() => {
         this.pushDebounceTimers.delete(path);
-        if (this.isInitialSyncing()) {
-          this.onFileChanged(path);
-          return;
-        }
         const freshContent = this.editor.readCurrentContent(path);
         if (freshContent !== null) {
           this.pushFileDelta(path, freshContent);
         }
-      }, this.isInitialSyncing() ? 1e3 : Math.max(this.settings.debounceMs, 300))
+      }, Math.max(this.settings.debounceMs, 300))
     );
   }
   onFileChangedImmediate(path, content) {
@@ -3004,7 +2987,6 @@ var SyncEngine = class {
         var _a;
         return ((_a = this.ws) == null ? void 0 : _a.readyState) === WebSocket.OPEN;
       },
-      () => this.initialSyncRunning,
       this.tag
     );
   }
@@ -3099,13 +3081,10 @@ var SyncEngine = class {
   }
   // ── Initial sync ───────────────────────────────────────────────────────────
   async initialSync(onProgress, mode = "merge") {
-    var _a, _b;
+    var _a;
     this.setStatus("syncing");
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
-    const hotDocPaths = /* @__PURE__ */ new Set();
-    const serverVVStrings = /* @__PURE__ */ new Map();
-    const contentHashes = /* @__PURE__ */ new Map();
     try {
       const localFiles = this.app.vault.getMarkdownFiles();
       const localFileMap = /* @__PURE__ */ new Map();
@@ -3115,6 +3094,7 @@ var SyncEngine = class {
       const { docs: serverDocs, tombstones } = await this.requestDocList();
       const tombstoneSet = new Set(tombstones);
       const localPathSet = new Set(localFileMap.keys());
+      const serverVVStrings = /* @__PURE__ */ new Map();
       const serverDocMap = /* @__PURE__ */ new Map();
       for (const d of serverDocs) {
         serverDocMap.set(d.doc_uuid, d);
@@ -3141,6 +3121,7 @@ var SyncEngine = class {
       const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
       let stepsDone = 0;
       let changed = 0;
+      const contentHashes = /* @__PURE__ */ new Map();
       let downloadOk = 0;
       let downloadFail = 0;
       if (mode !== "push") {
@@ -3200,16 +3181,9 @@ var SyncEngine = class {
       for (const file of overlappingFiles) {
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
-        const editorContent = this.editor.readCurrentContent(file.path);
-        const localContent = editorContent != null ? editorContent : await this.app.vault.read(file);
+        const localContent = await this.app.vault.read(file);
         const hash = fnv1aHash(localContent);
         contentHashes.set(file.path, hash);
-        if (editorContent !== null) {
-          hotDocPaths.add(file.path);
-          stepsDone++;
-          onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-          continue;
-        }
         if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
           if (hash === cached.contentHash) {
             this.lastServerVV.set(file.path, currentServerVV);
@@ -3246,7 +3220,7 @@ var SyncEngine = class {
             continue;
           }
         }
-        await this.syncOverlappingDoc(file.path, localContent, serverDocMap, editorContent !== null);
+        await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
         stepsDone++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
       }
@@ -3292,14 +3266,6 @@ var SyncEngine = class {
         log(`${this.tag} cleaned ${orphansRemoved} orphaned state files`);
       }
     } finally {
-      for (const path of hotDocPaths) {
-        try {
-          await this.syncHotDoc(path, (_b = serverVVStrings.get(path)) != null ? _b : null, contentHashes);
-        } catch (err) {
-          warn(`${this.tag} syncHotDoc failed`, { path, err });
-        }
-      }
-      await this.reconcileOpenEditors();
       this.initialSyncRunning = false;
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type;
@@ -3313,11 +3279,8 @@ var SyncEngine = class {
       this.setStatus("connected");
     }
   }
-  /** Full sync for a single overlapping doc — conflict detection + merge + push.
-   *  @param isLiveEdit true when localContent came from an open editor (live typing),
-   *         false when it came from vault.read() (offline disk change). Conflict
-   *         detection is skipped for live edits — the CRDT merge handles them correctly. */
-  async syncOverlappingDoc(path, localContent, serverDocMap, isLiveEdit = false) {
+  /** Full sync for a single overlapping doc — conflict detection + merge + push. */
+  async syncOverlappingDoc(path, localContent, serverDocMap) {
     const doc = await this.docs.getOrLoad(path);
     const hadPersistedState = doc.version() > 0;
     if (!hadPersistedState && localContent.trim() !== "") {
@@ -3345,7 +3308,7 @@ var SyncEngine = class {
     const clientVV = doc.export_vv_json();
     const result = await this.requestSyncStart(path, clientVV);
     if (result) {
-      if (result.delta.length > 0 && hadLocalDiskChange && !isLiveEdit) {
+      if (result.delta.length > 0 && hadLocalDiskChange) {
         const persistedSnapshot = await this.docs.loadPersistedSnapshot(path);
         const tempDoc = createDocument();
         if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
@@ -3367,7 +3330,7 @@ var SyncEngine = class {
           return;
         }
       }
-      if (result.delta.length > 0 && clientVV !== "{}" && !hasSharedHistory(clientVV, result.serverVV) && !isLiveEdit) {
+      if (result.delta.length > 0 && clientVV !== "{}" && !hasSharedHistory(clientVV, result.serverVV)) {
         const tempDoc = createDocument();
         tempDoc.import_snapshot(result.delta);
         const serverText = tempDoc.get_text();
@@ -3414,86 +3377,6 @@ var SyncEngine = class {
       }
     }
     await this.docs.persist(path);
-  }
-  /** Reconcile open editors after initialSync — push any edits that happened during sync. */
-  async reconcileOpenEditors() {
-    const openEditors = this.editor.getOpenEditorPaths();
-    for (const [path, editorContent] of openEditors) {
-      const doc = this.docs.get(path);
-      if (!doc || doc.text_matches(editorContent)) continue;
-      log(`${this.tag} reconcile: editor diverged during initialSync`, { path });
-      doc.sync_from_disk(editorContent);
-      const serverVV = this.lastServerVV.get(path);
-      if (serverVV) {
-        const delta = doc.export_delta_since_vv_json(serverVV);
-        if (delta.length > 0) {
-          this.send({
-            type: "sync_push",
-            doc_uuid: path,
-            delta,
-            peer_id: this.settings.peerId
-          });
-        }
-      }
-      await this.docs.persist(path);
-    }
-  }
-  /** Sync a "hot doc" (open in editor) after initialSync.
-   *  Uses import_and_diff + applyDiffToEditor (surgical diffs) instead of
-   *  writeToVault to avoid overwriting keystrokes typed during sync. */
-  async syncHotDoc(path, currentServerVV, contentHashes) {
-    var _a;
-    const editorContent = this.editor.readCurrentContent(path);
-    if (editorContent === null) {
-      return;
-    }
-    const doc = await this.docs.getOrLoad(path);
-    if (!doc.text_matches(editorContent)) {
-      doc.sync_from_disk(editorContent);
-    }
-    const clientVV = doc.export_vv_json();
-    const result = await this.requestSyncStart(path, clientVV);
-    if (result) {
-      if (result.delta.length > 0) {
-        let diffJson = null;
-        try {
-          diffJson = doc.import_and_diff(result.delta);
-        } catch (err) {
-          warn(`${this.tag} syncHotDoc import_and_diff failed, fallback to import_snapshot`, { path, err });
-          doc.import_snapshot(result.delta);
-        }
-        try {
-          if (diffJson && this.editor.applyDiffToEditor(path, diffJson, doc.get_text())) {
-            this.lastRemoteWrite.set(path, doc.get_text());
-          } else {
-            await this.editor.writeToVault(path, doc.get_text());
-          }
-        } catch (err) {
-          warn(`${this.tag} syncHotDoc applyDiff failed, fallback to writeToVault`, { path, err });
-          await this.editor.writeToVault(path, doc.get_text());
-        }
-      }
-      this.lastServerVV.set(path, result.serverVV);
-      const clientVVAfterMerge = doc.export_vv_json();
-      if (!vvCovers(result.serverVV, clientVVAfterMerge)) {
-        const delta = doc.export_delta_since_vv_json(result.serverVV);
-        if (delta.length > 0) {
-          log(`${this.tag} syncHotDoc push delta (VV gap)`, { path, deltaLen: delta.length });
-          this.send({
-            type: "sync_push",
-            doc_uuid: path,
-            delta,
-            peer_id: this.settings.peerId
-          });
-        }
-      }
-    } else if (currentServerVV) {
-      this.lastServerVV.set(path, currentServerVV);
-    }
-    const freshContent = (_a = this.editor.readCurrentContent(path)) != null ? _a : doc.get_text();
-    contentHashes.set(path, fnv1aHash(freshContent));
-    await this.docs.persist(path);
-    log(`${this.tag} syncHotDoc complete`, { path });
   }
   // ── Message handling ────────────────────────────────────────────────────────
   onMessage(data) {

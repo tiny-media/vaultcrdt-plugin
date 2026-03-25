@@ -27,19 +27,6 @@ export class EditorIntegration {
     return content;
   }
 
-  /** Return all paths that currently have an open editor with content. */
-  getOpenEditorPaths(): Map<string, string> {
-    const result = new Map<string, string>();
-    this.app.workspace.iterateAllLeaves((leaf: any) => {
-      if (!(leaf.view instanceof MarkdownView)) return;
-      const file = leaf.view.file;
-      if (!file || result.has(file.path)) return;
-      const editor = leaf.view.editor;
-      if (editor) result.set(file.path, editor.getValue());
-    });
-    return result;
-  }
-
   async writeToVault(filePath: string, content: string): Promise<void> {
     log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);
