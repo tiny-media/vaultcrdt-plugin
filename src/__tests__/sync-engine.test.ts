@@ -422,20 +422,24 @@ describe('SyncEngine', () => {
     });
   });
 
-  // ── initialSync — metadata fast-path (Tier 1) ─────────────────────────────
+  // ── initialSync — content-hash fast-path (Tier 1) ──────────────────────────
 
-  describe('initialSync — metadata fast-path', () => {
-    it('skips doc entirely when VV + mtime + size match (zero I/O)', async () => {
+  describe('initialSync — content-hash fast-path', () => {
+    it('skips CRDT load when VV + content hash match', async () => {
       const tfile = Object.create(TFile.prototype);
       tfile.path = 'cached.md';
-      tfile.stat = { mtime: 1700000000000, size: 42, ctime: 1700000000000 };
       mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+      mockVault.read.mockResolvedValue('hello world');
 
-      // Pre-populate VV cache with matching metadata
+      // fnv1a('hello world') — compute expected hash
+      const { fnv1aHash } = await import('../conflict-utils');
+      const expectedHash = fnv1aHash('hello world');
+
+      // Pre-populate VV cache with matching content hash
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
-        _version: 2,
-        'cached.md': { vv: '{"peer1":10}', mtime: 1700000000000, size: 42 },
+        _version: 3,
+        'cached.md': { vv: '{"peer1":10}', contentHash: expectedHash },
       }));
       mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
 
@@ -444,7 +448,6 @@ describe('SyncEngine', () => {
 
       await flush();
 
-      // Server returns same VV
       fireMessage({
         type: 'doc_list',
         docs: [{ doc_uuid: 'cached.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
@@ -453,8 +456,8 @@ describe('SyncEngine', () => {
 
       await syncPromise;
 
-      // vault.read should NOT have been called (Tier 1 skip)
-      expect(mockVault.read).not.toHaveBeenCalled();
+      // vault.read IS called (for hash), but NO CRDT load (getOrLoad not called for this doc)
+      expect(mockVault.read).toHaveBeenCalled();
       // No sync_start should have been sent
       const syncStartCalls = mockEncode.mock.calls.filter(
         (c: any[]) => c[0]?.type === 'sync_start'
@@ -462,19 +465,17 @@ describe('SyncEngine', () => {
       expect(syncStartCalls.length).toBe(0);
     });
 
-    it('falls through to Tier 2 when mtime differs', async () => {
+    it('falls through to full sync when content hash differs', async () => {
       const tfile = Object.create(TFile.prototype);
-      tfile.path = 'touched.md';
-      tfile.stat = { mtime: 1700000099999, size: 42, ctime: 1700000000000 }; // different mtime
+      tfile.path = 'edited.md';
       mockVault.getMarkdownFiles.mockReturnValue([tfile]);
-      mockVault.read.mockResolvedValue('same content');
+      mockVault.read.mockResolvedValue('edited content');
       mockDocInstance.version.mockReturnValue(5);
-      mockDocInstance.text_matches.mockReturnValue(true); // content unchanged
 
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
-        _version: 2,
-        'touched.md': { vv: '{"peer1":10}', mtime: 1700000000000, size: 42 },
+        _version: 3,
+        'edited.md': { vv: '{"peer1":10}', contentHash: 12345 }, // wrong hash
       }));
       mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
 
@@ -485,29 +486,27 @@ describe('SyncEngine', () => {
 
       fireMessage({
         type: 'doc_list',
-        docs: [{ doc_uuid: 'touched.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
+        docs: [{ doc_uuid: 'edited.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
         tombstones: [],
       });
 
-      await syncPromise;
+      await flush();
 
-      // vault.read SHOULD have been called (Tier 1 failed, fell to Tier 2)
-      expect(mockVault.read).toHaveBeenCalled();
-      // But no sync_start (Tier 2 skip via text_matches)
-      const syncStartCalls = mockEncode.mock.calls.filter(
-        (c: any[]) => c[0]?.type === 'sync_start'
+      // Hash mismatch + VV match → offline edit push (sync_push, not sync_start)
+      const syncPushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'edited.md'
       );
-      expect(syncStartCalls.length).toBe(0);
+      expect(syncPushCalls.length).toBe(1);
+
+      await syncPromise;
     });
 
     it('migrates old v1 cache format gracefully', async () => {
       const tfile = Object.create(TFile.prototype);
       tfile.path = 'old.md';
-      tfile.stat = { mtime: 1700000000000, size: 42, ctime: 1700000000000 };
       mockVault.getMarkdownFiles.mockReturnValue([tfile]);
       mockVault.read.mockResolvedValue('content');
       mockDocInstance.version.mockReturnValue(5);
-      mockDocInstance.text_matches.mockReturnValue(true);
 
       // Old v1 format (no _version, plain string values)
       mockAdapter.exists.mockResolvedValue(true);
@@ -527,11 +526,16 @@ describe('SyncEngine', () => {
         tombstones: [],
       });
 
-      await syncPromise;
+      await flush();
 
-      // Old format → sentinel mtime/size → Tier 1 never matches → falls to Tier 2
-      // vault.read should have been called
-      expect(mockVault.read).toHaveBeenCalled();
+      // Old format → sentinel contentHash=0 → hash mismatch → needs CRDT load
+      // sync_push sent for offline edit (VV matches but hash differs)
+      const syncPushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'old.md'
+      );
+      expect(syncPushCalls.length).toBe(1);
+
+      await syncPromise;
     });
   });
 

@@ -4,7 +4,7 @@
 
 | Repo | Version | Pfad |
 |------|---------|------|
-| Plugin | v0.2.6 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
+| Plugin | v0.2.7 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
 | Server | v0.2.3 | `/home/richard/projects/vaultcrdt-server/` (GitHub: tiny-media/vaultcrdt-server) |
 | Fleet | — | `/home/richard/fleet/` (Gitea: git.fryy.de/richard/fleet) |
 
@@ -21,11 +21,13 @@ Server deployed auf `home` via Docker Compose, erreichbar unter `https://obsidia
 
 ## Was letzte Session gebaut wurde
 
+### Plugin v0.2.7
+- **Content-Hash statt mtime**: Tier 1 nutzt jetzt FNV-1a Content-Hash statt mtime/size. Grund: mtime ist auf Android nicht stabil zwischen App-Neustarts → Tier 1 griff nie. Content-Hash ist deterministisch.
+- **Eliminiert CRDT-Loads**: Bei VV-Match + Hash-Match wird kein `.loro`-File geladen (kein `getOrLoad`). 800 Docs × (vault.read + hash) statt 800 × (vault.read + getOrLoad + text_matches).
+- **VV-Cache v3 Format**: `{ vv, contentHash }` statt `{ vv, mtime, size }`. Migriert v1/v2 automatisch.
+
 ### Plugin v0.2.6
-- **Metadata-Fast-Path (Tier 1)**: VV-Cache speichert jetzt `mtime` + `size` pro Doc. Bei VV-Match + unverändertem mtime/size wird das Doc komplett ohne Disk-I/O geskippt. Bei 800 Docs und "nichts geändert": von ~14s auf <100ms (nur in-memory stat-Vergleiche).
-- **Lazy Content-Reads**: `localContents` wird nicht mehr upfront für alle Docs gelesen, sondern erst wenn Tier 2/3 es tatsächlich braucht. Fixt den **"Text verschwindet"-Bug** (User-Edits während initialSync wurden vorher durch stale Snapshot überschrieben).
-- **3-Tier Skip-Logik**: Tier 1 (VV+mtime+size) → Tier 2 (VV+CRDT+text_matches) → Tier 3 (Full Sync).
-- **VV-Cache v2 Format**: Backward-kompatibel — alte v1 Caches werden automatisch migriert (Sentinel-Werte für mtime/size).
+- **Lazy Content-Reads**: `localContents` wird nicht mehr upfront für alle Docs gelesen. Fixt den **"Text verschwindet"-Bug**.
 - **CI-Fix**: Mock-Adapter in Tests um `read`/`write` erweitert.
 
 ### Plugin v0.2.5
@@ -37,18 +39,17 @@ Server deployed auf `home` via Docker Compose, erreichbar unter `https://obsidia
 - **DB-Maintenance**: Wöchentlicher Background-Task mit `PRAGMA optimize` + `VACUUM`.
 - **Peer-Cleanup**: Peers die >90 Tage nicht connected haben werden stündlich gelöscht.
 
-## Priorität 1 — Mobile Startup testen (v0.2.6)
+## Priorität 1 — Mobile Startup testen (v0.2.7)
 
-Der Metadata-Fast-Path (Tier 1) sollte den Mobile-Startup bei "nichts geändert" auf <1s bringen. **Wichtig**: Der erste Start nach dem Upgrade ist einmalig langsam (alter VV-Cache hat kein mtime/size → Sentinel-Werte → alle Docs gehen durch Tier 2/3). Ab dem zweiten Start greift Tier 1.
+Content-Hash Fast-Path sollte den Mobile-Startup bei "nichts geändert" deutlich beschleunigen. Erster Start nach Upgrade ist langsam (Cache-Migration), danach sollte es schnell sein.
 
-**Test-Prozedur:**
-1. Plugin auf Handy deployen
-2. App starten → warten bis Sync fertig (erster Start = langsam, Cache wird im neuen Format geschrieben)
-3. App komplett schließen
-4. Nochmal starten → sollte jetzt <1s sein
-5. Console Logs prüfen: `skippedVVMatch` sollte ~800 zeigen
+**Bekanntes Problem (v0.2.6):** mtime ist auf Android nicht stabil zwischen App-Restarts → Tier 1 mit mtime/size griff nie. Deshalb jetzt Content-Hash (FNV-1a).
 
-Falls der zweite Start immer noch langsam ist: Logs prüfen ob Tier 1 tatsächlich matcht (mtime/size-Vergleich).
+**Verbleibendes Performance-Budget:**
+- 800× `vault.read()` + 800× `fnv1aHash()` — das ist das Minimum für den "nichts geändert"-Fall
+- Falls das immer noch zu langsam ist: `vault.read()` parallelisieren oder file-size als Pre-Filter nutzen
+
+**"Text verschwindet"-Bug:** Lazy reads (v0.2.6) sollten das fixen. Falls der Bug weiterhin auftritt: prüfen ob `writeToVault` während initialSync aufgerufen wird (sollte bei Tier 1 skip nicht passieren).
 
 ## Priorität 2 — Docs & Code Quality
 
@@ -104,20 +105,21 @@ Heartbeat: Ping alle 30s → Pong vom Server
 **Inbound:** `doc_list`, `sync_delta`, `doc_unknown`, `delta_broadcast`, `doc_deleted`, `ack`, `pong`, `error`
 **Outbound:** `ping`, `request_doc_list`, `sync_start`, `sync_push`, `doc_create`, `doc_delete`
 
-### Sync-Flow (initialSync mit 3-Tier Skip)
+### Sync-Flow (initialSync mit Content-Hash Skip)
 ```
 1. Build local file index (metadata only — no content reads)
 2. request_doc_list → Server-VVs (JSON) + Tombstones
-3. Load VV-Cache v2 (vv-cache.json mit mtime/size)
+3. Load VV-Cache v3 (vv-cache.json mit contentHash)
 4. Server-only docs → parallel download (max 5)
-5. Overlapping docs (3-Tier):
-   Tier 1: VV + mtime + size match → SKIP (zero I/O)
-   Tier 2: VV match, metadata changed → lazy read + CRDT check
-   Tier 3: VV mismatch/no cache → syncOverlappingDoc() (full sync)
+5. Overlapping docs:
+   - vault.read() + fnv1aHash()
+   - Tier 1: VV + hash match → SKIP (no CRDT load)
+   - VV match + hash mismatch → offline edit push (CRDT load + sync_push)
+   - Tier 2: VV mismatch/no cache → syncOverlappingDoc() (full sync)
 6. Local-only docs → lazy read + push doc_create
 7. Flush offline deletes
 8. Trash tombstoned files
-9. Save VV-Cache v2 (with current mtime/size)
+9. Save VV-Cache v3 (with content hashes)
 10. Clean orphaned .loro files
 11. Process queued broadcasts
 ```

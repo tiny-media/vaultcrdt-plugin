@@ -4,8 +4,8 @@ const STATE_DIR = '.obsidian/plugins/vaultcrdt/state';
 
 export interface VVCacheEntry {
   vv: string;
-  mtime: number;
-  size: number;
+  /** FNV-1a hash of file content at last sync. Used for fast skip. */
+  contentHash: number;
 }
 
 /**
@@ -132,15 +132,15 @@ export class StateStorage {
 
   private vvCachePath = `${STATE_DIR}/vv-cache.json`;
 
-  /** Persist VV cache with file metadata for fast skip on next startup. */
+  /** Persist VV cache with content hashes for fast skip on next startup. */
   async saveVVCache(map: Map<string, VVCacheEntry>): Promise<void> {
     const adapter = this.app.vault.adapter;
-    const obj: Record<string, VVCacheEntry | number> = { _version: 2 };
+    const obj: Record<string, VVCacheEntry | number> = { _version: 3 };
     for (const [k, v] of map) obj[k] = v;
     await adapter.write(this.vvCachePath, JSON.stringify(obj));
   }
 
-  /** Load persisted VV cache. Migrates old format (v1) to sentinel entries. */
+  /** Load persisted VV cache. Migrates old formats (v1/v2) to sentinel entries. */
   async loadVVCache(): Promise<Map<string, VVCacheEntry> | null> {
     const adapter = this.app.vault.adapter;
     try {
@@ -151,17 +151,23 @@ export class StateStorage {
 
       const result = new Map<string, VVCacheEntry>();
 
-      if (obj._version === 2) {
-        // New format: entries are VVCacheEntry objects
+      if (obj._version === 3) {
+        // Current format: entries have { vv, contentHash }
         for (const [k, v] of Object.entries(obj)) {
           if (k === '_version') continue;
-          const entry = v as VVCacheEntry;
-          result.set(k, entry);
+          result.set(k, v as VVCacheEntry);
+        }
+      } else if (obj._version === 2) {
+        // v2 format had mtime/size → extract vv, use sentinel hash
+        for (const [k, v] of Object.entries(obj)) {
+          if (k === '_version') continue;
+          const entry = v as { vv: string };
+          result.set(k, { vv: entry.vv, contentHash: 0 });
         }
       } else {
-        // Old format (v1): values are plain VV strings → sentinel metadata
+        // v1 format: values are plain VV strings
         for (const [k, v] of Object.entries(obj)) {
-          result.set(k, { vv: v as string, mtime: 0, size: -1 });
+          result.set(k, { vv: v as string, contentHash: 0 });
         }
       }
       return result;

@@ -38,6 +38,16 @@ export function vvEquals(vvA: string, vvB: string): boolean {
   }
 }
 
+/** Fast FNV-1a hash for content comparison. Not cryptographic. */
+export function fnv1aHash(str: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0; // unsigned 32-bit
+}
+
 /** Generate a conflict file path with date and optional counter. */
 export function conflictPath(app: App, path: string): string {
   const date = new Date().toISOString().slice(0, 10);

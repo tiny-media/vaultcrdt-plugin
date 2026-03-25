@@ -2416,14 +2416,14 @@ var StateStorage = class {
     }
     return removed;
   }
-  /** Persist VV cache with file metadata for fast skip on next startup. */
+  /** Persist VV cache with content hashes for fast skip on next startup. */
   async saveVVCache(map) {
     const adapter = this.app.vault.adapter;
-    const obj = { _version: 2 };
+    const obj = { _version: 3 };
     for (const [k, v] of map) obj[k] = v;
     await adapter.write(this.vvCachePath, JSON.stringify(obj));
   }
-  /** Load persisted VV cache. Migrates old format (v1) to sentinel entries. */
+  /** Load persisted VV cache. Migrates old formats (v1/v2) to sentinel entries. */
   async loadVVCache() {
     const adapter = this.app.vault.adapter;
     try {
@@ -2432,15 +2432,20 @@ var StateStorage = class {
       const raw = await adapter.read(this.vvCachePath);
       const obj = JSON.parse(raw);
       const result = /* @__PURE__ */ new Map();
-      if (obj._version === 2) {
+      if (obj._version === 3) {
+        for (const [k, v] of Object.entries(obj)) {
+          if (k === "_version") continue;
+          result.set(k, v);
+        }
+      } else if (obj._version === 2) {
         for (const [k, v] of Object.entries(obj)) {
           if (k === "_version") continue;
           const entry = v;
-          result.set(k, entry);
+          result.set(k, { vv: entry.vv, contentHash: 0 });
         }
       } else {
         for (const [k, v] of Object.entries(obj)) {
-          result.set(k, { vv: v, mtime: 0, size: -1 });
+          result.set(k, { vv: v, contentHash: 0 });
         }
       }
       return result;
@@ -2584,6 +2589,14 @@ function vvEquals(vvA, vvB) {
   } catch (e) {
     return false;
   }
+}
+function fnv1aHash(str) {
+  let hash = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
 }
 function conflictPath(app, path) {
   const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
@@ -3068,6 +3081,7 @@ var SyncEngine = class {
   }
   // ── Initial sync ───────────────────────────────────────────────────────────
   async initialSync(onProgress, mode = "merge") {
+    var _a;
     this.setStatus("syncing");
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
@@ -3107,6 +3121,7 @@ var SyncEngine = class {
       const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
       let stepsDone = 0;
       let changed = 0;
+      const contentHashes = /* @__PURE__ */ new Map();
       let downloadOk = 0;
       let downloadFail = 0;
       if (mode !== "push") {
@@ -3166,25 +3181,19 @@ var SyncEngine = class {
       for (const file of overlappingFiles) {
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
-        if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv) && file.stat.mtime === cached.mtime && file.stat.size === cached.size) {
-          this.lastServerVV.set(file.path, currentServerVV);
-          skippedVVMatch++;
-          stepsDone++;
-          onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-          continue;
-        }
         const localContent = await this.app.vault.read(file);
+        const hash = fnv1aHash(localContent);
+        contentHashes.set(file.path, hash);
         if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-          const doc = await this.docs.getOrLoad(file.path);
-          const hadPersistedState = doc.version() > 0;
-          if (hadPersistedState && doc.text_matches(localContent)) {
+          if (hash === cached.contentHash) {
             this.lastServerVV.set(file.path, currentServerVV);
             skippedVVMatch++;
             stepsDone++;
             onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
             continue;
           }
-          if (hadPersistedState && localContent.trim() !== "") {
+          const doc = await this.docs.getOrLoad(file.path);
+          if (doc.version() > 0 && localContent.trim() !== "") {
             doc.sync_from_disk(localContent);
             const delta = doc.export_delta_since_vv_json(currentServerVV);
             if (delta.length > 0) {
@@ -3212,6 +3221,7 @@ var SyncEngine = class {
       if (mode !== "pull") {
         for (const file of localOnlyFiles) {
           const content = await this.app.vault.read(file);
+          contentHashes.set(file.path, fnv1aHash(content));
           log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
           const doc = await this.docs.getOrLoad(file.path);
           doc.sync_from_disk(content);
@@ -3240,12 +3250,7 @@ var SyncEngine = class {
       }
       const vvCacheEntries = /* @__PURE__ */ new Map();
       for (const [path, vv] of this.lastServerVV) {
-        const tfile = this.app.vault.getAbstractFileByPath(path);
-        if (tfile instanceof import_obsidian3.TFile && tfile.stat) {
-          vvCacheEntries.set(path, { vv, mtime: tfile.stat.mtime, size: tfile.stat.size });
-        } else {
-          vvCacheEntries.set(path, { vv, mtime: 0, size: -1 });
-        }
+        vvCacheEntries.set(path, { vv, contentHash: (_a = contentHashes.get(path)) != null ? _a : 0 });
       }
       await this.docs.saveVVCache(vvCacheEntries);
       const validPaths = /* @__PURE__ */ new Set([...localPathSet, ...serverDocMap.keys()]);
