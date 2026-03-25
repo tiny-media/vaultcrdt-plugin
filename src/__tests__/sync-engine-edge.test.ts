@@ -58,7 +58,9 @@ const {
 
   const mockAdapter = {
     exists: vi.fn().mockResolvedValue(false),
+    read: vi.fn().mockResolvedValue(''),
     readBinary: vi.fn().mockResolvedValue(new ArrayBuffer(0)),
+    write: vi.fn().mockResolvedValue(undefined),
     writeBinary: vi.fn().mockResolvedValue(undefined),
     mkdir: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),

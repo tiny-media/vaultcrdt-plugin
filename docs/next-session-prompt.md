@@ -4,7 +4,7 @@
 
 | Repo | Version | Pfad |
 |------|---------|------|
-| Plugin | v0.2.5 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
+| Plugin | v0.2.6 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
 | Server | v0.2.3 | `/home/richard/projects/vaultcrdt-server/` (GitHub: tiny-media/vaultcrdt-server) |
 | Fleet | — | `/home/richard/fleet/` (Gitea: git.fryy.de/richard/fleet) |
 
@@ -21,47 +21,34 @@ Server deployed auf `home` via Docker Compose, erreichbar unter `https://obsidia
 
 ## Was letzte Session gebaut wurde
 
+### Plugin v0.2.6
+- **Metadata-Fast-Path (Tier 1)**: VV-Cache speichert jetzt `mtime` + `size` pro Doc. Bei VV-Match + unverändertem mtime/size wird das Doc komplett ohne Disk-I/O geskippt. Bei 800 Docs und "nichts geändert": von ~14s auf <100ms (nur in-memory stat-Vergleiche).
+- **Lazy Content-Reads**: `localContents` wird nicht mehr upfront für alle Docs gelesen, sondern erst wenn Tier 2/3 es tatsächlich braucht. Fixt den **"Text verschwindet"-Bug** (User-Edits während initialSync wurden vorher durch stale Snapshot überschrieben).
+- **3-Tier Skip-Logik**: Tier 1 (VV+mtime+size) → Tier 2 (VV+CRDT+text_matches) → Tier 3 (Full Sync).
+- **VV-Cache v2 Format**: Backward-kompatibel — alte v1 Caches werden automatisch migriert (Sentinel-Werte für mtime/size).
+- **CI-Fix**: Mock-Adapter in Tests um `read`/`write` erweitert.
+
 ### Plugin v0.2.5
-- **VV-basierter Quick-Check beim initialSync**: Server-VVs aus `doc_list` werden mit lokal gecachten VVs verglichen. Docs wo Server-VV unverändert + kein lokaler Edit → komplett übersprungen (kein WS-Roundtrip). Bei 800 Docs und "nichts geändert" von ~800 Roundtrips auf 0.
-- **VV-Cache**: `lastServerVV` wird nach jedem initialSync als `vv-cache.json` persistiert.
-- **Offline-Edit Push**: Wenn Server-VV gleich aber lokal editiert → direkter Push ohne `requestSyncStart`.
-- **Orphan State Cleanup**: Nach initialSync werden `.loro`-Dateien gelöscht, die keinem aktiven Doc zugeordnet sind. Räumt alte Encoding-Relikte und gelöschte/umbenannte Docs auf.
-- **syncOverlappingDoc()** als separate Methode extrahiert.
-- Neue Hilfsfunktion `vvEquals()` in conflict-utils.ts.
+- **VV-basierter Quick-Check beim initialSync**: Server-VVs aus `doc_list` werden mit lokal gecachten VVs verglichen. Bei 800 Docs und "nichts geändert" von ~800 Roundtrips auf 0.
+- **VV-Cache**, **Offline-Edit Push**, **Orphan State Cleanup**, **syncOverlappingDoc()** Extraktion, `vvEquals()`.
 
 ### Server v0.2.3
-- **VV-Format-Fix**: `doc_list` liefert jetzt JSON-VVs (statt Loro-Binary). Vorher war der VV-Quick-Check auf Client-Seite wirkungslos, weil `doc_list` und `sync_delta` verschiedene VV-Formate lieferten.
+- **VV-Format-Fix**: `doc_list` liefert jetzt JSON-VVs (statt Loro-Binary).
 - **DB-Maintenance**: Wöchentlicher Background-Task mit `PRAGMA optimize` + `VACUUM`.
 - **Peer-Cleanup**: Peers die >90 Tage nicht connected haben werden stündlich gelöscht.
 
-## Priorität 1 — Mobile Startup blockiert 8-10s
+## Priorität 1 — Mobile Startup testen (v0.2.6)
 
-### Symptom
-Beim Start der Mobile App (Android) zeigt sich ein Spinner für 8-10 Sekunden. Während dieser Zeit ist der Vault benutzbar (man kann tippen), aber:
-- Edits während initialSync werden nicht sofort gesynced
-- Der getippte Text **verschwindet kurz** und taucht nach ~10s wieder auf
-- Erst danach wird der Edit zum Laptop gesynced
+Der Metadata-Fast-Path (Tier 1) sollte den Mobile-Startup bei "nichts geändert" auf <1s bringen. **Wichtig**: Der erste Start nach dem Upgrade ist einmalig langsam (alter VV-Cache hat kein mtime/size → Sentinel-Werte → alle Docs gehen durch Tier 2/3). Ab dem zweiten Start greift Tier 1.
 
-### Ursache (Analyse)
-Der initialSync blockiert den Sync-Lifecycle:
-1. `ws.onopen` → `onInitialSync` callback → `handleInitialSync()` (main.ts:103)
-2. `initialSync()` läuft durch alle Phasen (capture local files, request doc_list, download/merge/push)
-3. Broadcasts die während initialSync einkommen werden in `queuedBroadcasts` geparkt (sync-engine.ts:513-515)
-4. Lokale Edits via `editor-change` werden an `pushHandler.onFileChanged()` weitergeleitet — aber der Push geht nur durch wenn `ws.readyState === WebSocket.OPEN`, was zwar true ist, aber der `sync_push` kann mit dem laufenden initialSync kollidieren
+**Test-Prozedur:**
+1. Plugin auf Handy deployen
+2. App starten → warten bis Sync fertig (erster Start = langsam, Cache wird im neuen Format geschrieben)
+3. App komplett schließen
+4. Nochmal starten → sollte jetzt <1s sein
+5. Console Logs prüfen: `skippedVVMatch` sollte ~800 zeigen
 
-Das "Text verschwindet" passiert wahrscheinlich so:
-- User tippt → Editor hat neuen Text
-- initialSync merkt: overlapping doc, localContent (snapshot von vor dem Edit) ≠ serverContent → schreibt Server-Version zurück (`writeToVault`)
-- User-Edit ist weg (lokaler State wurde überschrieben)
-- Nach initialSync: queued edits werden verarbeitet, Text taucht wieder auf
-
-### Lösungsideen
-1. **initialSync non-blocking machen**: Sync im Hintergrund, UI sofort freigeben. Aber: Race-Conditions zwischen Edits und Sync müssen gelöst werden.
-2. **VV-Quick-Check zuerst, Full-Sync nur für geänderte Docs**: Das haben wir schon gebaut — wenn der VV-Cache stimmt, sollte der Start bei "nichts geändert" quasi instant sein. **ABER:** Der allererste Start nach dem Fix braucht noch einen Full-Sync (alter VV-Cache enthält Binary-Strings statt JSON). Ab dem zweiten Start sollte es schnell sein.
-3. **Editor-Lock während initialSync**: Edits während Sync verbieten (schlechte UX, aber sicher).
-4. **Snapshot-Zeitpunkt verschieben**: `localContents` nicht am Anfang capturen sondern lazy pro Doc — dann enthält der Snapshot den aktuellen Editor-Stand inkl. Edits.
-
-**Empfehlung**: Erstmal testen ob der VV-Quick-Check nach dem Fix (Server liefert jetzt JSON-VVs) den Startup auf dem Handy tatsächlich beschleunigt. Wenn der Cache korrekt greift, sollte der Spinner verschwinden. Falls nicht: Option 4 (lazy capture) als nächster Schritt.
+Falls der zweite Start immer noch langsam ist: Logs prüfen ob Tier 1 tatsächlich matcht (mtime/size-Vergleich).
 
 ## Priorität 2 — Docs & Code Quality
 
@@ -117,20 +104,20 @@ Heartbeat: Ping alle 30s → Pong vom Server
 **Inbound:** `doc_list`, `sync_delta`, `doc_unknown`, `delta_broadcast`, `doc_deleted`, `ack`, `pong`, `error`
 **Outbound:** `ping`, `request_doc_list`, `sync_start`, `sync_push`, `doc_create`, `doc_delete`
 
-### Sync-Flow (initialSync mit VV-Quick-Check)
+### Sync-Flow (initialSync mit 3-Tier Skip)
 ```
-1. Capture local files + contents (snapshot)
-2. request_doc_list → Server-VVs (jetzt JSON!) + Tombstones
-3. Load VV-Cache (vv-cache.json)
+1. Build local file index (metadata only — no content reads)
+2. request_doc_list → Server-VVs (JSON) + Tombstones
+3. Load VV-Cache v2 (vv-cache.json mit mtime/size)
 4. Server-only docs → parallel download (max 5)
-5. Overlapping docs:
-   a. VV-Match + no local edit → SKIP (kein Roundtrip)
-   b. VV-Match + local edit → push delta direkt
-   c. VV-Mismatch/no cache → syncOverlappingDoc() (full conflict detection)
-6. Local-only docs → push doc_create
+5. Overlapping docs (3-Tier):
+   Tier 1: VV + mtime + size match → SKIP (zero I/O)
+   Tier 2: VV match, metadata changed → lazy read + CRDT check
+   Tier 3: VV mismatch/no cache → syncOverlappingDoc() (full sync)
+6. Local-only docs → lazy read + push doc_create
 7. Flush offline deletes
 8. Trash tombstoned files
-9. Save VV-Cache
+9. Save VV-Cache v2 (with current mtime/size)
 10. Clean orphaned .loro files
 11. Process queued broadcasts
 ```

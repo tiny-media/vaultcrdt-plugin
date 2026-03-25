@@ -59,7 +59,9 @@ const {
 
   const mockAdapter = {
     exists: vi.fn().mockResolvedValue(false),
+    read: vi.fn().mockResolvedValue(''),
     readBinary: vi.fn().mockResolvedValue(new ArrayBuffer(0)),
+    write: vi.fn().mockResolvedValue(undefined),
     writeBinary: vi.fn().mockResolvedValue(undefined),
     mkdir: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn().mockResolvedValue(undefined),
@@ -417,6 +419,119 @@ describe('SyncEngine', () => {
         (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'offline.md'
       );
       expect(syncPushCalls.length).toBe(1);
+    });
+  });
+
+  // ── initialSync — metadata fast-path (Tier 1) ─────────────────────────────
+
+  describe('initialSync — metadata fast-path', () => {
+    it('skips doc entirely when VV + mtime + size match (zero I/O)', async () => {
+      const tfile = Object.create(TFile.prototype);
+      tfile.path = 'cached.md';
+      tfile.stat = { mtime: 1700000000000, size: 42, ctime: 1700000000000 };
+      mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+
+      // Pre-populate VV cache with matching metadata
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        _version: 2,
+        'cached.md': { vv: '{"peer1":10}', mtime: 1700000000000, size: 42 },
+      }));
+      mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      // Server returns same VV
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'cached.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
+        tombstones: [],
+      });
+
+      await syncPromise;
+
+      // vault.read should NOT have been called (Tier 1 skip)
+      expect(mockVault.read).not.toHaveBeenCalled();
+      // No sync_start should have been sent
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start'
+      );
+      expect(syncStartCalls.length).toBe(0);
+    });
+
+    it('falls through to Tier 2 when mtime differs', async () => {
+      const tfile = Object.create(TFile.prototype);
+      tfile.path = 'touched.md';
+      tfile.stat = { mtime: 1700000099999, size: 42, ctime: 1700000000000 }; // different mtime
+      mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+      mockVault.read.mockResolvedValue('same content');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(true); // content unchanged
+
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        _version: 2,
+        'touched.md': { vv: '{"peer1":10}', mtime: 1700000000000, size: 42 },
+      }));
+      mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'touched.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
+        tombstones: [],
+      });
+
+      await syncPromise;
+
+      // vault.read SHOULD have been called (Tier 1 failed, fell to Tier 2)
+      expect(mockVault.read).toHaveBeenCalled();
+      // But no sync_start (Tier 2 skip via text_matches)
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start'
+      );
+      expect(syncStartCalls.length).toBe(0);
+    });
+
+    it('migrates old v1 cache format gracefully', async () => {
+      const tfile = Object.create(TFile.prototype);
+      tfile.path = 'old.md';
+      tfile.stat = { mtime: 1700000000000, size: 42, ctime: 1700000000000 };
+      mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+      mockVault.read.mockResolvedValue('content');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(true);
+
+      // Old v1 format (no _version, plain string values)
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        'old.md': '{"peer1":10}',
+      }));
+      mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'old.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
+        tombstones: [],
+      });
+
+      await syncPromise;
+
+      // Old format → sentinel mtime/size → Tier 1 never matches → falls to Tier 2
+      // vault.read should have been called
+      expect(mockVault.read).toHaveBeenCalled();
     });
   });
 

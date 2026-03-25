@@ -2,6 +2,12 @@ import type { App } from 'obsidian';
 
 const STATE_DIR = '.obsidian/plugins/vaultcrdt/state';
 
+export interface VVCacheEntry {
+  vv: string;
+  mtime: number;
+  size: number;
+}
+
 /**
  * Persists CRDT snapshots as `.loro` files under `.obsidian/plugins/vaultcrdt/state/`.
  * One file per vault document — path-safe encoding replaces `/` with `_`.
@@ -126,23 +132,39 @@ export class StateStorage {
 
   private vvCachePath = `${STATE_DIR}/vv-cache.json`;
 
-  /** Persist the lastServerVV map so the next initialSync can skip unchanged docs. */
-  async saveVVCache(map: Map<string, string>): Promise<void> {
+  /** Persist VV cache with file metadata for fast skip on next startup. */
+  async saveVVCache(map: Map<string, VVCacheEntry>): Promise<void> {
     const adapter = this.app.vault.adapter;
-    const obj: Record<string, string> = {};
+    const obj: Record<string, VVCacheEntry | number> = { _version: 2 };
     for (const [k, v] of map) obj[k] = v;
     await adapter.write(this.vvCachePath, JSON.stringify(obj));
   }
 
-  /** Load the persisted VV cache, or null if none exists. */
-  async loadVVCache(): Promise<Map<string, string> | null> {
+  /** Load persisted VV cache. Migrates old format (v1) to sentinel entries. */
+  async loadVVCache(): Promise<Map<string, VVCacheEntry> | null> {
     const adapter = this.app.vault.adapter;
     try {
       const exists = await adapter.exists(this.vvCachePath);
       if (!exists) return null;
       const raw = await adapter.read(this.vvCachePath);
-      const obj = JSON.parse(raw) as Record<string, string>;
-      return new Map(Object.entries(obj));
+      const obj = JSON.parse(raw) as Record<string, unknown>;
+
+      const result = new Map<string, VVCacheEntry>();
+
+      if (obj._version === 2) {
+        // New format: entries are VVCacheEntry objects
+        for (const [k, v] of Object.entries(obj)) {
+          if (k === '_version') continue;
+          const entry = v as VVCacheEntry;
+          result.set(k, entry);
+        }
+      } else {
+        // Old format (v1): values are plain VV strings → sentinel metadata
+        for (const [k, v] of Object.entries(obj)) {
+          result.set(k, { vv: v as string, mtime: 0, size: -1 });
+        }
+      }
+      return result;
     } catch {
       return null;
     }

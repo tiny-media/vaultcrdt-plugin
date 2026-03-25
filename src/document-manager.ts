@@ -1,6 +1,6 @@
 import { App } from 'obsidian';
 import { createDocument, type WasmSyncDocument } from './wasm-bridge';
-import { StateStorage } from './state-storage';
+import { StateStorage, type VVCacheEntry } from './state-storage';
 import { error } from './logger';
 
 export class DocumentManager {
@@ -86,11 +86,11 @@ export class DocumentManager {
     return this.storage.cleanOrphans(validPaths);
   }
 
-  async saveVVCache(map: Map<string, string>): Promise<void> {
+  async saveVVCache(map: Map<string, VVCacheEntry>): Promise<void> {
     return this.storage.saveVVCache(map);
   }
 
-  async loadVVCache(): Promise<Map<string, string> | null> {
+  async loadVVCache(): Promise<Map<string, VVCacheEntry> | null> {
     return this.storage.loadVVCache();
   }
 }

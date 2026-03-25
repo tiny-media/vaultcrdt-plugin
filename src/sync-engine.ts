@@ -3,6 +3,7 @@ import { encode, decode } from '@msgpack/msgpack';
 import type { VaultCRDTSettings } from './settings';
 import { createDocument, type WasmSyncDocument } from './wasm-bridge';
 import { DocumentManager } from './document-manager';
+import type { VVCacheEntry } from './state-storage';
 import { vvCovers, vvEquals, hasSharedHistory, conflictPath } from './conflict-utils';
 import { PromiseManager } from './promise-manager';
 import { EditorIntegration } from './editor-integration';
@@ -194,16 +195,16 @@ export class SyncEngine {
     this.queuedBroadcasts = [];
 
     try {
-      // Capture local state BEFORE any network IO to prevent broadcast races
+      // Build local file index (metadata only — no content reads yet)
       const localFiles = this.app.vault.getMarkdownFiles() as TFile[];
-      const localContents = new Map<string, string>();
+      const localFileMap = new Map<string, TFile>();
       for (const file of localFiles) {
-        localContents.set(file.path, await this.app.vault.read(file));
+        localFileMap.set(file.path, file);
       }
 
       const { docs: serverDocs, tombstones } = await this.requestDocList();
       const tombstoneSet = new Set(tombstones);
-      const localPathSet = new Set(localContents.keys());
+      const localPathSet = new Set(localFileMap.keys());
 
       // Decode server VVs from binary to JSON strings for comparison
       const serverVVStrings = new Map<string, string>();
@@ -300,21 +301,34 @@ export class SyncEngine {
       }
       log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
 
-      // 2. Overlapping docs — VV-based quick check, then full sync only for changed docs
+      // 2. Overlapping docs — three-tier skip: metadata → content → full sync
       let skippedVVMatch = 0;
 
       for (const file of overlappingFiles) {
-        const localContent = localContents.get(file.path) ?? '';
         const currentServerVV = serverVVStrings.get(file.path);
-        const cachedServerVV = cachedVVs?.get(file.path);
+        const cached = cachedVVs?.get(file.path);
 
-        // VV quick check: skip docs where server hasn't changed AND no local disk edit
-        if (cachedServerVV && currentServerVV && vvEquals(currentServerVV, cachedServerVV)) {
+        // Tier 1: VV match + file metadata match → skip with zero I/O
+        if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)
+            && file.stat.mtime === cached.mtime
+            && file.stat.size === cached.size) {
+          this.lastServerVV.set(file.path, currentServerVV);
+          skippedVVMatch++;
+          stepsDone++;
+          onProgress?.(stepsDone, totalSteps, changed);
+          continue;
+        }
+
+        // Content needed from here → lazy read
+        const localContent = await this.app.vault.read(file);
+
+        // Tier 2: VV match but metadata changed → check CRDT
+        if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
           const doc = await this.docs.getOrLoad(file.path);
           const hadPersistedState = doc.version() > 0;
 
           if (hadPersistedState && doc.text_matches(localContent)) {
-            // Server unchanged, local unchanged → nothing to do
+            // File was touched but content unchanged → skip
             this.lastServerVV.set(file.path, currentServerVV);
             skippedVVMatch++;
             stepsDone++;
@@ -344,7 +358,7 @@ export class SyncEngine {
           }
         }
 
-        // Full sync path — server VV changed, no cache, or no persisted CRDT state
+        // Tier 3: Full sync — server VV changed, no cache, or no persisted CRDT state
         await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
         stepsDone++;
         onProgress?.(stepsDone, totalSteps, changed);
@@ -355,7 +369,7 @@ export class SyncEngine {
       // 3. Local-only docs — push full snapshot via doc_create (skip in pull mode)
       if (mode !== 'pull') {
         for (const file of localOnlyFiles) {
-          const content = localContents.get(file.path) ?? '';
+          const content = await this.app.vault.read(file);
           log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
           const doc = await this.docs.getOrLoad(file.path);
           doc.sync_from_disk(content);
@@ -387,8 +401,17 @@ export class SyncEngine {
         }
       }
 
-      // 6. Persist VV cache for next startup
-      await this.docs.saveVVCache(this.lastServerVV);
+      // 6. Persist VV cache with file metadata for next startup
+      const vvCacheEntries = new Map<string, VVCacheEntry>();
+      for (const [path, vv] of this.lastServerVV) {
+        const tfile = this.app.vault.getAbstractFileByPath(path);
+        if (tfile instanceof TFile && tfile.stat) {
+          vvCacheEntries.set(path, { vv, mtime: tfile.stat.mtime, size: tfile.stat.size });
+        } else {
+          vvCacheEntries.set(path, { vv, mtime: 0, size: -1 });
+        }
+      }
+      await this.docs.saveVVCache(vvCacheEntries);
 
       // 7. Clean orphaned .loro files (deleted/renamed docs, old encoding)
       const validPaths = new Set<string>([...localPathSet, ...serverDocMap.keys()]);

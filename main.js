@@ -2416,14 +2416,14 @@ var StateStorage = class {
     }
     return removed;
   }
-  /** Persist the lastServerVV map so the next initialSync can skip unchanged docs. */
+  /** Persist VV cache with file metadata for fast skip on next startup. */
   async saveVVCache(map) {
     const adapter = this.app.vault.adapter;
-    const obj = {};
+    const obj = { _version: 2 };
     for (const [k, v] of map) obj[k] = v;
     await adapter.write(this.vvCachePath, JSON.stringify(obj));
   }
-  /** Load the persisted VV cache, or null if none exists. */
+  /** Load persisted VV cache. Migrates old format (v1) to sentinel entries. */
   async loadVVCache() {
     const adapter = this.app.vault.adapter;
     try {
@@ -2431,7 +2431,19 @@ var StateStorage = class {
       if (!exists) return null;
       const raw = await adapter.read(this.vvCachePath);
       const obj = JSON.parse(raw);
-      return new Map(Object.entries(obj));
+      const result = /* @__PURE__ */ new Map();
+      if (obj._version === 2) {
+        for (const [k, v] of Object.entries(obj)) {
+          if (k === "_version") continue;
+          const entry = v;
+          result.set(k, entry);
+        }
+      } else {
+        for (const [k, v] of Object.entries(obj)) {
+          result.set(k, { vv: v, mtime: 0, size: -1 });
+        }
+      }
+      return result;
     } catch (e) {
       return null;
     }
@@ -3056,19 +3068,18 @@ var SyncEngine = class {
   }
   // ── Initial sync ───────────────────────────────────────────────────────────
   async initialSync(onProgress, mode = "merge") {
-    var _a, _b;
     this.setStatus("syncing");
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
     try {
       const localFiles = this.app.vault.getMarkdownFiles();
-      const localContents = /* @__PURE__ */ new Map();
+      const localFileMap = /* @__PURE__ */ new Map();
       for (const file of localFiles) {
-        localContents.set(file.path, await this.app.vault.read(file));
+        localFileMap.set(file.path, file);
       }
       const { docs: serverDocs, tombstones } = await this.requestDocList();
       const tombstoneSet = new Set(tombstones);
-      const localPathSet = new Set(localContents.keys());
+      const localPathSet = new Set(localFileMap.keys());
       const serverVVStrings = /* @__PURE__ */ new Map();
       const serverDocMap = /* @__PURE__ */ new Map();
       for (const d of serverDocs) {
@@ -3153,10 +3164,17 @@ var SyncEngine = class {
       log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
       let skippedVVMatch = 0;
       for (const file of overlappingFiles) {
-        const localContent = (_a = localContents.get(file.path)) != null ? _a : "";
         const currentServerVV = serverVVStrings.get(file.path);
-        const cachedServerVV = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
-        if (cachedServerVV && currentServerVV && vvEquals(currentServerVV, cachedServerVV)) {
+        const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
+        if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv) && file.stat.mtime === cached.mtime && file.stat.size === cached.size) {
+          this.lastServerVV.set(file.path, currentServerVV);
+          skippedVVMatch++;
+          stepsDone++;
+          onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+          continue;
+        }
+        const localContent = await this.app.vault.read(file);
+        if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
           const doc = await this.docs.getOrLoad(file.path);
           const hadPersistedState = doc.version() > 0;
           if (hadPersistedState && doc.text_matches(localContent)) {
@@ -3193,7 +3211,7 @@ var SyncEngine = class {
       log(`${this.tag} overlapping done: ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
       if (mode !== "pull") {
         for (const file of localOnlyFiles) {
-          const content = (_b = localContents.get(file.path)) != null ? _b : "";
+          const content = await this.app.vault.read(file);
           log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
           const doc = await this.docs.getOrLoad(file.path);
           doc.sync_from_disk(content);
@@ -3220,7 +3238,16 @@ var SyncEngine = class {
           }
         }
       }
-      await this.docs.saveVVCache(this.lastServerVV);
+      const vvCacheEntries = /* @__PURE__ */ new Map();
+      for (const [path, vv] of this.lastServerVV) {
+        const tfile = this.app.vault.getAbstractFileByPath(path);
+        if (tfile instanceof import_obsidian3.TFile && tfile.stat) {
+          vvCacheEntries.set(path, { vv, mtime: tfile.stat.mtime, size: tfile.stat.size });
+        } else {
+          vvCacheEntries.set(path, { vv, mtime: 0, size: -1 });
+        }
+      }
+      await this.docs.saveVVCache(vvCacheEntries);
       const validPaths = /* @__PURE__ */ new Set([...localPathSet, ...serverDocMap.keys()]);
       const orphansRemoved = await this.docs.cleanOrphans(validPaths);
       if (orphansRemoved > 0) {
