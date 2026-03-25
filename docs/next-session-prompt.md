@@ -1,10 +1,10 @@
-# Next Session — VaultCRDT Stand 2026-03-25
+# Next Session — VaultCRDT Stand 2026-03-25 (v0.2.8)
 
 ## Repos & Versionen
 
 | Repo | Version | Pfad |
 |------|---------|------|
-| Plugin | v0.2.7 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
+| Plugin | v0.2.8 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
 | Server | v0.2.3 | `/home/richard/projects/vaultcrdt-server/` (GitHub: tiny-media/vaultcrdt-server) |
 | Fleet | — | `/home/richard/fleet/` (Gitea: git.fryy.de/richard/fleet) |
 
@@ -22,67 +22,32 @@ Server deployed auf `home` via Docker Compose, erreichbar unter `https://obsidia
 ## Priorität 1 — Mobile Startup Performance
 
 ### Status
-Die initialSync-Performance wurde in v0.2.5–v0.2.7 schrittweise optimiert:
+Die initialSync-Performance wurde in v0.2.5–v0.2.8 schrittweise optimiert:
 
 1. **v0.2.5**: VV-basierter Quick-Check eliminiert WS-Roundtrips (0 statt 800 `sync_start` bei "nichts geändert")
-2. **v0.2.6**: Lazy Content-Reads statt Upfront-Capture aller 800 Docs. Fixt den "Text verschwindet"-Bug.
+2. **v0.2.6**: Lazy Content-Reads statt Upfront-Capture aller 800 Docs.
 3. **v0.2.7**: Content-Hash (FNV-1a) statt mtime/size (mtime auf Android instabil). Eliminiert CRDT-Loads bei VV+Hash-Match.
+4. **v0.2.8**: Drei Bug-Fixes (siehe unten).
 
-### Test-Ergebnis v0.2.7 — ZWEI KRITISCHE BUGS
+### v0.2.8 Bug-Fixes
 
-**Bug 1: 804 Ghost-Pushes bei Cache-Migration**
-Beim ersten Start mit v0.2.7 (Cache noch v2 → sentinel `contentHash: 0`) erkennt der Code für JEDES Doc einen "Hash-Mismatch" und ruft den Offline-Edit-Push-Pfad auf:
-```
-sync_from_disk(localContent) → export_delta_since_vv_json() → sync_push
-```
-Ergebnis: 804× `sync_push` mit `delta=22b` (leere Deltas, weil CRDT bereits matcht). Das blockiert den Sync für ~16s und bombardiert den Server.
+**Bug 1: Ghost-Pushes bei Cache-Migration — GEFIXT**
+Bei Cache-Migration (sentinel `contentHash: 0`) wurde für jedes Doc ein Hash-Mismatch erkannt → 804× `sync_push` mit leeren 22b-Deltas.
+**Fix:** `text_matches()` Check vor `sync_from_disk` + Push. Wenn CRDT bereits mit Disk übereinstimmt, wird nur geloggt und geskippt.
 
-**Root Cause in sync-engine.ts (Overlapping-Loop, VV match + hash mismatch path):**
-```typescript
-// Dieser Pfad wird bei sentinel contentHash=0 für JEDES Doc betreten:
-const doc = await this.docs.getOrLoad(file.path);  // 800× CRDT load!
-if (doc.version() > 0 && localContent.trim() !== '') {
-  doc.sync_from_disk(localContent);   // no-op wenn CRDT = disk
-  const delta = doc.export_delta_since_vv_json(currentServerVV);
-  if (delta.length > 0) {  // 22b = Loro framing, kein echtes Delta
-    this.send({ type: 'sync_push', ... });  // Ghost-Push!
-  }
-}
-```
+**Bug 2: Concurrent-Sync Datenverlust — GEFIXT (via Bug 1)**
+"Plan für Mittwoch" wurde leer, weil Mobile + Laptop gleichzeitig Ghost-Pushes sendeten. Root Cause waren die leeren 22b-Deltas aus Bug 1, die neue VV-Einträge erzeugten und den CRDT-Merge korrumpierten. Server-Code ist korrekt (Doc-Lock auf SyncPush, idempotenter CRDT-Merge). Mit dem Ghost-Push-Fix eliminiert.
 
-**Fix-Idee:** Bei Hash-Mismatch erst `text_matches()` prüfen bevor `sync_from_disk` + Push. Oder: leere Deltas (≤ Schwellenwert, z.B. 32b) nicht pushen.
+**Bug 3: "Text verschwindet" — GEFIXT**
+`writeToVault` in `syncOverlappingDoc` überschrieb den Editor-Buffer während der User tippt. Zwischen vault.read() und writeToVault konnte der User weiter tippen → Edits gingen verloren.
+**Fix:** Vor writeToVault wird der aktuelle Editor-Buffer geprüft (`readCurrentContent`). Wenn der User seit dem Capture editiert hat, werden die neuen Edits per `sync_from_disk` in den CRDT gemerged, dann wird das Merge-Ergebnis geschrieben.
 
-**Bug 2: "Plan für Mittwoch" wurde leer — Datenverlust**
-Timeline aus Server-Logs:
-1. `11:46:53` — Mobile verbindet (initialSync mit 804 Ghost-Pushes)
-2. `11:47:01` — Laptop verbindet gleichzeitig (eigener initialSync)
-3. `11:47:03` — Laptop: `sync_start` für "Plan für Mittwoch" (delta=353b)
-4. `11:47:23` — Laptop: `sync_push` für "Plan für Mittwoch" (delta=22b, snapshot=1770b)
-5. `11:47:23` — Laptop: `sync_start` (nochmal!) → bekommt delta=228b
-6. `11:47:29-33` — Laptop: 4× `sync_push` (User tippt, Snapshots wachsen: 1856→1961)
-7. `11:47:57` — Mobile verbindet erneut (2. Start)
-8. `11:48:13` — Mobile: 3× `sync_push` für "Plan für Mittwoch" (Snapshot: 1967→2064→**2059** ← SHRINK!)
-9. `11:48:25` — Mobile: `sync_push` (2120) + `sync_start` (delta=227b)
+### Performance — TODO
+Der Content-Hash Fast-Path konnte noch nicht verifiziert werden, weil Bug 1 (Ghost-Pushes) den ersten Start dominiert hat. Nach dem Fix sollte der zweite Start schnell sein — testen!
 
-**Das Snapshot-Shrink von 2064→2059 zeigt wo Content verloren ging.** Beide Devices schicken Deltas für dasselbe Doc während ihre initialSyncs gleichzeitig laufen → CRDT-Merge konvergiert zu unerwarteter (leerer?) State.
-
-**Hypothese:** Das Ghost-Push (22b Delta) von Mobile hat den Server-CRDT-State korrumpiert. Dann hat der Laptop den korrumpierten State gemerged, und beim nächsten Roundtrip wurde der leere Content zum "Gewinner" des CRDT-Merges.
-
-**Analyse-Plan für nächste Session:**
-1. Ghost-Push-Bug fixen (sofort, bevor weitere Tests)
-2. Den 22b-Delta auf dem Server inspizieren — was enthält er? `import_snapshot` Ergebnis prüfen
-3. Race-Condition analysieren: Was passiert wenn 2 Devices gleichzeitig initialSync machen?
-4. Ggf. `initialSync` als exklusiv markieren (Server-Lock pro Doc während Sync)
-
-### "Text verschwindet"-Bug (weiterhin vorhanden)
-Der Bug tritt weiterhin auf trotz lazy reads (v0.2.6). Mögliche Ursache: nicht der upfront-Capture, sondern `writeToVault` in `syncOverlappingDoc` (Tier 2/3) überschreibt den Editor-Buffer während der User tippt. Das lazy-Read captured zwar den aktuellen Stand, aber zwischen Read und WriteToVault kann der User weiter tippen → Edit geht verloren.
-
-### Performance
-Der Content-Hash Fast-Path konnte noch nicht verifiziert werden, weil Bug 1 (Ghost-Pushes) den ersten Start dominiert hat. Nach dem Fix sollte der zweite Start schnell sein — aber zuerst Bug 1 fixen.
-
-## Priorität 2 — Ghost-Push-Bug + Concurrent-Sync Race
-
-Bevor weitere Performance-Tests: Ghost-Push-Bug (Bug 1) fixen. Dann concurrent-initialSync Race-Condition (Bug 2) untersuchen.
+## Priorität 2 — Weitere Tests
+- Performance-Messung nach Bug-Fixes (Content-Hash Fast-Path verifizieren)
+- Concurrent-Sync Szenario nochmal testen (sollte jetzt safe sein)
 
 ## Priorität 3 — Code Quality
 
@@ -164,13 +129,13 @@ Heartbeat: Ping alle 30s → Pong vom Server
 11. Process queued broadcasts
 ```
 
-## Erkenntnisse aus dieser Session
+## Erkenntnisse
 
 - **mtime auf Android instabil**: Obsidian Mobile ändert mtime beim App-Start. Niemals mtime für Caching verwenden.
 - **Server-Logs zeigen 0 sync_starts bei VV-Match**: VV-Quick-Check funktioniert serverseitig. Bottleneck ist client-seitig.
 - **27s client-seitig** für 800× vault.read + 800× getOrLoad (gemessen Session 11:24).
-- **Cache-Migration erzeugt Ghost-Pushes**: Sentinel-Werte (contentHash: 0) triggern den Offline-Edit-Push für JEDES Doc. 804× sync_push mit 22b Deltas.
-- **Concurrent initialSync = Datenverlust**: Wenn Mobile und Laptop gleichzeitig initialSync machen und Ghost-Pushes senden, konvergiert der CRDT zu unerwartetem State. "Plan für Mittwoch" wurde leer.
+- **Ghost-Pushes verursachen CRDT-Korruption**: Leere Deltas (22b Loro-Framing) erzeugen neue VV-Einträge → korrumpiert Merge bei concurrent Sync. Fix: `text_matches()` Guard.
+- **writeToVault Race**: Zwischen vault.read() und writeToVault kann der User tippen → Edits gehen verloren. Fix: Editor-Buffer vor Write prüfen und ggf. mergen.
 
 ## SSH / Deploy
 - `SSH_AUTH_SOCK` → 1Password Agent (`~/.1password/agent.sock`)

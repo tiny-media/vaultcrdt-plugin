@@ -3194,6 +3194,13 @@ var SyncEngine = class {
           }
           const doc = await this.docs.getOrLoad(file.path);
           if (doc.version() > 0 && localContent.trim() !== "") {
+            if (doc.text_matches(localContent)) {
+              log(`${this.tag} hash-only update (CRDT matches disk)`, { path: file.path });
+              this.lastServerVV.set(file.path, currentServerVV);
+              stepsDone++;
+              onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+              continue;
+            }
             doc.sync_from_disk(localContent);
             const delta = doc.export_delta_since_vv_json(currentServerVV);
             if (delta.length > 0) {
@@ -3365,7 +3372,25 @@ var SyncEngine = class {
           log(`${this.tag} overlapping match`, { path });
         }
         if (localContent !== serverContent) {
-          await this.editor.writeToVault(path, serverContent);
+          const editorContent = this.editor.readCurrentContent(path);
+          if (editorContent !== null && editorContent !== localContent) {
+            doc.sync_from_disk(editorContent);
+            const merged = doc.get_text();
+            if (merged !== editorContent) {
+              await this.editor.writeToVault(path, merged);
+            }
+            const mergedDelta = doc.export_delta_since_vv_json(result.serverVV);
+            if (mergedDelta.length > 0) {
+              this.send({
+                type: "sync_push",
+                doc_uuid: path,
+                delta: mergedDelta,
+                peer_id: this.settings.peerId
+              });
+            }
+          } else {
+            await this.editor.writeToVault(path, serverContent);
+          }
         }
       }
     }

@@ -325,9 +325,17 @@ export class SyncEngine {
             continue;
           }
 
-          // Hash mismatch → local was edited offline, push changes
+          // Hash mismatch → check if CRDT already matches disk (e.g. cache migration sentinel)
           const doc = await this.docs.getOrLoad(file.path);
           if (doc.version() > 0 && localContent.trim() !== '') {
+            if (doc.text_matches(localContent)) {
+              // CRDT already matches disk — hash was stale (cache migration), no push needed
+              log(`${this.tag} hash-only update (CRDT matches disk)`, { path: file.path });
+              this.lastServerVV.set(file.path, currentServerVV);
+              stepsDone++;
+              onProgress?.(stepsDone, totalSteps, changed);
+              continue;
+            }
             doc.sync_from_disk(localContent);
             const delta = doc.export_delta_since_vv_json(currentServerVV);
             if (delta.length > 0) {
@@ -545,7 +553,28 @@ export class SyncEngine {
         }
 
         if (localContent !== serverContent) {
-          await this.editor.writeToVault(path, serverContent);
+          // Guard against race: user may have typed since we captured localContent
+          const editorContent = this.editor.readCurrentContent(path);
+          if (editorContent !== null && editorContent !== localContent) {
+            // User edited while we were syncing — merge their new edits into CRDT
+            doc.sync_from_disk(editorContent);
+            const merged = doc.get_text();
+            if (merged !== editorContent) {
+              await this.editor.writeToVault(path, merged);
+            }
+            // Push the user's edits + merge result to server
+            const mergedDelta = doc.export_delta_since_vv_json(result.serverVV);
+            if (mergedDelta.length > 0) {
+              this.send({
+                type: 'sync_push',
+                doc_uuid: path,
+                delta: mergedDelta,
+                peer_id: this.settings.peerId,
+              });
+            }
+          } else {
+            await this.editor.writeToVault(path, serverContent);
+          }
         }
       }
     }
