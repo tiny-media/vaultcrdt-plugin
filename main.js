@@ -2678,6 +2678,18 @@ var EditorIntegration = class {
     });
     return content;
   }
+  /** Return all paths that currently have an open editor with content. */
+  getOpenEditorPaths() {
+    const result = /* @__PURE__ */ new Map();
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (!(leaf.view instanceof import_obsidian2.MarkdownView)) return;
+      const file = leaf.view.file;
+      if (!file || result.has(file.path)) return;
+      const editor = leaf.view.editor;
+      if (editor) result.set(file.path, editor.getValue());
+    });
+    return result;
+  }
   async writeToVault(filePath, content) {
     log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);
@@ -2809,7 +2821,7 @@ var EditorIntegration = class {
 
 // src/push-handler.ts
 var PushHandler = class {
-  constructor(docs, editor, send, settings, lastRemoteWrite, lastServerVV, setStatus, isWsOpen, tag) {
+  constructor(docs, editor, send, settings, lastRemoteWrite, lastServerVV, setStatus, isWsOpen, isInitialSyncing, tag) {
     this.docs = docs;
     this.editor = editor;
     this.send = send;
@@ -2818,6 +2830,7 @@ var PushHandler = class {
     this.lastServerVV = lastServerVV;
     this.setStatus = setStatus;
     this.isWsOpen = isWsOpen;
+    this.isInitialSyncing = isInitialSyncing;
     this.tag = tag;
     __publicField(this, "pushDebounceTimers", /* @__PURE__ */ new Map());
     __publicField(this, "pendingDeletes", /* @__PURE__ */ new Set());
@@ -2829,11 +2842,15 @@ var PushHandler = class {
       path,
       setTimeout(() => {
         this.pushDebounceTimers.delete(path);
+        if (this.isInitialSyncing()) {
+          this.onFileChanged(path);
+          return;
+        }
         const freshContent = this.editor.readCurrentContent(path);
         if (freshContent !== null) {
           this.pushFileDelta(path, freshContent);
         }
-      }, Math.max(this.settings.debounceMs, 300))
+      }, this.isInitialSyncing() ? 1e3 : Math.max(this.settings.debounceMs, 300))
     );
   }
   onFileChangedImmediate(path, content) {
@@ -2987,6 +3004,7 @@ var SyncEngine = class {
         var _a;
         return ((_a = this.ws) == null ? void 0 : _a.readyState) === WebSocket.OPEN;
       },
+      () => this.initialSyncRunning,
       this.tag
     );
   }
@@ -3181,7 +3199,8 @@ var SyncEngine = class {
       for (const file of overlappingFiles) {
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
-        const localContent = await this.app.vault.read(file);
+        const editorContent = this.editor.readCurrentContent(file.path);
+        const localContent = editorContent != null ? editorContent : await this.app.vault.read(file);
         const hash = fnv1aHash(localContent);
         contentHashes.set(file.path, hash);
         if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
@@ -3267,6 +3286,7 @@ var SyncEngine = class {
       }
     } finally {
       this.initialSyncRunning = false;
+      await this.reconcileOpenEditors();
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type;
         if (type === "delta_broadcast") {
@@ -3395,6 +3415,29 @@ var SyncEngine = class {
       }
     }
     await this.docs.persist(path);
+  }
+  /** Reconcile open editors after initialSync — push any edits that happened during sync. */
+  async reconcileOpenEditors() {
+    const openEditors = this.editor.getOpenEditorPaths();
+    for (const [path, editorContent] of openEditors) {
+      const doc = this.docs.get(path);
+      if (!doc || doc.text_matches(editorContent)) continue;
+      log(`${this.tag} reconcile: editor diverged during initialSync`, { path });
+      doc.sync_from_disk(editorContent);
+      const serverVV = this.lastServerVV.get(path);
+      if (serverVV) {
+        const delta = doc.export_delta_since_vv_json(serverVV);
+        if (delta.length > 0) {
+          this.send({
+            type: "sync_push",
+            doc_uuid: path,
+            delta,
+            peer_id: this.settings.peerId
+          });
+        }
+      }
+      await this.docs.persist(path);
+    }
   }
   // ── Message handling ────────────────────────────────────────────────────────
   onMessage(data) {

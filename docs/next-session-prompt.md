@@ -4,7 +4,7 @@
 
 | Repo | Version | Pfad |
 |------|---------|------|
-| Plugin | v0.2.8 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
+| Plugin | v0.2.9 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
 | Server | v0.2.3 | `/home/richard/projects/vaultcrdt-server/` (GitHub: tiny-media/vaultcrdt-server) |
 | Fleet | — | `/home/richard/fleet/` (Gitea: git.fryy.de/richard/fleet) |
 
@@ -22,32 +22,34 @@ Server deployed auf `home` via Docker Compose, erreichbar unter `https://obsidia
 ## Priorität 1 — Mobile Startup Performance
 
 ### Status
-Die initialSync-Performance wurde in v0.2.5–v0.2.8 schrittweise optimiert:
+Die initialSync-Performance wurde in v0.2.5–v0.2.9 schrittweise optimiert:
 
 1. **v0.2.5**: VV-basierter Quick-Check eliminiert WS-Roundtrips (0 statt 800 `sync_start` bei "nichts geändert")
 2. **v0.2.6**: Lazy Content-Reads statt Upfront-Capture aller 800 Docs.
 3. **v0.2.7**: Content-Hash (FNV-1a) statt mtime/size (mtime auf Android instabil). Eliminiert CRDT-Loads bei VV+Hash-Match.
-4. **v0.2.8**: Drei Bug-Fixes (siehe unten).
+4. **v0.2.8**: Ghost-push fix (`text_matches()` guard), writeToVault editor guard.
+5. **v0.2.9**: Root-cause fix für "Text verschwindet" — drei zusammenwirkende Änderungen:
+   - Overlapping-Loop liest Editor-Buffer statt `vault.read()` (frische Edits statt stale Disk)
+   - `pushFileDelta` wird während initialSync deferred (verhindert CRDT-Interleaving)
+   - Post-initialSync `reconcileOpenEditors()` pusht Edits die während Sync passiert sind
 
-### v0.2.8 Bug-Fixes
+### Gelöste Bugs (v0.2.8–v0.2.9)
 
-**Bug 1: Ghost-Pushes bei Cache-Migration — GEFIXT**
-Bei Cache-Migration (sentinel `contentHash: 0`) wurde für jedes Doc ein Hash-Mismatch erkannt → 804× `sync_push` mit leeren 22b-Deltas.
-**Fix:** `text_matches()` Check vor `sync_from_disk` + Push. Wenn CRDT bereits mit Disk übereinstimmt, wird nur geloggt und geskippt.
+**Ghost-Pushes bei Cache-Migration (v0.2.8):** `text_matches()` Check vor `sync_from_disk` + Push.
 
-**Bug 2: Concurrent-Sync Datenverlust — GEFIXT (via Bug 1)**
-"Plan für Mittwoch" wurde leer, weil Mobile + Laptop gleichzeitig Ghost-Pushes sendeten. Root Cause waren die leeren 22b-Deltas aus Bug 1, die neue VV-Einträge erzeugten und den CRDT-Merge korrumpierten. Server-Code ist korrekt (Doc-Lock auf SyncPush, idempotenter CRDT-Merge). Mit dem Ghost-Push-Fix eliminiert.
+**Concurrent-Sync Datenverlust (v0.2.8):** Root Cause waren Ghost-Pushes → gefixt via Ghost-Push-Fix.
 
-**Bug 3: "Text verschwindet" — GEFIXT**
-`writeToVault` in `syncOverlappingDoc` überschrieb den Editor-Buffer während der User tippt. Zwischen vault.read() und writeToVault konnte der User weiter tippen → Edits gingen verloren.
-**Fix:** Vor writeToVault wird der aktuelle Editor-Buffer geprüft (`readCurrentContent`). Wenn der User seit dem Capture editiert hat, werden die neuen Edits per `sync_from_disk` in den CRDT gemerged, dann wird das Merge-Ergebnis geschrieben.
+**"Text verschwindet" beim Tippen während initialSync (v0.2.9):**
+Root Cause: `vault.read()` las stale Disk-Content statt Editor-Buffer. Gleichzeitig interleavten `pushFileDelta` (aus `editor-change` Debounce) und `syncOverlappingDoc` auf demselben CRDT-Objekt. `sync_from_disk(staleContent)` erzeugte DELETE-Ops für frisch getippten Text.
+Fix: Editor-Buffer als Source-of-Truth, Push-Deferral während Sync, Post-Sync Reconciliation.
 
 ### Performance — TODO
-Der Content-Hash Fast-Path konnte noch nicht verifiziert werden, weil Bug 1 (Ghost-Pushes) den ersten Start dominiert hat. Nach dem Fix sollte der zweite Start schnell sein — testen!
+Content-Hash Fast-Path verifizieren — nach den Bug-Fixes sollte der zweite Start schnell sein.
 
 ## Priorität 2 — Weitere Tests
-- Performance-Messung nach Bug-Fixes (Content-Hash Fast-Path verifizieren)
-- Concurrent-Sync Szenario nochmal testen (sollte jetzt safe sein)
+- Performance-Messung (Content-Hash Fast-Path)
+- "Text verschwindet" Szenario auf Android reproduzieren → sollte jetzt gefixt sein
+- Concurrent-Sync Szenario nochmal testen
 
 ## Priorität 3 — Code Quality
 
@@ -135,7 +137,8 @@ Heartbeat: Ping alle 30s → Pong vom Server
 - **Server-Logs zeigen 0 sync_starts bei VV-Match**: VV-Quick-Check funktioniert serverseitig. Bottleneck ist client-seitig.
 - **27s client-seitig** für 800× vault.read + 800× getOrLoad (gemessen Session 11:24).
 - **Ghost-Pushes verursachen CRDT-Korruption**: Leere Deltas (22b Loro-Framing) erzeugen neue VV-Einträge → korrumpiert Merge bei concurrent Sync. Fix: `text_matches()` Guard.
-- **writeToVault Race**: Zwischen vault.read() und writeToVault kann der User tippen → Edits gehen verloren. Fix: Editor-Buffer vor Write prüfen und ggf. mergen.
+- **vault.read() ist stale wenn Editor offen**: Editor-Buffer kann frische Edits enthalten die noch nicht auf Disk sind. Overlapping-Loop muss `readCurrentContent()` bevorzugen.
+- **pushFileDelta interleaved mit initialSync**: Beide mutieren dasselbe CRDT-Objekt zwischen await-Points. `sync_from_disk(staleContent)` erzeugt DELETE-Ops für frische Edits. Fix: Push deferral + Editor-Buffer als Source-of-Truth + Post-Sync Reconciliation.
 
 ## SSH / Deploy
 - `SSH_AUTH_SOCK` → 1Password Agent (`~/.1password/agent.sock`)

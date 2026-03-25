@@ -17,6 +17,7 @@ export class PushHandler {
     private lastServerVV: Map<string, string>,
     private setStatus: (s: 'syncing') => void,
     private isWsOpen: () => boolean,
+    private isInitialSyncing: () => boolean,
     private tag: string,
   ) {}
 
@@ -27,11 +28,17 @@ export class PushHandler {
       path,
       setTimeout(() => {
         this.pushDebounceTimers.delete(path);
+        // Defer push during initialSync — re-queue with longer delay.
+        // The user's edits stay safe in the editor buffer.
+        if (this.isInitialSyncing()) {
+          this.onFileChanged(path);
+          return;
+        }
         const freshContent = this.editor.readCurrentContent(path);
         if (freshContent !== null) {
           this.pushFileDelta(path, freshContent);
         }
-      }, Math.max(this.settings.debounceMs, 300)),
+      }, this.isInitialSyncing() ? 1000 : Math.max(this.settings.debounceMs, 300)),
     );
   }
 

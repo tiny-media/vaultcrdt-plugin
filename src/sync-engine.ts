@@ -73,6 +73,7 @@ export class SyncEngine {
       this.lastServerVV,
       (s) => this.setStatus(s),
       () => this.ws?.readyState === WebSocket.OPEN,
+      () => this.initialSyncRunning,
       this.tag,
     );
   }
@@ -309,8 +310,9 @@ export class SyncEngine {
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs?.get(file.path);
 
-        // Always read content (needed for hash check or sync)
-        const localContent = await this.app.vault.read(file);
+        // Prefer editor buffer over disk — editor has the user's live typing
+        const editorContent = this.editor.readCurrentContent(file.path);
+        const localContent = editorContent ?? await this.app.vault.read(file);
         const hash = fnv1aHash(localContent);
         contentHashes.set(file.path, hash);
 
@@ -415,6 +417,10 @@ export class SyncEngine {
       }
     } finally {
       this.initialSyncRunning = false;
+
+      // Reconcile open editors: if user typed during initialSync, their edits
+      // may not have been pushed (pushFileDelta was deferred). Sync them now.
+      await this.reconcileOpenEditors();
 
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type as string;
@@ -579,6 +585,32 @@ export class SyncEngine {
       }
     }
     await this.docs.persist(path);
+  }
+
+  /** Reconcile open editors after initialSync — push any edits that happened during sync. */
+  private async reconcileOpenEditors(): Promise<void> {
+    const openEditors = this.editor.getOpenEditorPaths();
+    for (const [path, editorContent] of openEditors) {
+      const doc = this.docs.get(path);
+      if (!doc || doc.text_matches(editorContent)) continue;
+
+      log(`${this.tag} reconcile: editor diverged during initialSync`, { path });
+      doc.sync_from_disk(editorContent);
+
+      const serverVV = this.lastServerVV.get(path);
+      if (serverVV) {
+        const delta = doc.export_delta_since_vv_json(serverVV);
+        if (delta.length > 0) {
+          this.send({
+            type: 'sync_push',
+            doc_uuid: path,
+            delta,
+            peer_id: this.settings.peerId,
+          });
+        }
+      }
+      await this.docs.persist(path);
+    }
   }
 
   // ── Message handling ────────────────────────────────────────────────────────
