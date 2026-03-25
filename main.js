@@ -2666,6 +2666,12 @@ var EditorIntegration = class {
   isUpdatingEditorFromRemote(path) {
     return this.updatingEditorFromRemote.has(path);
   }
+  /** Return the path of the currently active editor (the doc the user is looking at). */
+  getActiveEditorPath() {
+    var _a, _b;
+    const view = this.app.workspace.getActiveViewOfType(import_obsidian2.MarkdownView);
+    return (_b = (_a = view == null ? void 0 : view.file) == null ? void 0 : _a.path) != null ? _b : null;
+  }
   readCurrentContent(path) {
     let content = null;
     this.app.workspace.iterateAllLeaves((leaf) => {
@@ -3122,6 +3128,19 @@ var SyncEngine = class {
       let stepsDone = 0;
       let changed = 0;
       const contentHashes = /* @__PURE__ */ new Map();
+      const syncedPaths = /* @__PURE__ */ new Set();
+      const activeDoc = this.editor.getActiveEditorPath();
+      if (activeDoc && serverDocMap.has(activeDoc) && localFileMap.has(activeDoc)) {
+        const file = localFileMap.get(activeDoc);
+        const localContent = await this.app.vault.read(file);
+        contentHashes.set(activeDoc, fnv1aHash(localContent));
+        await this.syncOverlappingDoc(activeDoc, localContent, serverDocMap);
+        syncedPaths.add(activeDoc);
+        stepsDone++;
+        changed++;
+        onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+        log(`${this.tag} priority sync complete`, { path: activeDoc });
+      }
       let downloadOk = 0;
       let downloadFail = 0;
       if (mode !== "push") {
@@ -3179,6 +3198,11 @@ var SyncEngine = class {
       log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
       let skippedVVMatch = 0;
       for (const file of overlappingFiles) {
+        if (syncedPaths.has(file.path)) {
+          stepsDone++;
+          onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+          continue;
+        }
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
         if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {

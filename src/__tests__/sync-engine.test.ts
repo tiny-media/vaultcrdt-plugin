@@ -141,6 +141,7 @@ const makeApp = (leaves: any[] = []) =>
     vault: mockVault,
     workspace: {
       on: vi.fn(),
+      getActiveViewOfType: vi.fn(() => null),
       iterateAllLeaves: vi.fn((cb: (leaf: any) => void) => {
         for (const leaf of leaves) cb(leaf);
       }),

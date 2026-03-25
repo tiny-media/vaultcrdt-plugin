@@ -133,6 +133,7 @@ const makeApp = () =>
     vault: mockVault,
     workspace: {
       on: vi.fn(),
+      getActiveViewOfType: vi.fn(() => null),
       iterateAllLeaves: vi.fn(),
     },
   }) as any;

@@ -15,6 +15,12 @@ export class EditorIntegration {
     return this.updatingEditorFromRemote.has(path);
   }
 
+  /** Return the path of the currently active editor (the doc the user is looking at). */
+  getActiveEditorPath(): string | null {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    return view?.file?.path ?? null;
+  }
+
   readCurrentContent(path: string): string | null {
     let content: string | null = null;
     this.app.workspace.iterateAllLeaves((leaf: any) => {

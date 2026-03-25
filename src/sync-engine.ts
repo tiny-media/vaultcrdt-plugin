@@ -240,6 +240,23 @@ export class SyncEngine {
       let stepsDone = 0;
       let changed = 0;
       const contentHashes = new Map<string, number>(); // path → fnv1a hash (for VV cache)
+      const syncedPaths = new Set<string>(); // paths already synced (priority doc)
+
+      // Priority sync: sync the currently active editor doc FIRST so the user
+      // can start typing immediately. Edits during the rest of initialSync are
+      // treated as normal offline edits — the CRDT merges them naturally.
+      const activeDoc = this.editor.getActiveEditorPath();
+      if (activeDoc && serverDocMap.has(activeDoc) && localFileMap.has(activeDoc)) {
+        const file = localFileMap.get(activeDoc)!;
+        const localContent = await this.app.vault.read(file);
+        contentHashes.set(activeDoc, fnv1aHash(localContent));
+        await this.syncOverlappingDoc(activeDoc, localContent, serverDocMap);
+        syncedPaths.add(activeDoc);
+        stepsDone++;
+        changed++;
+        onProgress?.(stepsDone, totalSteps, changed);
+        log(`${this.tag} priority sync complete`, { path: activeDoc });
+      }
 
       let downloadOk = 0;
       let downloadFail = 0;
@@ -306,6 +323,7 @@ export class SyncEngine {
       let skippedVVMatch = 0;
 
       for (const file of overlappingFiles) {
+        if (syncedPaths.has(file.path)) { stepsDone++; onProgress?.(stepsDone, totalSteps, changed); continue; }
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs?.get(file.path);
 
