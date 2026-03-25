@@ -3104,6 +3104,8 @@ var SyncEngine = class {
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
     const hotDocPaths = /* @__PURE__ */ new Set();
+    const serverVVStrings = /* @__PURE__ */ new Map();
+    const contentHashes = /* @__PURE__ */ new Map();
     try {
       const localFiles = this.app.vault.getMarkdownFiles();
       const localFileMap = /* @__PURE__ */ new Map();
@@ -3113,12 +3115,11 @@ var SyncEngine = class {
       const { docs: serverDocs, tombstones } = await this.requestDocList();
       const tombstoneSet = new Set(tombstones);
       const localPathSet = new Set(localFileMap.keys());
-      const serverVVStrings2 = /* @__PURE__ */ new Map();
       const serverDocMap = /* @__PURE__ */ new Map();
       for (const d of serverDocs) {
         serverDocMap.set(d.doc_uuid, d);
         if (d.server_vv && d.server_vv.length > 0) {
-          serverVVStrings2.set(d.doc_uuid, new TextDecoder().decode(d.server_vv));
+          serverVVStrings.set(d.doc_uuid, new TextDecoder().decode(d.server_vv));
         }
       }
       const cachedVVs = await this.docs.loadVVCache();
@@ -3140,7 +3141,6 @@ var SyncEngine = class {
       const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
       let stepsDone = 0;
       let changed = 0;
-      const contentHashes2 = /* @__PURE__ */ new Map();
       let downloadOk = 0;
       let downloadFail = 0;
       if (mode !== "push") {
@@ -3198,12 +3198,12 @@ var SyncEngine = class {
       log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
       let skippedVVMatch = 0;
       for (const file of overlappingFiles) {
-        const currentServerVV = serverVVStrings2.get(file.path);
+        const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
         const editorContent = this.editor.readCurrentContent(file.path);
         const localContent = editorContent != null ? editorContent : await this.app.vault.read(file);
         const hash = fnv1aHash(localContent);
-        contentHashes2.set(file.path, hash);
+        contentHashes.set(file.path, hash);
         if (editorContent !== null) {
           hotDocPaths.add(file.path);
           stepsDone++;
@@ -3254,7 +3254,7 @@ var SyncEngine = class {
       if (mode !== "pull") {
         for (const file of localOnlyFiles) {
           const content = await this.app.vault.read(file);
-          contentHashes2.set(file.path, fnv1aHash(content));
+          contentHashes.set(file.path, fnv1aHash(content));
           log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
           const doc = await this.docs.getOrLoad(file.path);
           doc.sync_from_disk(content);
@@ -3283,7 +3283,7 @@ var SyncEngine = class {
       }
       const vvCacheEntries = /* @__PURE__ */ new Map();
       for (const [path, vv] of this.lastServerVV) {
-        vvCacheEntries.set(path, { vv, contentHash: (_a = contentHashes2.get(path)) != null ? _a : 0 });
+        vvCacheEntries.set(path, { vv, contentHash: (_a = contentHashes.get(path)) != null ? _a : 0 });
       }
       await this.docs.saveVVCache(vvCacheEntries);
       const validPaths = /* @__PURE__ */ new Set([...localPathSet, ...serverDocMap.keys()]);
@@ -3441,7 +3441,7 @@ var SyncEngine = class {
   /** Sync a "hot doc" (open in editor) after initialSync.
    *  Uses import_and_diff + applyDiffToEditor (surgical diffs) instead of
    *  writeToVault to avoid overwriting keystrokes typed during sync. */
-  async syncHotDoc(path, currentServerVV, contentHashes2) {
+  async syncHotDoc(path, currentServerVV, contentHashes) {
     var _a;
     const editorContent = this.editor.readCurrentContent(path);
     if (editorContent === null) {
@@ -3491,7 +3491,7 @@ var SyncEngine = class {
       this.lastServerVV.set(path, currentServerVV);
     }
     const freshContent = (_a = this.editor.readCurrentContent(path)) != null ? _a : doc.get_text();
-    contentHashes2.set(path, fnv1aHash(freshContent));
+    contentHashes.set(path, fnv1aHash(freshContent));
     await this.docs.persist(path);
     log(`${this.tag} syncHotDoc complete`, { path });
   }

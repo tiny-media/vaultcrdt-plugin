@@ -195,6 +195,8 @@ export class SyncEngine {
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
     const hotDocPaths = new Set<string>();
+    const serverVVStrings = new Map<string, string>();
+    const contentHashes = new Map<string, number>();
 
     try {
       // Build local file index (metadata only — no content reads yet)
@@ -207,9 +209,6 @@ export class SyncEngine {
       const { docs: serverDocs, tombstones } = await this.requestDocList();
       const tombstoneSet = new Set(tombstones);
       const localPathSet = new Set(localFileMap.keys());
-
-      // Decode server VVs from binary to JSON strings for comparison
-      const serverVVStrings = new Map<string, string>();
       const serverDocMap = new Map<string, DocEntry>();
       for (const d of serverDocs) {
         serverDocMap.set(d.doc_uuid, d);
@@ -241,7 +240,7 @@ export class SyncEngine {
       const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
       let stepsDone = 0;
       let changed = 0;
-      const contentHashes = new Map<string, number>(); // path → fnv1a hash (for VV cache)
+      // contentHashes declared before try — shared with finally for hot doc sync
 
       let downloadOk = 0;
       let downloadFail = 0;
