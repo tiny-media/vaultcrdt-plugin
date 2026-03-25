@@ -3099,7 +3099,7 @@ var SyncEngine = class {
   }
   // ── Initial sync ───────────────────────────────────────────────────────────
   async initialSync(onProgress, mode = "merge") {
-    var _a;
+    var _a, _b;
     this.setStatus("syncing");
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
@@ -3112,12 +3112,12 @@ var SyncEngine = class {
       const { docs: serverDocs, tombstones } = await this.requestDocList();
       const tombstoneSet = new Set(tombstones);
       const localPathSet = new Set(localFileMap.keys());
-      const serverVVStrings = /* @__PURE__ */ new Map();
+      const serverVVStrings2 = /* @__PURE__ */ new Map();
       const serverDocMap = /* @__PURE__ */ new Map();
       for (const d of serverDocs) {
         serverDocMap.set(d.doc_uuid, d);
         if (d.server_vv && d.server_vv.length > 0) {
-          serverVVStrings.set(d.doc_uuid, new TextDecoder().decode(d.server_vv));
+          serverVVStrings2.set(d.doc_uuid, new TextDecoder().decode(d.server_vv));
         }
       }
       const cachedVVs = await this.docs.loadVVCache();
@@ -3139,7 +3139,7 @@ var SyncEngine = class {
       const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
       let stepsDone = 0;
       let changed = 0;
-      const contentHashes = /* @__PURE__ */ new Map();
+      const contentHashes2 = /* @__PURE__ */ new Map();
       let downloadOk = 0;
       let downloadFail = 0;
       if (mode !== "push") {
@@ -3196,13 +3196,20 @@ var SyncEngine = class {
       }
       log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
       let skippedVVMatch = 0;
+      const hotDocPaths2 = /* @__PURE__ */ new Set();
       for (const file of overlappingFiles) {
-        const currentServerVV = serverVVStrings.get(file.path);
+        const currentServerVV = serverVVStrings2.get(file.path);
         const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
         const editorContent = this.editor.readCurrentContent(file.path);
         const localContent = editorContent != null ? editorContent : await this.app.vault.read(file);
         const hash = fnv1aHash(localContent);
-        contentHashes.set(file.path, hash);
+        contentHashes2.set(file.path, hash);
+        if (editorContent !== null) {
+          hotDocPaths2.add(file.path);
+          stepsDone++;
+          onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+          continue;
+        }
         if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
           if (hash === cached.contentHash) {
             this.lastServerVV.set(file.path, currentServerVV);
@@ -3247,7 +3254,7 @@ var SyncEngine = class {
       if (mode !== "pull") {
         for (const file of localOnlyFiles) {
           const content = await this.app.vault.read(file);
-          contentHashes.set(file.path, fnv1aHash(content));
+          contentHashes2.set(file.path, fnv1aHash(content));
           log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
           const doc = await this.docs.getOrLoad(file.path);
           doc.sync_from_disk(content);
@@ -3276,7 +3283,7 @@ var SyncEngine = class {
       }
       const vvCacheEntries = /* @__PURE__ */ new Map();
       for (const [path, vv] of this.lastServerVV) {
-        vvCacheEntries.set(path, { vv, contentHash: (_a = contentHashes.get(path)) != null ? _a : 0 });
+        vvCacheEntries.set(path, { vv, contentHash: (_a = contentHashes2.get(path)) != null ? _a : 0 });
       }
       await this.docs.saveVVCache(vvCacheEntries);
       const validPaths = /* @__PURE__ */ new Set([...localPathSet, ...serverDocMap.keys()]);
@@ -3285,6 +3292,13 @@ var SyncEngine = class {
         log(`${this.tag} cleaned ${orphansRemoved} orphaned state files`);
       }
     } finally {
+      for (const path of hotDocPaths) {
+        try {
+          await this.syncHotDoc(path, (_b = serverVVStrings.get(path)) != null ? _b : null, contentHashes);
+        } catch (err) {
+          warn(`${this.tag} syncHotDoc failed`, { path, err });
+        }
+      }
       await this.reconcileOpenEditors();
       this.initialSyncRunning = false;
       for (const queued of this.queuedBroadcasts) {
@@ -3423,6 +3437,63 @@ var SyncEngine = class {
       }
       await this.docs.persist(path);
     }
+  }
+  /** Sync a "hot doc" (open in editor) after initialSync.
+   *  Uses import_and_diff + applyDiffToEditor (surgical diffs) instead of
+   *  writeToVault to avoid overwriting keystrokes typed during sync. */
+  async syncHotDoc(path, currentServerVV, contentHashes2) {
+    var _a;
+    const editorContent = this.editor.readCurrentContent(path);
+    if (editorContent === null) {
+      return;
+    }
+    const doc = await this.docs.getOrLoad(path);
+    if (!doc.text_matches(editorContent)) {
+      doc.sync_from_disk(editorContent);
+    }
+    const clientVV = doc.export_vv_json();
+    const result = await this.requestSyncStart(path, clientVV);
+    if (result) {
+      if (result.delta.length > 0) {
+        let diffJson = null;
+        try {
+          diffJson = doc.import_and_diff(result.delta);
+        } catch (err) {
+          warn(`${this.tag} syncHotDoc import_and_diff failed, fallback to import_snapshot`, { path, err });
+          doc.import_snapshot(result.delta);
+        }
+        try {
+          if (diffJson && this.editor.applyDiffToEditor(path, diffJson, doc.get_text())) {
+            this.lastRemoteWrite.set(path, doc.get_text());
+          } else {
+            await this.editor.writeToVault(path, doc.get_text());
+          }
+        } catch (err) {
+          warn(`${this.tag} syncHotDoc applyDiff failed, fallback to writeToVault`, { path, err });
+          await this.editor.writeToVault(path, doc.get_text());
+        }
+      }
+      this.lastServerVV.set(path, result.serverVV);
+      const clientVVAfterMerge = doc.export_vv_json();
+      if (!vvCovers(result.serverVV, clientVVAfterMerge)) {
+        const delta = doc.export_delta_since_vv_json(result.serverVV);
+        if (delta.length > 0) {
+          log(`${this.tag} syncHotDoc push delta (VV gap)`, { path, deltaLen: delta.length });
+          this.send({
+            type: "sync_push",
+            doc_uuid: path,
+            delta,
+            peer_id: this.settings.peerId
+          });
+        }
+      }
+    } else if (currentServerVV) {
+      this.lastServerVV.set(path, currentServerVV);
+    }
+    const freshContent = (_a = this.editor.readCurrentContent(path)) != null ? _a : doc.get_text();
+    contentHashes2.set(path, fnv1aHash(freshContent));
+    await this.docs.persist(path);
+    log(`${this.tag} syncHotDoc complete`, { path });
   }
   // ── Message handling ────────────────────────────────────────────────────────
   onMessage(data) {
