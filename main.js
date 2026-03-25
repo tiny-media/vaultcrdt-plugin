@@ -3181,45 +3181,16 @@ var SyncEngine = class {
       for (const file of overlappingFiles) {
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
-        const localContent = await this.app.vault.read(file);
-        const hash = fnv1aHash(localContent);
-        contentHashes.set(file.path, hash);
         if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-          if (hash === cached.contentHash) {
-            this.lastServerVV.set(file.path, currentServerVV);
-            skippedVVMatch++;
-            stepsDone++;
-            onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-            continue;
-          }
-          const doc = await this.docs.getOrLoad(file.path);
-          if (doc.version() > 0 && localContent.trim() !== "") {
-            if (doc.text_matches(localContent)) {
-              log(`${this.tag} hash-only update (CRDT matches disk)`, { path: file.path });
-              this.lastServerVV.set(file.path, currentServerVV);
-              stepsDone++;
-              onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-              continue;
-            }
-            doc.sync_from_disk(localContent);
-            const delta = doc.export_delta_since_vv_json(currentServerVV);
-            if (delta.length > 0) {
-              log(`${this.tag} offline edit push (VV match)`, { path: file.path, deltaLen: delta.length });
-              this.send({
-                type: "sync_push",
-                doc_uuid: file.path,
-                delta,
-                peer_id: this.settings.peerId
-              });
-              changed++;
-            }
-            this.lastServerVV.set(file.path, currentServerVV);
-            await this.docs.persist(file.path);
-            stepsDone++;
-            onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-            continue;
-          }
+          this.lastServerVV.set(file.path, currentServerVV);
+          contentHashes.set(file.path, cached.contentHash);
+          skippedVVMatch++;
+          stepsDone++;
+          onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+          continue;
         }
+        const localContent = await this.app.vault.read(file);
+        contentHashes.set(file.path, fnv1aHash(localContent));
         await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
         stepsDone++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);

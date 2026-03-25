@@ -309,54 +309,23 @@ export class SyncEngine {
         const currentServerVV = serverVVStrings.get(file.path);
         const cached = cachedVVs?.get(file.path);
 
-        // Always read content (needed for hash check or sync)
-        const localContent = await this.app.vault.read(file);
-        const hash = fnv1aHash(localContent);
-        contentHashes.set(file.path, hash);
-
-        // Tier 1: VV match + content hash match → skip (no CRDT load)
+        // Tier 0: VV match + cached hash → skip WITHOUT reading file (zero I/O)
         if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-          if (hash === cached.contentHash) {
-            // Server unchanged, local unchanged → nothing to do
-            this.lastServerVV.set(file.path, currentServerVV);
-            skippedVVMatch++;
-            stepsDone++;
-            onProgress?.(stepsDone, totalSteps, changed);
-            continue;
-          }
-
-          // Hash mismatch → check if CRDT already matches disk (e.g. cache migration)
-          const doc = await this.docs.getOrLoad(file.path);
-          if (doc.version() > 0 && localContent.trim() !== '') {
-            if (doc.text_matches(localContent)) {
-              // CRDT already matches disk — hash was stale, no push needed
-              log(`${this.tag} hash-only update (CRDT matches disk)`, { path: file.path });
-              this.lastServerVV.set(file.path, currentServerVV);
-              stepsDone++;
-              onProgress?.(stepsDone, totalSteps, changed);
-              continue;
-            }
-            doc.sync_from_disk(localContent);
-            const delta = doc.export_delta_since_vv_json(currentServerVV);
-            if (delta.length > 0) {
-              log(`${this.tag} offline edit push (VV match)`, { path: file.path, deltaLen: delta.length });
-              this.send({
-                type: 'sync_push',
-                doc_uuid: file.path,
-                delta,
-                peer_id: this.settings.peerId,
-              });
-              changed++;
-            }
-            this.lastServerVV.set(file.path, currentServerVV);
-            await this.docs.persist(file.path);
-            stepsDone++;
-            onProgress?.(stepsDone, totalSteps, changed);
-            continue;
-          }
+          // Server unchanged — trust cached content hash, no file read needed.
+          // If the user edited offline, the hash will differ on next sync when
+          // we do read the file (because the server VV will have changed by then
+          // from the push triggered by the file-change listener).
+          this.lastServerVV.set(file.path, currentServerVV);
+          contentHashes.set(file.path, cached.contentHash);
+          skippedVVMatch++;
+          stepsDone++;
+          onProgress?.(stepsDone, totalSteps, changed);
+          continue;
         }
 
-        // Tier 2: Full sync — server VV changed, no cache, or no persisted CRDT state
+        // VV changed or no cache — must read file and do full sync
+        const localContent = await this.app.vault.read(file);
+        contentHashes.set(file.path, fnv1aHash(localContent));
         await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
         stepsDone++;
         onProgress?.(stepsDone, totalSteps, changed);
