@@ -28,22 +28,63 @@ Die initialSync-Performance wurde in v0.2.5–v0.2.7 schrittweise optimiert:
 2. **v0.2.6**: Lazy Content-Reads statt Upfront-Capture aller 800 Docs. Fixt den "Text verschwindet"-Bug.
 3. **v0.2.7**: Content-Hash (FNV-1a) statt mtime/size (mtime auf Android instabil). Eliminiert CRDT-Loads bei VV+Hash-Match.
 
-### Offener Test (v0.2.7)
-**Ergebnis steht aus**: User testet gerade ob der Content-Hash Fast-Path den Mobile-Startup beschleunigt. Erster Start nach Upgrade ist einmalig langsam (Cache-Migration v2→v3).
+### Test-Ergebnis v0.2.7 — ZWEI KRITISCHE BUGS
 
-**Was bei "nichts geändert" passiert:**
-- 800× `vault.read()` + 800× `fnv1aHash()` (schnell, ~32bit hash)
-- Bei VV+Hash-Match: kein `getOrLoad()`, kein `.loro`-Load, kein WASM-Import → SKIP
+**Bug 1: 804 Ghost-Pushes bei Cache-Migration**
+Beim ersten Start mit v0.2.7 (Cache noch v2 → sentinel `contentHash: 0`) erkennt der Code für JEDES Doc einen "Hash-Mismatch" und ruft den Offline-Edit-Push-Pfad auf:
+```
+sync_from_disk(localContent) → export_delta_since_vv_json() → sync_push
+```
+Ergebnis: 804× `sync_push` mit `delta=22b` (leere Deltas, weil CRDT bereits matcht). Das blockiert den Sync für ~16s und bombardiert den Server.
 
-**Falls immer noch langsam:**
-- Server-Logs prüfen: `sync_start`-Count in der Session (sollte 0 sein)
-- Client-Logs prüfen: `skippedVVMatch` sollte ~800 sein
-- Nächste Optionen: `vault.read()` parallelisieren, file-size Pre-Filter, oder Batch-Read API
+**Root Cause in sync-engine.ts (Overlapping-Loop, VV match + hash mismatch path):**
+```typescript
+// Dieser Pfad wird bei sentinel contentHash=0 für JEDES Doc betreten:
+const doc = await this.docs.getOrLoad(file.path);  // 800× CRDT load!
+if (doc.version() > 0 && localContent.trim() !== '') {
+  doc.sync_from_disk(localContent);   // no-op wenn CRDT = disk
+  const delta = doc.export_delta_since_vv_json(currentServerVV);
+  if (delta.length > 0) {  // 22b = Loro framing, kein echtes Delta
+    this.send({ type: 'sync_push', ... });  // Ghost-Push!
+  }
+}
+```
 
-### "Text verschwindet"-Bug
-Vor v0.2.6 wurde `localContents` upfront gecaptured. Wenn der User während initialSync tippt, wurde sein Edit durch den stale Snapshot überschrieben. Ab v0.2.6 werden Contents lazy gelesen → Snapshot enthält aktuelle Edits. **Verifizieren ob der Bug mit v0.2.7 weg ist.**
+**Fix-Idee:** Bei Hash-Mismatch erst `text_matches()` prüfen bevor `sync_from_disk` + Push. Oder: leere Deltas (≤ Schwellenwert, z.B. 32b) nicht pushen.
 
-## Priorität 2 — Code Quality
+**Bug 2: "Plan für Mittwoch" wurde leer — Datenverlust**
+Timeline aus Server-Logs:
+1. `11:46:53` — Mobile verbindet (initialSync mit 804 Ghost-Pushes)
+2. `11:47:01` — Laptop verbindet gleichzeitig (eigener initialSync)
+3. `11:47:03` — Laptop: `sync_start` für "Plan für Mittwoch" (delta=353b)
+4. `11:47:23` — Laptop: `sync_push` für "Plan für Mittwoch" (delta=22b, snapshot=1770b)
+5. `11:47:23` — Laptop: `sync_start` (nochmal!) → bekommt delta=228b
+6. `11:47:29-33` — Laptop: 4× `sync_push` (User tippt, Snapshots wachsen: 1856→1961)
+7. `11:47:57` — Mobile verbindet erneut (2. Start)
+8. `11:48:13` — Mobile: 3× `sync_push` für "Plan für Mittwoch" (Snapshot: 1967→2064→**2059** ← SHRINK!)
+9. `11:48:25` — Mobile: `sync_push` (2120) + `sync_start` (delta=227b)
+
+**Das Snapshot-Shrink von 2064→2059 zeigt wo Content verloren ging.** Beide Devices schicken Deltas für dasselbe Doc während ihre initialSyncs gleichzeitig laufen → CRDT-Merge konvergiert zu unerwarteter (leerer?) State.
+
+**Hypothese:** Das Ghost-Push (22b Delta) von Mobile hat den Server-CRDT-State korrumpiert. Dann hat der Laptop den korrumpierten State gemerged, und beim nächsten Roundtrip wurde der leere Content zum "Gewinner" des CRDT-Merges.
+
+**Analyse-Plan für nächste Session:**
+1. Ghost-Push-Bug fixen (sofort, bevor weitere Tests)
+2. Den 22b-Delta auf dem Server inspizieren — was enthält er? `import_snapshot` Ergebnis prüfen
+3. Race-Condition analysieren: Was passiert wenn 2 Devices gleichzeitig initialSync machen?
+4. Ggf. `initialSync` als exklusiv markieren (Server-Lock pro Doc während Sync)
+
+### "Text verschwindet"-Bug (weiterhin vorhanden)
+Der Bug tritt weiterhin auf trotz lazy reads (v0.2.6). Mögliche Ursache: nicht der upfront-Capture, sondern `writeToVault` in `syncOverlappingDoc` (Tier 2/3) überschreibt den Editor-Buffer während der User tippt. Das lazy-Read captured zwar den aktuellen Stand, aber zwischen Read und WriteToVault kann der User weiter tippen → Edit geht verloren.
+
+### Performance
+Der Content-Hash Fast-Path konnte noch nicht verifiziert werden, weil Bug 1 (Ghost-Pushes) den ersten Start dominiert hat. Nach dem Fix sollte der zweite Start schnell sein — aber zuerst Bug 1 fixen.
+
+## Priorität 2 — Ghost-Push-Bug + Concurrent-Sync Race
+
+Bevor weitere Performance-Tests: Ghost-Push-Bug (Bug 1) fixen. Dann concurrent-initialSync Race-Condition (Bug 2) untersuchen.
+
+## Priorität 3 — Code Quality
 
 ### sync-engine.ts (~795 Zeilen)
 Größte Datei. `syncOverlappingDoc()` wurde bereits extrahiert. Weitere Kandidaten:
@@ -62,7 +103,7 @@ Enthält jetzt `vvCovers`, `vvEquals`, `hasSharedHistory`, `conflictPath`, `fnv1
 ### Generell
 LLM-freundlicher Code-Stil: ausgewogene Dateigröße, keine Magie, klare Strukturen.
 
-## Priorität 3 — Server-seitiges Orphan-Monitoring
+## Priorität 4 — Server-seitiges Orphan-Monitoring
 
 Docs die kein Client mehr referenziert bleiben auf dem Server. Kein automatisches Löschen (zu gefährlich), aber ein Admin-Endpoint oder Logging für "docs not updated in >90 days" wäre nützlich für manuelles Aufräumen.
 
@@ -125,9 +166,11 @@ Heartbeat: Ping alle 30s → Pong vom Server
 
 ## Erkenntnisse aus dieser Session
 
-- **mtime auf Android instabil**: Obsidian Mobile ändert mtime beim App-Start. Niemals mtime für Caching verwenden. Content-Hash oder size sind zuverlässig.
-- **Server-Logs zeigen 0 sync_starts**: Der VV-Quick-Check (v0.2.5) funktioniert serverseitig. Das Bottleneck war rein client-seitig (800× CRDT-Load).
-- **27s zwischen doc_list und erstem sync_start**: Gemessen in Server-Logs (Session 11:24). Das war die Zeit für 800× vault.read + 800× getOrLoad im alten Code.
+- **mtime auf Android instabil**: Obsidian Mobile ändert mtime beim App-Start. Niemals mtime für Caching verwenden.
+- **Server-Logs zeigen 0 sync_starts bei VV-Match**: VV-Quick-Check funktioniert serverseitig. Bottleneck ist client-seitig.
+- **27s client-seitig** für 800× vault.read + 800× getOrLoad (gemessen Session 11:24).
+- **Cache-Migration erzeugt Ghost-Pushes**: Sentinel-Werte (contentHash: 0) triggern den Offline-Edit-Push für JEDES Doc. 804× sync_push mit 22b Deltas.
+- **Concurrent initialSync = Datenverlust**: Wenn Mobile und Laptop gleichzeitig initialSync machen und Ghost-Pushes senden, konvergiert der CRDT zu unerwartetem State. "Plan für Mittwoch" wurde leer.
 
 ## SSH / Deploy
 - `SSH_AUTH_SOCK` → 1Password Agent (`~/.1password/agent.sock`)
