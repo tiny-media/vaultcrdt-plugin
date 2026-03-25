@@ -3103,6 +3103,7 @@ var SyncEngine = class {
     this.setStatus("syncing");
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
+    const hotDocPaths = /* @__PURE__ */ new Set();
     try {
       const localFiles = this.app.vault.getMarkdownFiles();
       const localFileMap = /* @__PURE__ */ new Map();
@@ -3196,7 +3197,6 @@ var SyncEngine = class {
       }
       log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
       let skippedVVMatch = 0;
-      const hotDocPaths2 = /* @__PURE__ */ new Set();
       for (const file of overlappingFiles) {
         const currentServerVV = serverVVStrings2.get(file.path);
         const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
@@ -3205,7 +3205,7 @@ var SyncEngine = class {
         const hash = fnv1aHash(localContent);
         contentHashes2.set(file.path, hash);
         if (editorContent !== null) {
-          hotDocPaths2.add(file.path);
+          hotDocPaths.add(file.path);
           stepsDone++;
           onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
           continue;

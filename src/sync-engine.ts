@@ -194,6 +194,7 @@ export class SyncEngine {
     this.setStatus('syncing');
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
+    const hotDocPaths = new Set<string>();
 
     try {
       // Build local file index (metadata only — no content reads yet)
@@ -305,7 +306,6 @@ export class SyncEngine {
 
       // 2. Overlapping docs — two-tier skip: VV+hash → full sync
       let skippedVVMatch = 0;
-      const hotDocPaths = new Set<string>();
 
       for (const file of overlappingFiles) {
         const currentServerVV = serverVVStrings.get(file.path);
