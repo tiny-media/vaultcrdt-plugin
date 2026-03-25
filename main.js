@@ -3239,7 +3239,7 @@ var SyncEngine = class {
             continue;
           }
         }
-        await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
+        await this.syncOverlappingDoc(file.path, localContent, serverDocMap, editorContent !== null);
         stepsDone++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
       }
@@ -3285,8 +3285,8 @@ var SyncEngine = class {
         log(`${this.tag} cleaned ${orphansRemoved} orphaned state files`);
       }
     } finally {
-      this.initialSyncRunning = false;
       await this.reconcileOpenEditors();
+      this.initialSyncRunning = false;
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type;
         if (type === "delta_broadcast") {
@@ -3299,8 +3299,11 @@ var SyncEngine = class {
       this.setStatus("connected");
     }
   }
-  /** Full sync for a single overlapping doc — conflict detection + merge + push. */
-  async syncOverlappingDoc(path, localContent, serverDocMap) {
+  /** Full sync for a single overlapping doc — conflict detection + merge + push.
+   *  @param isLiveEdit true when localContent came from an open editor (live typing),
+   *         false when it came from vault.read() (offline disk change). Conflict
+   *         detection is skipped for live edits — the CRDT merge handles them correctly. */
+  async syncOverlappingDoc(path, localContent, serverDocMap, isLiveEdit = false) {
     const doc = await this.docs.getOrLoad(path);
     const hadPersistedState = doc.version() > 0;
     if (!hadPersistedState && localContent.trim() !== "") {
@@ -3328,7 +3331,7 @@ var SyncEngine = class {
     const clientVV = doc.export_vv_json();
     const result = await this.requestSyncStart(path, clientVV);
     if (result) {
-      if (result.delta.length > 0 && hadLocalDiskChange) {
+      if (result.delta.length > 0 && hadLocalDiskChange && !isLiveEdit) {
         const persistedSnapshot = await this.docs.loadPersistedSnapshot(path);
         const tempDoc = createDocument();
         if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
@@ -3350,7 +3353,7 @@ var SyncEngine = class {
           return;
         }
       }
-      if (result.delta.length > 0 && clientVV !== "{}" && !hasSharedHistory(clientVV, result.serverVV)) {
+      if (result.delta.length > 0 && clientVV !== "{}" && !hasSharedHistory(clientVV, result.serverVV) && !isLiveEdit) {
         const tempDoc = createDocument();
         tempDoc.import_snapshot(result.delta);
         const serverText = tempDoc.get_text();
@@ -3392,25 +3395,7 @@ var SyncEngine = class {
           log(`${this.tag} overlapping match`, { path });
         }
         if (localContent !== serverContent) {
-          const editorContent = this.editor.readCurrentContent(path);
-          if (editorContent !== null && editorContent !== localContent) {
-            doc.sync_from_disk(editorContent);
-            const merged = doc.get_text();
-            if (merged !== editorContent) {
-              await this.editor.writeToVault(path, merged);
-            }
-            const mergedDelta = doc.export_delta_since_vv_json(result.serverVV);
-            if (mergedDelta.length > 0) {
-              this.send({
-                type: "sync_push",
-                doc_uuid: path,
-                delta: mergedDelta,
-                peer_id: this.settings.peerId
-              });
-            }
-          } else {
-            await this.editor.writeToVault(path, serverContent);
-          }
+          await this.editor.writeToVault(path, serverContent);
         }
       }
     }

@@ -359,7 +359,7 @@ export class SyncEngine {
         }
 
         // Tier 2: Full sync — server VV changed, no cache, or no persisted CRDT state
-        await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
+        await this.syncOverlappingDoc(file.path, localContent, serverDocMap, editorContent !== null);
         stepsDone++;
         onProgress?.(stepsDone, totalSteps, changed);
       }
@@ -416,11 +416,11 @@ export class SyncEngine {
         log(`${this.tag} cleaned ${orphansRemoved} orphaned state files`);
       }
     } finally {
-      this.initialSyncRunning = false;
-
-      // Reconcile open editors: if user typed during initialSync, their edits
-      // may not have been pushed (pushFileDelta was deferred). Sync them now.
+      // Reconcile open editors BEFORE clearing the flag — deferred pushes must
+      // wait until reconciliation is done to avoid racing on the same CRDT.
       await this.reconcileOpenEditors();
+
+      this.initialSyncRunning = false;
 
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type as string;
@@ -436,11 +436,15 @@ export class SyncEngine {
     }
   }
 
-  /** Full sync for a single overlapping doc — conflict detection + merge + push. */
+  /** Full sync for a single overlapping doc — conflict detection + merge + push.
+   *  @param isLiveEdit true when localContent came from an open editor (live typing),
+   *         false when it came from vault.read() (offline disk change). Conflict
+   *         detection is skipped for live edits — the CRDT merge handles them correctly. */
   private async syncOverlappingDoc(
     path: string,
     localContent: string,
     serverDocMap: Map<string, DocEntry>,
+    isLiveEdit = false,
   ): Promise<void> {
     const doc = await this.docs.getOrLoad(path);
     const hadPersistedState = doc.version() > 0;
@@ -479,8 +483,9 @@ export class SyncEngine {
     const result = await this.requestSyncStart(path, clientVV);
 
     if (result) {
-      // Concurrent external-edit conflict detection
-      if (result.delta.length > 0 && hadLocalDiskChange) {
+      // Concurrent external-edit conflict detection (skip for live editor typing —
+      // the CRDT merge handles concurrent edits correctly without conflict files)
+      if (result.delta.length > 0 && hadLocalDiskChange && !isLiveEdit) {
         const persistedSnapshot = await this.docs.loadPersistedSnapshot(path);
         const tempDoc = createDocument();
         if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
@@ -505,11 +510,12 @@ export class SyncEngine {
         }
       }
 
-      // Disjoint-VV conflict detection
+      // Disjoint-VV conflict detection (skip for live editor typing)
       if (
         result.delta.length > 0 &&
         clientVV !== '{}' &&
-        !hasSharedHistory(clientVV, result.serverVV)
+        !hasSharedHistory(clientVV, result.serverVV) &&
+        !isLiveEdit
       ) {
         const tempDoc = createDocument();
         tempDoc.import_snapshot(result.delta);
@@ -559,28 +565,7 @@ export class SyncEngine {
         }
 
         if (localContent !== serverContent) {
-          // Guard against race: user may have typed since we captured localContent
-          const editorContent = this.editor.readCurrentContent(path);
-          if (editorContent !== null && editorContent !== localContent) {
-            // User edited while we were syncing — merge their new edits into CRDT
-            doc.sync_from_disk(editorContent);
-            const merged = doc.get_text();
-            if (merged !== editorContent) {
-              await this.editor.writeToVault(path, merged);
-            }
-            // Push the user's edits + merge result to server
-            const mergedDelta = doc.export_delta_since_vv_json(result.serverVV);
-            if (mergedDelta.length > 0) {
-              this.send({
-                type: 'sync_push',
-                doc_uuid: path,
-                delta: mergedDelta,
-                peer_id: this.settings.peerId,
-              });
-            }
-          } else {
-            await this.editor.writeToVault(path, serverContent);
-          }
+          await this.editor.writeToVault(path, serverContent);
         }
       }
     }

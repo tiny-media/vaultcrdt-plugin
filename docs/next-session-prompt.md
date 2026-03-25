@@ -4,7 +4,7 @@
 
 | Repo | Version | Pfad |
 |------|---------|------|
-| Plugin | v0.2.9 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
+| Plugin | v0.2.10 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
 | Server | v0.2.3 | `/home/richard/projects/vaultcrdt-server/` (GitHub: tiny-media/vaultcrdt-server) |
 | Fleet | — | `/home/richard/fleet/` (Gitea: git.fryy.de/richard/fleet) |
 
@@ -22,34 +22,38 @@ Server deployed auf `home` via Docker Compose, erreichbar unter `https://obsidia
 ## Priorität 1 — Mobile Startup Performance
 
 ### Status
-Die initialSync-Performance wurde in v0.2.5–v0.2.9 schrittweise optimiert:
+Die initialSync-Performance wurde in v0.2.5–v0.2.10 schrittweise optimiert:
 
 1. **v0.2.5**: VV-basierter Quick-Check eliminiert WS-Roundtrips (0 statt 800 `sync_start` bei "nichts geändert")
 2. **v0.2.6**: Lazy Content-Reads statt Upfront-Capture aller 800 Docs.
 3. **v0.2.7**: Content-Hash (FNV-1a) statt mtime/size (mtime auf Android instabil). Eliminiert CRDT-Loads bei VV+Hash-Match.
 4. **v0.2.8**: Ghost-push fix (`text_matches()` guard), writeToVault editor guard.
-5. **v0.2.9**: Root-cause fix für "Text verschwindet" — drei zusammenwirkende Änderungen:
-   - Overlapping-Loop liest Editor-Buffer statt `vault.read()` (frische Edits statt stale Disk)
-   - `pushFileDelta` wird während initialSync deferred (verhindert CRDT-Interleaving)
-   - Post-initialSync `reconcileOpenEditors()` pusht Edits die während Sync passiert sind
+5. **v0.2.9**: Editor-Buffer statt vault.read(), Push-Deferral, reconcileOpenEditors.
+6. **v0.2.10**: Root-cause fix für "Text verschwindet":
+   - Conflict Detection überspringt Live-Editor-Typing (`isLiveEdit` Flag)
+   - writeToVault Guard entfernt (sync_from_disk nach import_snapshot löschte Server-Änderungen)
+   - `initialSyncRunning = false` erst NACH reconcileOpenEditors (verhindert Race)
 
-### Gelöste Bugs (v0.2.8–v0.2.9)
+### Gelöste Bugs (v0.2.8–v0.2.10)
 
 **Ghost-Pushes bei Cache-Migration (v0.2.8):** `text_matches()` Check vor `sync_from_disk` + Push.
 
 **Concurrent-Sync Datenverlust (v0.2.8):** Root Cause waren Ghost-Pushes → gefixt via Ghost-Push-Fix.
 
-**"Text verschwindet" beim Tippen während initialSync (v0.2.9):**
-Root Cause: `vault.read()` las stale Disk-Content statt Editor-Buffer. Gleichzeitig interleavten `pushFileDelta` (aus `editor-change` Debounce) und `syncOverlappingDoc` auf demselben CRDT-Objekt. `sync_from_disk(staleContent)` erzeugte DELETE-Ops für frisch getippten Text.
-Fix: Editor-Buffer als Source-of-Truth, Push-Deferral während Sync, Post-Sync Reconciliation.
+**"Text verschwindet" beim Tippen während initialSync (v0.2.9–v0.2.10):**
+Drei zusammenwirkende Root Causes:
+1. `vault.read()` las stale Disk-Content statt Editor-Buffer → Fix v0.2.9: `readCurrentContent`
+2. `pushFileDelta` interleavte mit `syncOverlappingDoc` auf demselben CRDT → Fix v0.2.9: Push-Deferral
+3. **Conflict Detection behandelte Live-Typing als "externen Edit"** → `removeAndClean()` löschte den CRDT mit User-Typing, schrieb Server-Content in den Editor. Fix v0.2.10: `isLiveEdit` Flag überspringt Conflict Detection, CRDT-Merge handled concurrent Edits korrekt.
+4. writeToVault Guard rief `sync_from_disk(editorContent)` NACH `import_snapshot` auf → DELETE-Ops für Server-Änderungen. Fix v0.2.10: Guard entfernt, einfaches `writeToVault(merged)`.
 
 ### Performance — TODO
 Content-Hash Fast-Path verifizieren — nach den Bug-Fixes sollte der zweite Start schnell sein.
 
 ## Priorität 2 — Weitere Tests
 - Performance-Messung (Content-Hash Fast-Path)
-- "Text verschwindet" Szenario auf Android reproduzieren → sollte jetzt gefixt sein
-- Concurrent-Sync Szenario nochmal testen
+- "Text verschwindet" auf Android testen (v0.2.10 sollte es fixen)
+- Bidirektionaler Sync Laptop ↔ Handy nach initialSync prüfen
 
 ## Priorität 3 — Code Quality
 
