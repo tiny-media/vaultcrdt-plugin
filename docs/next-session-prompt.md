@@ -19,49 +19,48 @@ Server deployed auf `home` via Docker Compose, erreichbar unter `https://obsidia
 | richardsachen (Laptop) | `~/CloudOrdner/Obsidian/richardsachen/` | `richardlaptop` | `richardsachen` |
 | richardsachen (Handy) | `~/Dokumente/obsidian-plugins/vaultcrdt/` (synced) | `richardhandy` | `richardsachen` |
 
-## Was letzte Session gebaut wurde
+## Priorität 1 — Mobile Startup Performance
 
-### Plugin v0.2.7
-- **Content-Hash statt mtime**: Tier 1 nutzt jetzt FNV-1a Content-Hash statt mtime/size. Grund: mtime ist auf Android nicht stabil zwischen App-Neustarts → Tier 1 griff nie. Content-Hash ist deterministisch.
-- **Eliminiert CRDT-Loads**: Bei VV-Match + Hash-Match wird kein `.loro`-File geladen (kein `getOrLoad`). 800 Docs × (vault.read + hash) statt 800 × (vault.read + getOrLoad + text_matches).
-- **VV-Cache v3 Format**: `{ vv, contentHash }` statt `{ vv, mtime, size }`. Migriert v1/v2 automatisch.
+### Status
+Die initialSync-Performance wurde in v0.2.5–v0.2.7 schrittweise optimiert:
 
-### Plugin v0.2.6
-- **Lazy Content-Reads**: `localContents` wird nicht mehr upfront für alle Docs gelesen. Fixt den **"Text verschwindet"-Bug**.
-- **CI-Fix**: Mock-Adapter in Tests um `read`/`write` erweitert.
+1. **v0.2.5**: VV-basierter Quick-Check eliminiert WS-Roundtrips (0 statt 800 `sync_start` bei "nichts geändert")
+2. **v0.2.6**: Lazy Content-Reads statt Upfront-Capture aller 800 Docs. Fixt den "Text verschwindet"-Bug.
+3. **v0.2.7**: Content-Hash (FNV-1a) statt mtime/size (mtime auf Android instabil). Eliminiert CRDT-Loads bei VV+Hash-Match.
 
-### Plugin v0.2.5
-- **VV-basierter Quick-Check beim initialSync**: Server-VVs aus `doc_list` werden mit lokal gecachten VVs verglichen. Bei 800 Docs und "nichts geändert" von ~800 Roundtrips auf 0.
-- **VV-Cache**, **Offline-Edit Push**, **Orphan State Cleanup**, **syncOverlappingDoc()** Extraktion, `vvEquals()`.
+### Offener Test (v0.2.7)
+**Ergebnis steht aus**: User testet gerade ob der Content-Hash Fast-Path den Mobile-Startup beschleunigt. Erster Start nach Upgrade ist einmalig langsam (Cache-Migration v2→v3).
 
-### Server v0.2.3
-- **VV-Format-Fix**: `doc_list` liefert jetzt JSON-VVs (statt Loro-Binary).
-- **DB-Maintenance**: Wöchentlicher Background-Task mit `PRAGMA optimize` + `VACUUM`.
-- **Peer-Cleanup**: Peers die >90 Tage nicht connected haben werden stündlich gelöscht.
+**Was bei "nichts geändert" passiert:**
+- 800× `vault.read()` + 800× `fnv1aHash()` (schnell, ~32bit hash)
+- Bei VV+Hash-Match: kein `getOrLoad()`, kein `.loro`-Load, kein WASM-Import → SKIP
 
-## Priorität 1 — Mobile Startup testen (v0.2.7)
+**Falls immer noch langsam:**
+- Server-Logs prüfen: `sync_start`-Count in der Session (sollte 0 sein)
+- Client-Logs prüfen: `skippedVVMatch` sollte ~800 sein
+- Nächste Optionen: `vault.read()` parallelisieren, file-size Pre-Filter, oder Batch-Read API
 
-Content-Hash Fast-Path sollte den Mobile-Startup bei "nichts geändert" deutlich beschleunigen. Erster Start nach Upgrade ist langsam (Cache-Migration), danach sollte es schnell sein.
+### "Text verschwindet"-Bug
+Vor v0.2.6 wurde `localContents` upfront gecaptured. Wenn der User während initialSync tippt, wurde sein Edit durch den stale Snapshot überschrieben. Ab v0.2.6 werden Contents lazy gelesen → Snapshot enthält aktuelle Edits. **Verifizieren ob der Bug mit v0.2.7 weg ist.**
 
-**Bekanntes Problem (v0.2.6):** mtime ist auf Android nicht stabil zwischen App-Restarts → Tier 1 mit mtime/size griff nie. Deshalb jetzt Content-Hash (FNV-1a).
+## Priorität 2 — Code Quality
 
-**Verbleibendes Performance-Budget:**
-- 800× `vault.read()` + 800× `fnv1aHash()` — das ist das Minimum für den "nichts geändert"-Fall
-- Falls das immer noch zu langsam ist: `vault.read()` parallelisieren oder file-size als Pre-Filter nutzen
+### sync-engine.ts (~795 Zeilen)
+Größte Datei. `syncOverlappingDoc()` wurde bereits extrahiert. Weitere Kandidaten:
+- Download-Phase (Zeile ~248-302) als eigene Methode
+- Die gesamte initialSync-Methode ist ~250 Zeilen lang — könnte in Phasen-Methoden aufgeteilt werden
 
-**"Text verschwindet"-Bug:** Lazy reads (v0.2.6) sollten das fixen. Falls der Bug weiterhin auftritt: prüfen ob `writeToVault` während initialSync aufgerufen wird (sollte bei Tier 1 skip nicht passieren).
+### state-storage.ts (~191 Zeilen)
+Hat 3 Verantwortungen: `.loro` Persistenz, VV-Cache (v3), Orphan-Cleanup. Noch übersichtlich, aber bei weiterem Wachstum VV-Cache in eigene Klasse auslagern.
 
-## Priorität 2 — Docs & Code Quality
+### conflict-utils.ts (~64 Zeilen)
+Enthält jetzt `vvCovers`, `vvEquals`, `hasSharedHistory`, `conflictPath`, `fnv1aHash`. Gut — reine Funktionen, kein State.
 
-### Docs aufräumen
-- `next-session-prompt.md` enthält mittlerweile viel historischen Ballast aus früheren Sessions. Komprimieren: nur aktuelle Architektur + offene Probleme behalten, alte "was wurde gebaut"-Abschnitte entfernen.
-- README.md für beide Repos prüfen/aktualisieren.
+### Server
+`handlers.rs` ist clean. `db.rs` wächst — prüfen ob `list_docs_with_vv` performant genug für große Vaults ist.
 
-### Code Quality Checks
-- `sync-engine.ts` ist mit ~725 Zeilen die größte Datei. Die Extraktion von `syncOverlappingDoc()` war ein guter Schritt. Prüfen ob weitere Extraktionen sinnvoll sind (z.B. die Download-Phase als eigene Methode).
-- `state-storage.ts` hat jetzt 3 Verantwortungen (`.loro` Persistenz, VV-Cache, Orphan-Cleanup). Prüfen ob das noch übersichtlich genug ist oder ob der VV-Cache + Cleanup in eine eigene Klasse sollte.
-- Server: `handlers.rs` ist clean. `db.rs` wächst — prüfen ob die neue `list_docs_with_vv` Konvertierung performant genug ist für große Vaults.
-- Generell: LLM-freundlicher Code-Stil (ausgewogene Dateigröße, keine Magie, klare Strukturen).
+### Generell
+LLM-freundlicher Code-Stil: ausgewogene Dateigröße, keine Magie, klare Strukturen.
 
 ## Priorität 3 — Server-seitiges Orphan-Monitoring
 
@@ -73,13 +72,13 @@ Docs die kein Client mehr referenziert bleiben auf dem Server. Kein automatische
 ```
 main.ts               — Plugin-Lifecycle, Settings, StatusBar, Onboarding
 settings.ts            — VaultCRDTSettings Interface, SettingsTab UI
-sync-engine.ts         — WebSocket, Auth, initialSync (VV-Quick-Check), Broadcasts
+sync-engine.ts         — WebSocket, Auth, initialSync (Content-Hash Skip), Broadcasts
   └─ syncOverlappingDoc()  — Conflict-Detection + Merge für einzelnes Doc
 push-handler.ts        — Outbound-Changes (debounced), Doc-Create/Delete/Rename
 editor-integration.ts  — Editor lesen/schreiben, surgical diffs via TextDelta
 document-manager.ts    — CRDT-Doc Cache + .loro Persistenz + VV-Cache Proxy
-state-storage.ts       — .loro File I/O, VV-Cache (vv-cache.json), Orphan-Cleanup
-conflict-utils.ts      — vvCovers, vvEquals, hasSharedHistory, conflictPath
+state-storage.ts       — .loro File I/O, VV-Cache v3 (contentHash), Orphan-Cleanup
+conflict-utils.ts      — vvCovers, vvEquals, hasSharedHistory, conflictPath, fnv1aHash
 promise-manager.ts     — WS Request/Response Pairing (60s Timeout)
 onboarding-modal.ts    — Erster-Start Modal (Pull/Push/Merge)
 file-watcher.ts        — External-Change-Detection (focus event)
@@ -105,9 +104,9 @@ Heartbeat: Ping alle 30s → Pong vom Server
 **Inbound:** `doc_list`, `sync_delta`, `doc_unknown`, `delta_broadcast`, `doc_deleted`, `ack`, `pong`, `error`
 **Outbound:** `ping`, `request_doc_list`, `sync_start`, `sync_push`, `doc_create`, `doc_delete`
 
-### Sync-Flow (initialSync mit Content-Hash Skip)
+### Sync-Flow (initialSync v0.2.7)
 ```
-1. Build local file index (metadata only — no content reads)
+1. Build local file index (metadata only)
 2. request_doc_list → Server-VVs (JSON) + Tombstones
 3. Load VV-Cache v3 (vv-cache.json mit contentHash)
 4. Server-only docs → parallel download (max 5)
@@ -124,8 +123,15 @@ Heartbeat: Ping alle 30s → Pong vom Server
 11. Process queued broadcasts
 ```
 
+## Erkenntnisse aus dieser Session
+
+- **mtime auf Android instabil**: Obsidian Mobile ändert mtime beim App-Start. Niemals mtime für Caching verwenden. Content-Hash oder size sind zuverlässig.
+- **Server-Logs zeigen 0 sync_starts**: Der VV-Quick-Check (v0.2.5) funktioniert serverseitig. Das Bottleneck war rein client-seitig (800× CRDT-Load).
+- **27s zwischen doc_list und erstem sync_start**: Gemessen in Server-Logs (Session 11:24). Das war die Zeit für 800× vault.read + 800× getOrLoad im alten Code.
+
 ## SSH / Deploy
 - `SSH_AUTH_SOCK` → 1Password Agent (`~/.1password/agent.sock`)
-- Deploy: `cd ~/fleet && just home-deploy vaultcrdt`
+- Deploy Server: `cd ~/fleet && just home-deploy vaultcrdt`
 - Server-Tag für Deploy muss mit compose.yaml übereinstimmen (`v0.2.3`)
+- Server-Logs: `ssh home "docker logs vaultcrdt 2>&1 | tail -50"`
 - Plugin an 4 Stellen kopieren: vault-a, vault-b, Dokumente/obsidian-plugins, CloudOrdner/richardsachen
