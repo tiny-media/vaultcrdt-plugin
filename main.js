@@ -45,8 +45,7 @@ var import_obsidian5 = require("obsidian");
 // src/settings.ts
 var import_obsidian = require("obsidian");
 var DEFAULT_SETTINGS = {
-  serverUrl: "http://localhost:3737",
-  registrationKey: "",
+  serverUrl: "",
   vaultSecret: "",
   peerId: "",
   vaultId: "",
@@ -89,10 +88,6 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.peerId = crypto.randomUUID();
       needsSave = true;
     }
-    if (!this.plugin.settings.vaultId) {
-      this.plugin.settings.vaultId = crypto.randomUUID();
-      needsSave = true;
-    }
     if (!this.plugin.settings.deviceName) {
       this.plugin.settings.deviceName = defaultDeviceName();
       needsSave = true;
@@ -114,16 +109,9 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Admin Token").setDesc("Only needed once when setting up a new vault. Your server admin can provide this.").addText((text) => {
-      text.setPlaceholder("admin token").setValue(this.plugin.settings.registrationKey).onChange(async (value) => {
-        this.plugin.settings.registrationKey = value;
-        await this.plugin.saveSettings();
-      });
-      text.inputEl.type = "password";
-      return text;
-    });
-    new import_obsidian.Setting(containerEl).setName("Vault Secret").setDesc("Shared secret for this vault. Must be identical on every device that syncs this vault.").addText((text) => {
-      text.setPlaceholder("vault secret").setValue(this.plugin.settings.vaultSecret).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Vault Name").setDesc(this.plugin.settings.vaultId ? `Connected to: ${this.plugin.settings.vaultId}` : "Not configured \u2014 enable the plugin to run Setup");
+    new import_obsidian.Setting(containerEl).setName("Password").setDesc("Shared password for this vault. Must be identical on every device that syncs this vault.").addText((text) => {
+      text.setPlaceholder("vault password").setValue(this.plugin.settings.vaultSecret).onChange(async (value) => {
         this.plugin.settings.vaultSecret = value;
         await this.plugin.saveSettings();
       });
@@ -183,10 +171,15 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
         new import_obsidian.Notice("Peer ID copied");
       })
     );
-    new import_obsidian.Setting(advancedContainer).setName("Vault ID").setDesc(`Identifies this vault on the server: ${this.plugin.settings.vaultId}`).addButton(
+    new import_obsidian.Setting(advancedContainer).setName("Vault Name").setDesc("Identifies this vault on the server. Changing this disconnects from the current vault.").addText(
+      (text) => text.setPlaceholder("my-notes").setValue(this.plugin.settings.vaultId).onChange(async (value) => {
+        this.plugin.settings.vaultId = value.toLowerCase().trim();
+        await this.plugin.saveSettings();
+      })
+    ).addButton(
       (btn) => btn.setButtonText("Copy").onClick(() => {
         void navigator.clipboard.writeText(this.plugin.settings.vaultId);
-        new import_obsidian.Notice("Vault ID copied");
+        new import_obsidian.Notice("Vault Name copied");
       })
     );
   }
@@ -2981,7 +2974,7 @@ var SyncEngine = class {
     __publicField(this, "statusCallback", null);
     /** Fires on every message received from the server (pong, ack, delta, etc.). */
     __publicField(this, "onServerActivity", null);
-    /** Called on WS open instead of auto-starting initialSync — allows main.ts to show onboarding modal. */
+    /** Called on WS open — main.ts auto-detects sync mode and runs initialSync. */
     __publicField(this, "onInitialSync", null);
     this.docs = new DocumentManager(app);
     this.editor = new EditorIntegration(app, this.writingFromRemote, this.lastRemoteWrite, this.tag);
@@ -3028,8 +3021,7 @@ var SyncEngine = class {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         vault_id: this.settings.vaultId,
-        api_key: this.settings.vaultSecret,
-        registration_key: this.settings.registrationKey
+        api_key: this.settings.vaultSecret
       })
     });
     this.token = resp.json.token;
@@ -3661,18 +3653,21 @@ var FileWatcherV2 = class {
   }
 };
 
-// src/onboarding-modal.ts
+// src/setup-modal.ts
 var import_obsidian4 = require("obsidian");
-var OnboardingModal = class extends import_obsidian4.Modal {
-  constructor(app, serverDocCount, localDocCount) {
+var VAULT_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
+var SetupModal = class extends import_obsidian4.Modal {
+  constructor(app, settings) {
     super(app);
     __publicField(this, "resolve", null);
-    __publicField(this, "serverDocCount");
-    __publicField(this, "localDocCount");
-    this.serverDocCount = serverDocCount;
-    this.localDocCount = localDocCount;
+    __publicField(this, "serverUrl");
+    __publicField(this, "vaultId");
+    __publicField(this, "vaultSecret");
+    __publicField(this, "errorEl", null);
+    this.serverUrl = settings.serverUrl;
+    this.vaultId = settings.vaultId;
+    this.vaultSecret = settings.vaultSecret;
   }
-  /** Show modal and return the chosen sync mode. */
   prompt() {
     return new Promise((resolve) => {
       this.resolve = resolve;
@@ -3682,47 +3677,118 @@ var OnboardingModal = class extends import_obsidian4.Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.addClass("vcrdt-onboarding");
-    contentEl.createEl("h2", { text: "VaultCRDT \u2014 First Sync" });
+    contentEl.addClass("vcrdt-setup");
+    contentEl.createEl("h2", { text: "VaultCRDT \u2014 Setup" });
     contentEl.createEl("p", {
-      text: `Server has ${this.serverDocCount} documents. This vault has ${this.localDocCount} local files.`
+      text: "Enter the details your server admin gave you.",
+      cls: "setting-item-description"
     });
-    contentEl.createEl("p", {
-      text: "Choose how to handle the initial sync:"
-    });
-    new import_obsidian4.Setting(contentEl).setName("Pull from Server (recommended)").setDesc("Download all server documents. Local-only files will NOT be pushed.").addButton(
-      (btn) => btn.setButtonText("Pull").setCta().onClick(() => {
-        var _a;
-        (_a = this.resolve) == null ? void 0 : _a.call(this, "pull");
-        this.close();
+    new import_obsidian4.Setting(contentEl).setName("Server").setDesc("Address of your sync server").addText(
+      (text) => text.setPlaceholder("https://sync.example.com").setValue(this.serverUrl).onChange((v) => {
+        this.serverUrl = v.trim();
       })
     );
-    new import_obsidian4.Setting(contentEl).setName("Push to Server").setDesc("Upload all local files to server. Server-only documents will NOT be downloaded.").addButton(
-      (btn) => btn.setButtonText("Push").onClick(() => {
-        var _a;
-        (_a = this.resolve) == null ? void 0 : _a.call(this, "push");
-        this.close();
+    new import_obsidian4.Setting(contentEl).setName("Vault Name").setDesc("Must match on every device that syncs this vault").addText(
+      (text) => text.setPlaceholder("my-notes").setValue(this.vaultId).onChange((v) => {
+        this.vaultId = v.toLowerCase().trim();
       })
     );
-    if (this.serverDocCount > 0) {
-      const warn2 = contentEl.createEl("p", {
-        cls: "mod-warning",
-        text: "Warning: Push will skip server documents that don't exist locally."
+    new import_obsidian4.Setting(contentEl).setName("Password").setDesc("Shared password for this vault \u2014 same on every device").addText((text) => {
+      text.setPlaceholder("vault password").setValue(this.vaultSecret).onChange((v) => {
+        this.vaultSecret = v;
       });
-      warn2.style.color = "var(--text-error)";
-      warn2.style.fontSize = "0.85em";
-    }
-    new import_obsidian4.Setting(contentEl).setName("Merge (bidirectional)").setDesc("Full two-way sync: download server docs AND push local files. May create conflict files.").addButton(
-      (btn) => btn.setButtonText("Merge").onClick(() => {
+      text.inputEl.type = "password";
+      return text;
+    });
+    this.errorEl = contentEl.createEl("p", { cls: "vcrdt-setup-error" });
+    this.errorEl.style.color = "var(--text-error)";
+    this.errorEl.style.fontSize = "0.85em";
+    this.errorEl.style.display = "none";
+    new import_obsidian4.Setting(contentEl).addButton(
+      (btn) => btn.setButtonText("Cancel").onClick(() => {
         var _a;
-        (_a = this.resolve) == null ? void 0 : _a.call(this, "merge");
+        (_a = this.resolve) == null ? void 0 : _a.call(this, null);
+        this.resolve = null;
         this.close();
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("Connect").setCta().onClick(() => {
+        void this.submit(btn);
       })
     );
   }
+  showError(msg) {
+    if (!this.errorEl) return;
+    this.errorEl.textContent = msg;
+    this.errorEl.style.display = "";
+  }
+  hideError() {
+    if (!this.errorEl) return;
+    this.errorEl.style.display = "none";
+  }
+  async submit(btn) {
+    var _a, _b, _c;
+    this.hideError();
+    if (!this.serverUrl) {
+      this.showError("Server URL is required");
+      return;
+    }
+    if (!VAULT_NAME_RE.test(this.vaultId)) {
+      this.showError("Vault Name must be lowercase letters, numbers, or hyphens (e.g. my-notes)");
+      return;
+    }
+    if (!this.vaultSecret) {
+      this.showError("Password is required");
+      return;
+    }
+    btn.setDisabled(true);
+    btn.setButtonText("Connecting...");
+    const httpBase = this.serverUrl.replace(/^ws:\/\//, "http://").replace(/^wss:\/\//, "https://");
+    try {
+      const resp = await (0, import_obsidian4.requestUrl)({
+        url: `${httpBase}/auth/verify`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          vault_id: this.vaultId,
+          api_key: this.vaultSecret
+        })
+      });
+      if ((_a = resp.json) == null ? void 0 : _a.token) {
+        (_b = this.resolve) == null ? void 0 : _b.call(this, {
+          serverUrl: this.serverUrl,
+          vaultId: this.vaultId,
+          vaultSecret: this.vaultSecret
+        });
+        this.resolve = null;
+        this.close();
+        return;
+      }
+      this.showError("Unexpected server response. Check the server URL.");
+    } catch (e) {
+      const status = e == null ? void 0 : e.status;
+      if (status === 401) {
+        const msg = String((_c = e == null ? void 0 : e.message) != null ? _c : "");
+        if (msg.includes("Invalid API key")) {
+          this.showError("Wrong password for this vault. Check with your server admin.");
+        } else if (msg.includes("Invalid registration key")) {
+          this.showError("This vault does not exist on the server. Ask your server admin to create it.");
+        } else {
+          this.showError("Authentication failed. Check vault name and password.");
+        }
+      } else if (status) {
+        this.showError(`Server returned status ${status}. Check the server URL.`);
+      } else {
+        this.showError("Could not reach the server. Check the URL and your internet connection.");
+      }
+    } finally {
+      btn.setDisabled(false);
+      btn.setButtonText("Connect");
+    }
+  }
   onClose() {
     if (this.resolve) {
-      this.resolve("pull");
+      this.resolve(null);
       this.resolve = null;
     }
     this.contentEl.empty();
@@ -3795,21 +3861,39 @@ var VaultCRDTPlugin = class extends import_obsidian5.Plugin {
     this.syncEngine.onInitialSync = (engine) => {
       void this.handleInitialSync(engine);
     };
-    this.syncEngine.start().catch(
-      (err) => error("start error:", err)
-    );
+    this.app.workspace.onLayoutReady(() => {
+      void this.startWithSetup();
+    });
     log("Plugin loaded");
+  }
+  async startWithSetup() {
+    const needsSetup = !this.settings.serverUrl || !this.settings.vaultId || !this.settings.vaultSecret;
+    if (needsSetup) {
+      const result = await new SetupModal(this.app, this.settings).prompt();
+      if (result) {
+        Object.assign(this.settings, result);
+        await this.saveSettings();
+      } else {
+        new import_obsidian5.Notice("VaultCRDT: open Settings to configure sync", 5e3);
+        return;
+      }
+    }
+    this.syncEngine.start().catch((err) => {
+      error("start error:", err);
+      new import_obsidian5.Notice("VaultCRDT: connection failed \u2014 check Settings", 8e3);
+    });
   }
   async handleInitialSync(engine) {
     try {
-      let mode = "merge";
       const isOnboarding = !this.settings.onboardingComplete;
+      let mode = "merge";
       if (isOnboarding) {
         const { docs: serverDocs } = await engine.requestDocList();
         const localFiles = this.app.vault.getMarkdownFiles();
-        if (serverDocs.length > 0 || localFiles.length > 0) {
-          const modal = new OnboardingModal(this.app, serverDocs.length, localFiles.length);
-          mode = await modal.prompt();
+        if (localFiles.length === 0 && serverDocs.length > 0) {
+          mode = "pull";
+        } else if (serverDocs.length === 0 && localFiles.length > 0) {
+          mode = "push";
         }
         this.settings.onboardingComplete = true;
         await this.saveSettings();
@@ -3898,9 +3982,12 @@ var VaultCRDTPlugin = class extends import_obsidian5.Plugin {
   }
   async loadSettings() {
     const data = await this.loadData();
-    if (data && "apiKey" in data && !("vaultSecret" in data)) {
-      data.vaultSecret = data.apiKey;
+    if (data) {
+      if ("apiKey" in data && !("vaultSecret" in data)) {
+        data.vaultSecret = data.apiKey;
+      }
       delete data.apiKey;
+      delete data.registrationKey;
     }
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }

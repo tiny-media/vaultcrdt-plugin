@@ -10,37 +10,41 @@ Pre-release (0.2.x). The protocol and storage format may change between versions
 
 ## Requirements
 
-- Obsidian 1.12 or later (tested with 1.8.9+)
-- A running instance of vaultcrdt-server with a valid API key
+- Obsidian 1.12 or later
+- A running instance of [vaultcrdt-server](https://github.com/tiny-media/vaultcrdt-server)
 
 ## Installation
 
-Manual installation until the plugin is accepted in the community directory:
+Install via **BRAT** (recommended) — see [docs/install-brat.md](docs/install-brat.md) for step-by-step instructions.
+
+Or install manually:
 
 1. Download `main.js` and `manifest.json` from the [latest release](https://github.com/tiny-media/vaultcrdt-plugin/releases/latest).
 2. Create a folder at `<your-vault>/.obsidian/plugins/vaultcrdt/`.
 3. Place both files in that folder.
 4. Restart Obsidian and enable the plugin under Settings > Community plugins.
 
-## Configuration
+## Setup
 
-Open Settings > VaultCRDT and set:
+On first launch, a Setup screen asks for three things:
 
-- **Server URL** — WebSocket URL of your vaultcrdt-server instance, e.g. `wss://your-server.example.com`
-- **Vault ID** — identifier for this vault on the server
-- **Vault Secret** — shared secret for this vault (must be identical on every device)
+- **Server** — URL of your VaultCRDT server (e.g. `https://sync.example.com`)
+- **Vault Name** — identifies this vault on the server (e.g. `family-notes`)
+- **Password** — shared password for this vault (same on every device)
 
-## Sync Modes
+Your server admin provides these details. The plugin verifies the credentials before connecting.
 
-On first connect, a modal prompts you to choose how the initial sync should proceed:
+## Initial sync
 
-| Mode | Behaviour |
+The first sync is fully automatic:
+
+| Situation | Behaviour |
 |---|---|
-| Pull | Downloads all documents from the server. Local files not on the server are not uploaded. |
-| Push | Uploads all local documents to the server. Remote documents not present locally are not downloaded. |
-| Merge | Bidirectional: downloads remote documents and uploads local documents. CRDT merge resolves concurrent edits. |
+| Fresh device, server has notes | Downloads all notes from the server (pull) |
+| Server empty, device has notes | Uploads all local notes to the server (push) |
+| Both have notes | Bidirectional merge — CRDT resolves concurrent edits |
 
-After the initial sync, all modes behave identically: edits are synchronised bidirectionally in real time.
+After the initial sync, all changes are synchronised bidirectionally in real time.
 
 ## Conflict handling
 

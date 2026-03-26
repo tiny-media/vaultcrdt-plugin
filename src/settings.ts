@@ -3,7 +3,6 @@ import type VaultCRDTPlugin from './main';
 
 export interface VaultCRDTSettings {
   serverUrl: string;
-  registrationKey: string;
   vaultSecret: string;
   peerId: string;
   vaultId: string;
@@ -14,8 +13,7 @@ export interface VaultCRDTSettings {
 }
 
 export const DEFAULT_SETTINGS: VaultCRDTSettings = {
-  serverUrl: 'http://localhost:3737',
-  registrationKey: '',
+  serverUrl: '',
   vaultSecret: '',
   peerId: '',
   vaultId: '',
@@ -65,10 +63,6 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       this.plugin.settings.peerId = crypto.randomUUID();
       needsSave = true;
     }
-    if (!this.plugin.settings.vaultId) {
-      this.plugin.settings.vaultId = crypto.randomUUID();
-      needsSave = true;
-    }
     if (!this.plugin.settings.deviceName) {
       this.plugin.settings.deviceName = defaultDeviceName();
       needsSave = true;
@@ -112,26 +106,17 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Admin Token')
-      .setDesc('Only needed once when setting up a new vault. Your server admin can provide this.')
-      .addText((text) => {
-        text
-          .setPlaceholder('admin token')
-          .setValue(this.plugin.settings.registrationKey)
-          .onChange(async (value) => {
-            this.plugin.settings.registrationKey = value;
-            await this.plugin.saveSettings();
-          });
-        text.inputEl.type = 'password';
-        return text;
-      });
+      .setName('Vault Name')
+      .setDesc(this.plugin.settings.vaultId
+        ? `Connected to: ${this.plugin.settings.vaultId}`
+        : 'Not configured — enable the plugin to run Setup');
 
     new Setting(containerEl)
-      .setName('Vault Secret')
-      .setDesc('Shared secret for this vault. Must be identical on every device that syncs this vault.')
+      .setName('Password')
+      .setDesc('Shared password for this vault. Must be identical on every device that syncs this vault.')
       .addText((text) => {
         text
-          .setPlaceholder('vault secret')
+          .setPlaceholder('vault password')
           .setValue(this.plugin.settings.vaultSecret)
           .onChange(async (value) => {
             this.plugin.settings.vaultSecret = value;
@@ -229,12 +214,21 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       );
 
     new Setting(advancedContainer)
-      .setName('Vault ID')
-      .setDesc(`Identifies this vault on the server: ${this.plugin.settings.vaultId}`)
+      .setName('Vault Name')
+      .setDesc('Identifies this vault on the server. Changing this disconnects from the current vault.')
+      .addText((text) =>
+        text
+          .setPlaceholder('my-notes')
+          .setValue(this.plugin.settings.vaultId)
+          .onChange(async (value) => {
+            this.plugin.settings.vaultId = value.toLowerCase().trim();
+            await this.plugin.saveSettings();
+          })
+      )
       .addButton((btn) =>
         btn.setButtonText('Copy').onClick(() => {
           void navigator.clipboard.writeText(this.plugin.settings.vaultId);
-          new Notice('Vault ID copied');
+          new Notice('Vault Name copied');
         })
       );
   }

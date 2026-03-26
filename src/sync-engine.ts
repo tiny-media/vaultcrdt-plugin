@@ -55,7 +55,7 @@ export class SyncEngine {
   statusCallback: ((s: SyncStatus) => void) | null = null;
   /** Fires on every message received from the server (pong, ack, delta, etc.). */
   onServerActivity: (() => void) | null = null;
-  /** Called on WS open instead of auto-starting initialSync — allows main.ts to show onboarding modal. */
+  /** Called on WS open — main.ts auto-detects sync mode and runs initialSync. */
   onInitialSync: ((engine: SyncEngine) => void) | null = null;
 
   constructor(
@@ -112,7 +112,6 @@ export class SyncEngine {
       body: JSON.stringify({
         vault_id: this.settings.vaultId,
         api_key: this.settings.vaultSecret,
-        registration_key: this.settings.registrationKey,
       }),
     });
     this.token = resp.json.token as string;

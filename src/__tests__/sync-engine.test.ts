@@ -125,7 +125,6 @@ import { TFile, MarkdownView } from 'obsidian';
 
 const makeSettings = (overrides: Record<string, unknown> = {}) => ({
   serverUrl: 'http://localhost:3737',
-  registrationKey: 'test-server-password',
   vaultSecret: 'test-api-key',
   peerId: 'peer-test',
   vaultId: 'vault-abc',
@@ -186,13 +185,13 @@ describe('SyncEngine', () => {
   // ── auth ───────────────────────────────────────────────────────────────────
 
   describe('auth', () => {
-    it('calls /auth/verify with vault_id, api_key, and registration_key', async () => {
+    it('calls /auth/verify with vault_id and api_key', async () => {
       await engine.start();
       expect(mockRequestUrl).toHaveBeenCalledWith(
         expect.objectContaining({
           url: 'http://localhost:3737/auth/verify',
           method: 'POST',
-          body: JSON.stringify({ vault_id: 'vault-abc', api_key: 'test-api-key', registration_key: 'test-server-password' }),
+          body: JSON.stringify({ vault_id: 'vault-abc', api_key: 'test-api-key' }),
         })
       );
     });

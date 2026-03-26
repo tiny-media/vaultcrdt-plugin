@@ -4,7 +4,7 @@ import { initWasm } from './wasm-bridge';
 import { SyncEngine } from './sync-engine';
 import type { SyncMode } from './sync-engine';
 import { FileWatcherV2 } from './file-watcher';
-import { OnboardingModal } from './onboarding-modal';
+import { SetupModal } from './setup-modal';
 import { log, error } from './logger';
 
 /** If no server response (pong/ack/delta) for this long, show disconnected. */
@@ -87,35 +87,53 @@ export default class VaultCRDTPlugin extends Plugin {
     this.addSettingTab(new VaultCRDTSettingsTab(this.app, this));
     this.setupStatusBar();
 
-    // Wire up onboarding modal + progress notice
+    // Wire up initial sync (auto-detect pull/push/merge)
     this.syncEngine.onInitialSync = (engine) => {
       void this.handleInitialSync(engine);
     };
 
-    // Start: authenticate + connect (fire-and-forget, non-blocking)
-    this.syncEngine.start().catch((err) =>
-      error('start error:', err)
-    );
+    // Wait for layout before showing any modal or starting sync
+    this.app.workspace.onLayoutReady(() => {
+      void this.startWithSetup();
+    });
 
     log('Plugin loaded');
   }
 
+  private async startWithSetup(): Promise<void> {
+    const needsSetup = !this.settings.serverUrl || !this.settings.vaultId || !this.settings.vaultSecret;
+    if (needsSetup) {
+      const result = await new SetupModal(this.app, this.settings).prompt();
+      if (result) {
+        Object.assign(this.settings, result);
+        await this.saveSettings();
+      } else {
+        new Notice('VaultCRDT: open Settings to configure sync', 5000);
+        return;
+      }
+    }
+    this.syncEngine.start().catch((err) => {
+      error('start error:', err);
+      new Notice('VaultCRDT: connection failed — check Settings', 8000);
+    });
+  }
+
   private async handleInitialSync(engine: SyncEngine): Promise<void> {
     try {
-      let mode: SyncMode = 'merge';
       const isOnboarding = !this.settings.onboardingComplete;
+      let mode: SyncMode = 'merge';
 
       if (isOnboarding) {
-        // Check if this looks like a fresh device
         const { docs: serverDocs } = await engine.requestDocList();
         const localFiles = this.app.vault.getMarkdownFiles();
 
-        // Fresh device heuristic: server has docs and we have no persisted CRDT state
-        // (or very little). Show onboarding modal.
-        if (serverDocs.length > 0 || localFiles.length > 0) {
-          const modal = new OnboardingModal(this.app, serverDocs.length, localFiles.length);
-          mode = await modal.prompt();
+        // Auto-detect: no question asked
+        if (localFiles.length === 0 && serverDocs.length > 0) {
+          mode = 'pull';
+        } else if (serverDocs.length === 0 && localFiles.length > 0) {
+          mode = 'push';
         }
+        // else: both have content → merge (CRDT handles conflicts)
 
         this.settings.onboardingComplete = true;
         await this.saveSettings();
@@ -214,10 +232,14 @@ export default class VaultCRDTPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     const data = await this.loadData() as Record<string, unknown> | null;
-    // Migrate legacy "apiKey" → "vaultSecret"
-    if (data && 'apiKey' in data && !('vaultSecret' in data)) {
-      data.vaultSecret = data.apiKey;
+    if (data) {
+      // Migrate legacy "apiKey" → "vaultSecret"
+      if ('apiKey' in data && !('vaultSecret' in data)) {
+        data.vaultSecret = data.apiKey;
+      }
+      // Clean up removed fields
       delete data.apiKey;
+      delete data.registrationKey;
     }
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
