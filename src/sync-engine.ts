@@ -190,6 +190,7 @@ export class SyncEngine {
   // ── Initial sync ───────────────────────────────────────────────────────────
 
   async initialSync(onProgress?: (done: number, total: number, changed: number) => void, mode: SyncMode = 'merge'): Promise<void> {
+    const t0 = performance.now();
     this.setStatus('syncing');
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
@@ -255,7 +256,7 @@ export class SyncEngine {
         stepsDone++;
         changed++;
         onProgress?.(stepsDone, totalSteps, changed);
-        log(`${this.tag} priority sync complete`, { path: activeDoc });
+        console.info(`${this.tag} priority sync complete (${(performance.now() - t0).toFixed(0)}ms)`, { path: activeDoc });
       }
 
       let downloadOk = 0;
@@ -317,7 +318,7 @@ export class SyncEngine {
         stepsDone += serverOnlyUuids.length;
         onProgress?.(stepsDone, totalSteps, changed);
       }
-      log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
+      console.info(`${this.tag} downloads done (${(performance.now() - t0).toFixed(0)}ms): ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
 
       // 2. Overlapping docs — two-tier skip: VV+hash → full sync
       let skippedVVMatch = 0;
@@ -349,7 +350,7 @@ export class SyncEngine {
         onProgress?.(stepsDone, totalSteps, changed);
       }
 
-      log(`${this.tag} overlapping done: ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
+      console.info(`${this.tag} overlapping done (${(performance.now() - t0).toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
 
       // 3. Local-only docs — push full snapshot via doc_create (skip in pull mode)
       if (mode !== 'pull') {
@@ -402,6 +403,7 @@ export class SyncEngine {
       }
     } finally {
       this.initialSyncRunning = false;
+      console.info(`${this.tag} initialSync complete (${(performance.now() - t0).toFixed(0)}ms)`);
 
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type as string;
@@ -511,15 +513,34 @@ export class SyncEngine {
         }
       }
 
-      // Import server delta
+      // For the active editor doc: flush pending keystrokes into the CRDT
+      // before merging so import_and_diff produces a correct surgical diff.
+      // This prevents writeToVault(setValue) from clobbering in-flight typing.
+      const isActiveEditorDoc = this.editor.getActiveEditorPath() === path;
+      if (isActiveEditorDoc && result && result.delta.length > 0) {
+        await this.push.flushPendingEdits(path);
+      }
+
+      // Import server delta — for active editor doc, use import_and_diff
+      // to get a surgical TextDelta instead of a full editor replacement.
+      let diffJson: string | null = null;
       if (result.delta.length > 0) {
-        doc.import_snapshot(result.delta);
+        if (isActiveEditorDoc) {
+          try {
+            diffJson = doc.import_and_diff(result.delta);
+          } catch (err) {
+            warn(`${this.tag} import_and_diff failed, falling back to import_snapshot`, { path, err });
+            doc.import_snapshot(result.delta);
+          }
+        } else {
+          doc.import_snapshot(result.delta);
+        }
       }
       this.lastServerVV.set(path, result.serverVV);
 
       const serverContent = doc.get_text();
 
-      if (localContent.trim() === '' && serverContent.trim() !== '') {
+      if (localContent.trim() === '' && serverContent.trim() !== '' && !isActiveEditorDoc) {
         log(`${this.tag} overlapping: empty local, adopting server`, { path });
         await this.editor.writeToVault(path, serverContent);
       } else {
@@ -539,7 +560,38 @@ export class SyncEngine {
           log(`${this.tag} overlapping match`, { path });
         }
 
-        if (localContent !== serverContent) {
+        // Apply merged content — active editor gets surgical diff, others get full replace
+        if (isActiveEditorDoc) {
+          if (diffJson) {
+            // Check if the diff has actual insert/delete ops (not just retains)
+            let hasTextChanges = false;
+            try {
+              const ops = JSON.parse(diffJson);
+              hasTextChanges = Array.isArray(ops) && ops.some(
+                (op: { insert?: string; delete?: number }) => op.insert !== undefined || op.delete !== undefined
+              );
+            } catch { /* empty */ }
+
+            if (hasTextChanges) {
+              if (this.editor.applyDiffToEditor(path, diffJson, serverContent, true)) {
+                // After surgical apply, sync any concurrent typing back into the CRDT
+                // so CRDT state stays consistent with what's in the editor.
+                const postApplyContent = this.editor.readCurrentContent(path);
+                if (postApplyContent !== null && !doc.text_matches(postApplyContent)) {
+                  doc.sync_from_disk(postApplyContent);
+                }
+                this.lastRemoteWrite.set(path, postApplyContent ?? serverContent);
+              } else {
+                // Editor was closed between check and apply — fall back
+                await this.editor.writeToVault(path, serverContent);
+              }
+            }
+            // else: no text changes from server — user typing is untouched
+          } else if (result.delta.length > 0) {
+            // import_and_diff failed, fell back to import_snapshot — must use writeToVault
+            await this.editor.writeToVault(path, serverContent);
+          }
+        } else if (localContent !== serverContent) {
           await this.editor.writeToVault(path, serverContent);
         }
       }
@@ -659,11 +711,35 @@ export class SyncEngine {
         if (!this.catchUpInProgress.has(docUuid)) {
           this.catchUpInProgress.add(docUuid);
           try {
+            await this.push.flushPendingEdits(docUuid);
             const result = await this.requestSyncStart(docUuid, localVVStr);
             if (result && result.delta.length > 0) {
-              doc.import_snapshot(result.delta);
+              // Use surgical diff for active editor doc to preserve typing
+              const isActive = this.editor.getActiveEditorPath() === docUuid;
+              let catchUpDiffJson: string | null = null;
+              if (isActive) {
+                try {
+                  catchUpDiffJson = doc.import_and_diff(result.delta);
+                } catch {
+                  doc.import_snapshot(result.delta);
+                }
+              } else {
+                doc.import_snapshot(result.delta);
+              }
               const catchUpText = doc.get_text();
-              await this.editor.writeToVault(docUuid, catchUpText);
+              if (isActive && catchUpDiffJson) {
+                if (this.editor.applyDiffToEditor(docUuid, catchUpDiffJson, catchUpText, true)) {
+                  const postContent = this.editor.readCurrentContent(docUuid);
+                  if (postContent !== null && !doc.text_matches(postContent)) {
+                    doc.sync_from_disk(postContent);
+                  }
+                  this.lastRemoteWrite.set(docUuid, postContent ?? catchUpText);
+                } else {
+                  await this.editor.writeToVault(docUuid, catchUpText);
+                }
+              } else {
+                await this.editor.writeToVault(docUuid, catchUpText);
+              }
             }
           } finally {
             this.catchUpInProgress.delete(docUuid);

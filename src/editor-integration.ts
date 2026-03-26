@@ -73,7 +73,7 @@ export class EditorIntegration {
    * Uses editor.transaction() so the cursor stays in place automatically.
    * Returns true if at least one editor was updated, false if no editor found.
    */
-  applyDiffToEditor(filePath: string, diffJson: string, expectedText: string): boolean {
+  applyDiffToEditor(filePath: string, diffJson: string, expectedText: string, skipFallback = false): boolean {
     let ops: Array<{ retain?: number; insert?: string; delete?: number }>;
     try {
       ops = JSON.parse(diffJson);
@@ -121,17 +121,23 @@ export class EditorIntegration {
 
       // Verification: ensure editor content matches CRDT state
       if (editor.getValue() !== expectedText) {
-        warn(`${this.tag} diff apply mismatch, falling back to setValue`, { filePath });
-        this.updatingEditorFromRemote.add(filePath);
-        try {
-          const cursor = editor.getCursor();
-          editor.setValue(expectedText);
-          const lastLine = editor.lastLine();
-          const line = Math.min(cursor.line, lastLine);
-          const maxCh = editor.getLine(line).length;
-          editor.setCursor({ line, ch: Math.min(cursor.ch, maxCh) });
-        } finally {
-          this.updatingEditorFromRemote.delete(filePath);
+        if (skipFallback) {
+          // During initialSync surgical diff: mismatch is expected from concurrent
+          // typing — the diff was applied correctly, extra chars are user keystrokes.
+          log(`${this.tag} diff apply mismatch (concurrent typing, no fallback)`, { filePath });
+        } else {
+          warn(`${this.tag} diff apply mismatch, falling back to setValue`, { filePath });
+          this.updatingEditorFromRemote.add(filePath);
+          try {
+            const cursor = editor.getCursor();
+            editor.setValue(expectedText);
+            const lastLine = editor.lastLine();
+            const line = Math.min(cursor.line, lastLine);
+            const maxCh = editor.getLine(line).length;
+            editor.setCursor({ line, ch: Math.min(cursor.ch, maxCh) });
+          } finally {
+            this.updatingEditorFromRemote.delete(filePath);
+          }
         }
       }
 

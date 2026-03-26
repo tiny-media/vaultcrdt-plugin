@@ -2715,7 +2715,7 @@ var EditorIntegration = class {
    * Uses editor.transaction() so the cursor stays in place automatically.
    * Returns true if at least one editor was updated, false if no editor found.
    */
-  applyDiffToEditor(filePath, diffJson, expectedText) {
+  applyDiffToEditor(filePath, diffJson, expectedText, skipFallback = false) {
     let ops;
     try {
       ops = JSON.parse(diffJson);
@@ -2754,17 +2754,21 @@ var EditorIntegration = class {
         this.updatingEditorFromRemote.delete(filePath);
       }
       if (editor.getValue() !== expectedText) {
-        warn(`${this.tag} diff apply mismatch, falling back to setValue`, { filePath });
-        this.updatingEditorFromRemote.add(filePath);
-        try {
-          const cursor = editor.getCursor();
-          editor.setValue(expectedText);
-          const lastLine = editor.lastLine();
-          const line = Math.min(cursor.line, lastLine);
-          const maxCh = editor.getLine(line).length;
-          editor.setCursor({ line, ch: Math.min(cursor.ch, maxCh) });
-        } finally {
-          this.updatingEditorFromRemote.delete(filePath);
+        if (skipFallback) {
+          log(`${this.tag} diff apply mismatch (concurrent typing, no fallback)`, { filePath });
+        } else {
+          warn(`${this.tag} diff apply mismatch, falling back to setValue`, { filePath });
+          this.updatingEditorFromRemote.add(filePath);
+          try {
+            const cursor = editor.getCursor();
+            editor.setValue(expectedText);
+            const lastLine = editor.lastLine();
+            const line = Math.min(cursor.line, lastLine);
+            const maxCh = editor.getLine(line).length;
+            editor.setCursor({ line, ch: Math.min(cursor.ch, maxCh) });
+          } finally {
+            this.updatingEditorFromRemote.delete(filePath);
+          }
         }
       }
       applied = true;
@@ -3088,6 +3092,7 @@ var SyncEngine = class {
   // ── Initial sync ───────────────────────────────────────────────────────────
   async initialSync(onProgress, mode = "merge") {
     var _a;
+    const t0 = performance.now();
     this.setStatus("syncing");
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
@@ -3139,7 +3144,7 @@ var SyncEngine = class {
         stepsDone++;
         changed++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
-        log(`${this.tag} priority sync complete`, { path: activeDoc });
+        console.info(`${this.tag} priority sync complete (${(performance.now() - t0).toFixed(0)}ms)`, { path: activeDoc });
       }
       let downloadOk = 0;
       let downloadFail = 0;
@@ -3195,7 +3200,7 @@ var SyncEngine = class {
         stepsDone += serverOnlyUuids.length;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
       }
-      log(`${this.tag} download complete: ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
+      console.info(`${this.tag} downloads done (${(performance.now() - t0).toFixed(0)}ms): ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
       let skippedVVMatch = 0;
       for (const file of overlappingFiles) {
         if (syncedPaths.has(file.path)) {
@@ -3219,7 +3224,7 @@ var SyncEngine = class {
         stepsDone++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
       }
-      log(`${this.tag} overlapping done: ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
+      console.info(`${this.tag} overlapping done (${(performance.now() - t0).toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
       if (mode !== "pull") {
         for (const file of localOnlyFiles) {
           const content = await this.app.vault.read(file);
@@ -3262,6 +3267,7 @@ var SyncEngine = class {
       }
     } finally {
       this.initialSyncRunning = false;
+      console.info(`${this.tag} initialSync complete (${(performance.now() - t0).toFixed(0)}ms)`);
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type;
         if (type === "delta_broadcast") {
@@ -3342,12 +3348,26 @@ var SyncEngine = class {
           return;
         }
       }
+      const isActiveEditorDoc = this.editor.getActiveEditorPath() === path;
+      if (isActiveEditorDoc && result && result.delta.length > 0) {
+        await this.push.flushPendingEdits(path);
+      }
+      let diffJson = null;
       if (result.delta.length > 0) {
-        doc.import_snapshot(result.delta);
+        if (isActiveEditorDoc) {
+          try {
+            diffJson = doc.import_and_diff(result.delta);
+          } catch (err) {
+            warn(`${this.tag} import_and_diff failed, falling back to import_snapshot`, { path, err });
+            doc.import_snapshot(result.delta);
+          }
+        } else {
+          doc.import_snapshot(result.delta);
+        }
       }
       this.lastServerVV.set(path, result.serverVV);
       const serverContent = doc.get_text();
-      if (localContent.trim() === "" && serverContent.trim() !== "") {
+      if (localContent.trim() === "" && serverContent.trim() !== "" && !isActiveEditorDoc) {
         log(`${this.tag} overlapping: empty local, adopting server`, { path });
         await this.editor.writeToVault(path, serverContent);
       } else {
@@ -3366,7 +3386,31 @@ var SyncEngine = class {
         } else {
           log(`${this.tag} overlapping match`, { path });
         }
-        if (localContent !== serverContent) {
+        if (isActiveEditorDoc) {
+          if (diffJson) {
+            let hasTextChanges = false;
+            try {
+              const ops = JSON.parse(diffJson);
+              hasTextChanges = Array.isArray(ops) && ops.some(
+                (op) => op.insert !== void 0 || op.delete !== void 0
+              );
+            } catch (e) {
+            }
+            if (hasTextChanges) {
+              if (this.editor.applyDiffToEditor(path, diffJson, serverContent, true)) {
+                const postApplyContent = this.editor.readCurrentContent(path);
+                if (postApplyContent !== null && !doc.text_matches(postApplyContent)) {
+                  doc.sync_from_disk(postApplyContent);
+                }
+                this.lastRemoteWrite.set(path, postApplyContent != null ? postApplyContent : serverContent);
+              } else {
+                await this.editor.writeToVault(path, serverContent);
+              }
+            }
+          } else if (result.delta.length > 0) {
+            await this.editor.writeToVault(path, serverContent);
+          }
+        } else if (localContent !== serverContent) {
           await this.editor.writeToVault(path, serverContent);
         }
       }
@@ -3468,11 +3512,34 @@ var SyncEngine = class {
         if (!this.catchUpInProgress.has(docUuid)) {
           this.catchUpInProgress.add(docUuid);
           try {
+            await this.push.flushPendingEdits(docUuid);
             const result = await this.requestSyncStart(docUuid, localVVStr);
             if (result && result.delta.length > 0) {
-              doc.import_snapshot(result.delta);
+              const isActive = this.editor.getActiveEditorPath() === docUuid;
+              let catchUpDiffJson = null;
+              if (isActive) {
+                try {
+                  catchUpDiffJson = doc.import_and_diff(result.delta);
+                } catch (e) {
+                  doc.import_snapshot(result.delta);
+                }
+              } else {
+                doc.import_snapshot(result.delta);
+              }
               const catchUpText = doc.get_text();
-              await this.editor.writeToVault(docUuid, catchUpText);
+              if (isActive && catchUpDiffJson) {
+                if (this.editor.applyDiffToEditor(docUuid, catchUpDiffJson, catchUpText, true)) {
+                  const postContent = this.editor.readCurrentContent(docUuid);
+                  if (postContent !== null && !doc.text_matches(postContent)) {
+                    doc.sync_from_disk(postContent);
+                  }
+                  this.lastRemoteWrite.set(docUuid, postContent != null ? postContent : catchUpText);
+                } else {
+                  await this.editor.writeToVault(docUuid, catchUpText);
+                }
+              } else {
+                await this.editor.writeToVault(docUuid, catchUpText);
+              }
             }
           } finally {
             this.catchUpInProgress.delete(docUuid);
