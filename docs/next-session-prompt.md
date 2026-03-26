@@ -1,10 +1,18 @@
-# Next Session — VaultCRDT Stand 2026-03-25 (v0.2.10)
+# Next Session — VaultCRDT Stand 2026-03-26 (v0.2.13)
+
+## TL;DR für den nächsten Agenten
+
+**Startup-Typing-Bug (v0.2.8–v0.2.12) ist gefixt in v0.2.13.** User kann auf Android sofort tippen, Text bleibt erhalten, Server-Änderungen werden chirurgisch reingemerged.
+
+**Lösung:** Ansatz C — Surgical Diffs via `import_and_diff` + `applyDiffToEditor(skipFallback=true)` statt `writeToVault(setValue)` für das aktive Editor-Doc. Getestet auf Android + Laptop, funktioniert.
+
+---
 
 ## Repos & Versionen
 
 | Repo | Version | Pfad |
 |------|---------|------|
-| Plugin | v0.2.10 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
+| Plugin | v0.2.13 | `/home/richard/projects/vaultcrdt-plugin/` (GitHub: tiny-media/vaultcrdt-plugin) |
 | Server | v0.2.3 | `/home/richard/projects/vaultcrdt-server/` (GitHub: tiny-media/vaultcrdt-server) |
 | Fleet | — | `/home/richard/fleet/` (Gitea: git.fryy.de/richard/fleet) |
 
@@ -21,247 +29,143 @@ Server deployed auf `home` via Docker Compose, erreichbar unter `https://obsidia
 
 ---
 
-## PRIORITÄT 1 — "Typing during initialSync" Problem lösen
+## Was in v0.2.13 gefixt wurde
 
-### Aktueller Stand (v0.2.10)
-Text verschwindet nicht mehr, aber das aktiv editierte Dokument "verschluckt" sich — Keystrokes gehen verloren oder werden nicht zum Server gepusht. Nach initialSync sind Laptop und Handy out-of-sync.
+### Das Problem (v0.2.8–v0.2.12)
 
-### Was wir versucht haben (v0.2.8–v0.2.10) und warum es nicht reicht
+Wenn der User auf Android Obsidian startet und sofort tippt, "verschluckt" sich der Text — er verschwindet, kommt teilweise wieder, Dateien werden korrumpiert. Ursache: `syncOverlappingDoc` nutzte `writeToVault` → `editor.setValue()`, was den gesamten Editor-Buffer überschrieb und User-Keystrokes zerstörte.
 
-Alle bisherigen Fixes adressieren Symptome, nicht das Grundproblem:
+### Die Lösung: Surgical Diffs (Ansatz C)
 
-| Version | Fix | Ergebnis |
-|---------|-----|----------|
-| v0.2.8 | `text_matches()` Guard vor `sync_from_disk` | Ghost-Pushes gefixt |
-| v0.2.9 | Editor-Buffer statt `vault.read()`, Push-Deferral, reconcileOpenEditors | Stale-Content gefixt, aber Conflict Detection killt Typing |
-| v0.2.10 | `isLiveEdit` Flag überspringt Conflict Detection | Kein Datenverlust mehr, ABER: "verschluckt" sich, Sync bricht ab |
+Für das **aktive Editor-Doc** wird in `syncOverlappingDoc` und `onDeltaBroadcast` (VV-Gap-Catchup) jetzt:
 
-### Das Grundproblem
+1. **`flushPendingEdits(path)`** — alle gepufferten Keystrokes in den CRDT + an Server pushen
+2. **`import_and_diff(serverDelta)`** statt `import_snapshot` — merged UND gibt TextDelta-JSON zurück
+3. **`applyDiffToEditor(diffJson, serverContent, skipFallback=true)`** — nur Server-Änderungen chirurgisch via `editor.transaction({changes})`, User-Typing bleibt erhalten
+4. **`readCurrentContent` → `sync_from_disk`** — nach dem Apply, restlichen Editor-Content in CRDT aufnehmen
 
-**`sync_from_disk` ist eine Replace-Operation, kein Merge.** Es erzeugt CRDT-Ops die den Text zum Argument transformieren. Wenn der CRDT nach `import_snapshot(serverDelta)` Server-Änderungen hat und wir `sync_from_disk(editorContent)` aufrufen, erzeugt das DELETE-Ops für die Server-Änderungen.
+`skipFallback=true` verhindert, dass die Verification in `applyDiffToEditor` bei Mismatch (durch concurrent Typing) auf `editor.setValue()` zurückfällt.
 
-Das bedeutet: **Wir können `sync_from_disk` nicht sicher aufrufen NACHDEM wir Server-Änderungen importiert haben**, wenn der Editor-Content die Server-Änderungen nicht enthält.
+Für **nicht-aktive Docs** (kein offener Editor) bleibt der alte `writeToVault`-Path — dort kann kein Typing verloren gehen.
 
-Die einzige sichere Reihenfolge ist:
-1. `sync_from_disk(localContent)` — CRDT bekommt lokale Edits
-2. `import_snapshot(serverDelta)` — CRDT merged lokal + server (Loro-CRDT handled das korrekt)
-3. `get_text()` — merged Ergebnis
-4. `writeToVault(merged)` — Editor zeigt Merge-Ergebnis
+### Geschützte Code-Pfade
 
-Aber zwischen Schritt 1 und 4 kann der User weiter tippen. Diese Keystrokes landen im Editor-Buffer, sind aber nicht im CRDT. Wenn dann `writeToVault(merged)` den Editor überschreibt, gehen die Zwischenzeitlichen Keystrokes verloren.
+| Pfad | Methode | Schutz |
+|------|---------|--------|
+| `syncOverlappingDoc` (active doc) | `import_and_diff` + `applyDiffToEditor(skipFallback)` | ✓ v0.2.13 |
+| `onDeltaBroadcast` VV-Gap-Catchup (active doc) | `import_and_diff` + `applyDiffToEditor(skipFallback)` | ✓ v0.2.13 |
+| `onDeltaBroadcast` normal | `import_and_diff` + `applyDiffToEditor` | ✓ schon vor v0.2.13 |
+| Nicht-active docs | `writeToVault(setValue)` | kein Editor offen = kein Problem |
 
-### Lösungsansätze für nächste Session
+### Was NICHT geändert wurde
 
-**Ansatz A: "Hot Doc" — aktiv editiertes Doc aus initialSync herausnehmen**
-- Vor der Overlapping-Loop: prüfe welche Docs gerade im Editor offen sind
-- Diese Docs werden NICHT in der Overlapping-Loop verarbeitet
-- Stattdessen: nach initialSync, ein separater `syncHotDoc(path)` der:
-  1. Server-Delta holt (sync_start)
-  2. import_snapshot in den CRDT (ohne sync_from_disk vorher!)
-  3. Den Merge-Result als surgical diff auf den Editor anwendet (via `import_and_diff`)
-  4. Dann den aktuellen Editor-Content ins CRDT synct
-- Vorteil: Der Editor wird nie mit `setValue()` überschrieben, nur surgical diffs
-- Nachteil: Komplexer, braucht Sonderbehandlung
-
-**Ansatz B: "Pause Editor" — kurze Sperre für das aktive Doc**
-- Wenn syncOverlappingDoc ein offenes Doc verarbeitet:
-  1. `readCurrentContent()` → aktueller Editor-Stand
-  2. `sync_from_disk(editorContent)` → CRDT hat alles vom Editor
-  3. Zeige kurz einen Lock-Indicator (z.B. "Syncing..." Banner)
-  4. `requestSyncStart` + `import_snapshot` → CRDT hat Server + Editor
-  5. `writeToVault(merged)` → Editor bekommt Merge-Ergebnis
-  6. Lock aufheben
-- Keystrokes während der Sperre werden von Obsidian gepuffert
-- Sperre dauert nur den Server-Roundtrip (~100-500ms)
-- Vorteil: Einfach, korrekt, keine Sonderbehandlung
-- Nachteil: Kurzes "Stottern" beim Tippen, nicht ganz "smooth"
-
-**Ansatz C: "Broadcast statt initialSync für Hot Docs"**
-- Hot Docs (im Editor offen) werden komplett aus initialSync rausgenommen
-- Server-Änderungen kommen stattdessen via delta_broadcast (nach initialSync)
-- delta_broadcast nutzt bereits `import_and_diff` + `applyDiffToEditor` (surgical diffs!)
-- Das ist der Broadcast-Pfad der schon funktioniert und getestet ist
-- Vorteil: Nutzt bestehenden, getesteten Code-Pfad; kein `setValue()`
-- Nachteil: Server-Änderungen für Hot Docs erscheinen erst nach initialSync
-- **Das ist vermutlich der beste Ansatz** — einfach, sicher, nutzt was da ist
-
-**Ansatz D: "WASM-Level Merge" — sync_from_disk ersetzen**
-- Neue WASM-Methode: `merge_concurrent_edit(baseText, editedText)` die:
-  1. Diff zwischen baseText und editedText berechnet
-  2. Nur die Diff-Ops als CRDT-Ops einfügt (nicht den ganzen Text ersetzt)
-  3. Existierende CRDT-Ops (Server-Änderungen) bleiben erhalten
-- Vorteil: Korrekteste Lösung, echtes concurrent editing
-- Nachteil: Rust-WASM Änderung nötig, komplex
-
-### Empfehlung: Ansatz C ("Broadcast statt initialSync für Hot Docs")
-
-Warum:
-- **Null Risiko für Textverlust** — wir fassen den Editor nicht an während initialSync
-- **Nutzt bestehenden Code** — `onDeltaBroadcast` → `import_and_diff` → `applyDiffToEditor` ist getestet
-- **Kein "Stottern"** — User tippt smooth weiter, Server-Änderungen kommen per surgical diff
-- **Einfache Implementierung**:
-
-```typescript
-// In der Overlapping-Loop:
-const editorContent = this.editor.readCurrentContent(file.path);
-if (editorContent !== null) {
-  // Hot doc — skip in initialSync, will sync via broadcast after
-  hotDocPaths.add(file.path);
-  contentHashes.set(file.path, fnv1aHash(editorContent));
-  stepsDone++;
-  continue;
-}
-// ... normal processing for non-hot docs ...
-
-// Nach initialSync, im finally-Block:
-for (const path of hotDocPaths) {
-  await this.syncHotDoc(path);
-}
-```
-
-`syncHotDoc(path)`:
-1. Lies aktuellen Editor-Content
-2. Lade CRDT via getOrLoad
-3. sync_from_disk(editorContent) — CRDT hat User-Typing
-4. sync_start → bekomme Server-Delta
-5. import_and_diff(serverDelta) → bekomme surgical diff
-6. applyDiffToEditor(path, diff, doc.get_text()) — surgical Editor-Update
-7. Push VV-Gap delta an Server
-8. Persist
-
-### Verbleibende Fragen
-- Was passiert wenn der User WÄHREND syncHotDoc tippt? (Gleiche Race wie vorher, aber kleiner weil nur ein Server-Roundtrip statt die ganze Loop)
-- Soll syncHotDoc den Editor "locken" für die ~100ms des Server-Roundtrips?
-- Was wenn ein Hot Doc local-only ist (nicht auf dem Server)?
+- Conflict-Detection-Pfade (concurrent create, external edit, disjoint VV) — diese sind Sonderfälle und nutzen weiterhin `writeToVault`. Könnte bei Edge-Cases noch Probleme geben, aber die normalen Startup-Typing-Szenarien sind abgedeckt.
 
 ---
 
-## Gelöste Bugs (v0.2.8–v0.2.10)
+## Versionshistorie der Startup-Typing-Fixes
 
-**Ghost-Pushes bei Cache-Migration (v0.2.8):** `text_matches()` Check vor `sync_from_disk` + Push. Bei Hash-Mismatch aber CRDT-Match wird nur der Hash aktualisiert, kein Push.
-
-**Concurrent-Sync Datenverlust (v0.2.8):** Root Cause waren Ghost-Pushes die neue VV-Einträge erzeugten → korrumpierter Merge bei concurrent initialSync.
-
-**"Text verschwindet" — teilweise gefixt (v0.2.9–v0.2.10):**
-- v0.2.9: Editor-Buffer statt vault.read(), Push-Deferral, reconcileOpenEditors
-- v0.2.10: Conflict Detection überspringt Live-Typing, writeToVault Guard entfernt
-- Ergebnis: Kein Datenverlust mehr, aber "verschluckt" sich (Keystrokes gehen verloren, Sync bricht ab)
-
----
-
-## Priorität 2 — Code Quality
-
-### sync-engine.ts (~800 Zeilen)
-Größte Datei. Wurde durch die Bug-Fixes komplexer. Refactoring-Kandidaten:
-- `syncOverlappingDoc` hat zu viele Verantwortungen (conflict detection, merge, push, editor-write)
-- Download-Phase als eigene Methode extrahieren
-- initialSync in Phasen-Methoden aufteilen
-
-### Generell
-LLM-freundlicher Code-Stil: ausgewogene Dateigröße, keine Magie, klare Strukturen.
+| Version | Ansatz | Ergebnis |
+|---------|--------|----------|
+| v0.2.8 | Ghost-Push Fix (`text_matches` Guard) | Gefixt: Cache-Migration-Ghost-Pushes. Beibehalten ✓ |
+| v0.2.9 | Editor-Buffer + Push-Deferral | Conflict Detection löschte CRDT. Revertiert. |
+| v0.2.10 | isLiveEdit Flag | Text verschluckt sich weiterhin. Revertiert. |
+| v0.2.11 | Hot-Doc-Skip | Unklar warum gescheitert. Revertiert. |
+| v0.2.12 | Revert + Priority Sync + Zero-I/O | Text verschluckt sich weiterhin bei Startup-Typing. |
+| **v0.2.13** | **Surgical Diffs (Ansatz C)** | **Funktioniert. User kann sofort tippen.** |
 
 ---
 
-## Priorität 3 — Server-seitiges Orphan-Monitoring
+## Architektur-Referenz
 
-Docs die kein Client mehr referenziert bleiben auf dem Server. Admin-Endpoint oder Logging für "docs not updated in >90 days".
+### Code-Pfade die den Editor beschreiben
 
----
+1. **syncOverlappingDoc** (active doc) → `flushPendingEdits` → `import_and_diff` → `applyDiffToEditor(skipFallback=true)` → `editor.transaction({changes})`
+   - Chirurgisch: nur Server-Änderungen werden eingefügt
+   - Trigger: initialSync Priority-Sync + Overlapping-Loop
 
-## Architektur-Überblick
+2. **syncOverlappingDoc** (nicht-active doc) → `import_snapshot` → `writeToVault` → `applyToEditor` → `editor.setValue()`
+   - Full replace — kein Problem weil kein Editor offen
+   - Trigger: initialSync Overlapping-Loop
 
-### Plugin
-```
-main.ts               — Plugin-Lifecycle, Settings, StatusBar, Onboarding
-settings.ts            — VaultCRDTSettings Interface, SettingsTab UI
-sync-engine.ts         — WebSocket, Auth, initialSync (Content-Hash Skip), Broadcasts
-  └─ syncOverlappingDoc()  — Conflict-Detection + Merge für einzelnes Doc
-  └─ reconcileOpenEditors() — Post-initialSync: synct Editor-Divergenz
-push-handler.ts        — Outbound-Changes (debounced, deferred during initialSync)
-editor-integration.ts  — Editor lesen/schreiben, surgical diffs via TextDelta
-document-manager.ts    — CRDT-Doc Cache + .loro Persistenz + VV-Cache Proxy
-state-storage.ts       — .loro File I/O, VV-Cache v3 (contentHash), Orphan-Cleanup
-conflict-utils.ts      — vvCovers, vvEquals, hasSharedHistory, conflictPath, fnv1aHash
-promise-manager.ts     — WS Request/Response Pairing (60s Timeout)
-onboarding-modal.ts    — Erster-Start Modal (Pull/Push/Merge)
-file-watcher.ts        — External-Change-Detection (focus event)
-wasm-bridge.ts         — WASM init + createDocument wrapper
-logger.ts              — log/warn/error mit Prefix
-```
+3. **onDeltaBroadcast** → `import_and_diff` → `applyDiffToEditor` → `editor.transaction({changes})`
+   - Surgical diff, preserviert Cursor und unberührten Text
+   - VV-Gap-Catchup nutzt jetzt auch surgical diffs für active doc
+   - Trigger: Server-Broadcast nach initialSync
 
-### Server
-```
-src/main.rs       — Server-Setup, Background-Tasks (Tombstone/Peer-Expiry, DB-Maintenance)
-src/lib.rs        — AppState, DocLocks, Router-Setup
-src/ws.rs         — WebSocket Handler, Message-Types (ClientMsg/ServerMsg)
-src/handlers.rs   — Message Processing (SyncStart/SyncPush/DocCreate/DocDelete)
-src/db.rs         — SQLite Queries (CRUD, Stats, Expiry)
-src/vv_serde.rs   — VV Encoding: JSON (wire) ↔ Binary (DB) ↔ Loro VersionVector
-src/auth.rs       — JWT Token Generation + Verification
-src/errors.rs     — ServerError enum
-```
-
-### WebSocket-Protokoll (MessagePack)
-Heartbeat: Ping alle 30s → Pong vom Server
-
-**Inbound:** `doc_list`, `sync_delta`, `doc_unknown`, `delta_broadcast`, `doc_deleted`, `ack`, `pong`, `error`
-**Outbound:** `ping`, `request_doc_list`, `sync_start`, `sync_push`, `doc_create`, `doc_delete`
+4. **pushFileDelta** → (kein Editor-Write, nur CRDT + Server-Push)
+   - Liest Editor via `readCurrentContent`, synct in CRDT, pusht an Server
+   - Trigger: editor-change Event (debounced 300ms)
 
 ### WASM API (WasmSyncDocument)
+
+| Methode | Typ | Beschreibung |
+|---------|-----|-------------|
+| `sync_from_disk(text)` | **REPLACE** | Macht CRDT-Text = text. Erzeugt Insert/Delete-Ops. **Nie nach import_snapshot aufrufen!** |
+| `text_matches(text)` | CHECK | CRDT-Text === text? Ohne JS-String-Allokation |
+| `import_snapshot(data)` | IMPORT | Snapshot oder Delta importieren |
+| `import_and_diff(data)` | IMPORT+DIFF | Importiert und gibt TextDelta-JSON zurück |
+| `export_delta_since_vv_json(vv)` | EXPORT | Ops seit gegebenem VV |
+| `export_snapshot()` | EXPORT | Full Snapshot |
+| `export_vv_json()` | VV | Version Vector als JSON |
+| `get_text()` | READ | Aktueller CRDT-Text |
+| `insert_text(pos, text)` | OP | Einzelne Insert-Op |
+| `delete_text(pos, len)` | OP | Einzelne Delete-Op |
+| `version()` | READ | Aktuelle Version |
+
+### Plugin-Dateien
 ```
-sync_from_disk(text)           — REPLACE: macht CRDT-Text = text (erzeugt Insert/Delete-Ops)
-text_matches(text)             — CHECK: CRDT-Text === text? (ohne JS-String Allokation)
-import_snapshot(data)          — IMPORT: Snapshot oder Delta importieren
-import_and_diff(data)          — IMPORT + DIFF: importiert und gibt TextDelta-JSON zurück
-export_delta_since_vv_json(vv) — EXPORT: Ops seit gegebenem VV
-export_snapshot()              — EXPORT: Full Snapshot
-export_vv_json()               — VV als JSON-String
-get_text()                     — Aktueller CRDT-Text
-insert_text(pos, text)         — Einzelne Insert-Op
-delete_text(pos, len)          — Einzelne Delete-Op
-version()                      — Aktuelle Version (f64)
+main.ts               — Plugin-Lifecycle, Event-Handler (editor-change, modify, create, delete, rename)
+sync-engine.ts         — WebSocket, initialSync, syncOverlappingDoc, onDeltaBroadcast, priority sync, surgical diffs
+push-handler.ts        — Debounced pushFileDelta, flushPendingEdits, pushDocCreate
+editor-integration.ts  — readCurrentContent, writeToVault (setValue), applyDiffToEditor (surgical, skipFallback)
+document-manager.ts    — CRDT-Doc Cache + .loro Persistenz
+state-storage.ts       — .loro File I/O, VV-Cache v3 (contentHash)
+conflict-utils.ts      — vvCovers, vvEquals, hasSharedHistory, conflictPath, fnv1aHash
 ```
 
-**Kritisch:** `sync_from_disk` ist ein REPLACE, kein MERGE. Es erzeugt Ops die den CRDT-Text zum Argument transformieren. Wenn der CRDT nach `import_snapshot` Server-Änderungen hat und man `sync_from_disk(editorContent)` aufruft, erzeugt das DELETE-Ops für die Server-Änderungen. Deswegen muss `sync_from_disk` IMMER VOR `import_snapshot` aufgerufen werden, nie danach.
-
-### Sync-Flow (initialSync v0.2.10)
+### Sync-Flow (initialSync v0.2.13)
 ```
 1. Build local file index (metadata only)
-2. request_doc_list → Server-VVs (JSON) + Tombstones
-3. Load VV-Cache v3 (vv-cache.json mit contentHash)
-4. Server-only docs → parallel download (max 5)
-5. Overlapping docs:
-   - readCurrentContent() || vault.read() + fnv1aHash()
-   - Tier 1: VV + hash match → SKIP (no CRDT load)
-   - VV match + hash mismatch → offline edit push (CRDT load + sync_push)
-   - Tier 2: VV mismatch/no cache → syncOverlappingDoc(isLiveEdit)
-     - isLiveEdit=true: skip conflict detection, let CRDT merge handle
-     - isLiveEdit=false: conflict detection + conflict file creation
-6. Local-only docs → lazy read + push doc_create
-7. Flush offline deletes
-8. Trash tombstoned files
-9. Save VV-Cache v3 (with content hashes)
-10. Clean orphaned .loro files
-11. reconcileOpenEditors (BEFORE initialSyncRunning=false)
-12. Process queued broadcasts
+2. request_doc_list → Server-VVs + Tombstones
+3. Load VV-Cache v3
+4. ★ Priority sync: active editor doc FIRST via syncOverlappingDoc (surgical diffs)
+5. Server-only docs → parallel download (max 5)
+6. Overlapping docs (skip already-synced priority doc):
+   - Tier 0: VV match → SKIP (zero I/O, trust cached hash)
+   - VV mismatch → vault.read() + syncOverlappingDoc (surgical if active, else full)
+7. Local-only docs → doc_create
+8. Flush offline deletes, trash tombstones
+9. Save VV-Cache, clean orphans
+10. initialSyncRunning = false
+11. Process queued broadcasts (surgical diffs for active doc)
 ```
 
 ---
 
-## Erkenntnisse
+## Erkenntnisse aus den bisherigen Debug-Sessions
 
-- **mtime auf Android instabil**: Obsidian Mobile ändert mtime beim App-Start. Niemals mtime für Caching verwenden.
-- **27s client-seitig** für 800× vault.read + 800× getOrLoad (gemessen Session 11:24).
-- **Ghost-Pushes verursachen CRDT-Korruption**: Leere Deltas (22b Loro-Framing) erzeugen neue VV-Einträge.
-- **vault.read() ist stale wenn Editor offen**: Editor-Buffer kann frische Edits enthalten die noch nicht auf Disk sind.
-- **pushFileDelta interleaved mit initialSync**: Beide mutieren dasselbe CRDT-Objekt zwischen await-Points.
-- **sync_from_disk ist REPLACE, nicht MERGE**: Darf nie nach import_snapshot aufgerufen werden wenn der Editor die Server-Änderungen nicht hat.
-- **Conflict Detection behandelt Live-Typing als externen Edit**: isLiveEdit-Flag in v0.2.10 verhindert das.
-- **writeToVault(merged) überschreibt Keystrokes**: Zwischen Capture und Write kann der User tippen. Surgical diffs (import_and_diff + applyDiffToEditor) sind die bessere Lösung.
+- **mtime auf Android instabil**: Niemals mtime für Caching verwenden.
+- **sync_from_disk ist REPLACE, nicht MERGE**: Darf nie nach import_snapshot aufgerufen werden (Ausnahme: nach applyDiffToEditor, um concurrent Typing aufzufangen).
+- **writeToVault hat await vor setValue**: Event-Loop-Gap wo User-Events durchkommen.
+- **Ghost-Pushes (leere 22b Deltas) erzeugen VV-Einträge**: Gefixt mit text_matches Guard (v0.2.8).
+- **applyDiffToEditor Verification-Fallback**: `setValue`-Fallback bei Mismatch zerstört concurrent Typing. Gelöst mit `skipFallback=true` für initialSync-Pfade.
+- **Priority Sync allein reicht nicht**: User kann zu einem anderen Doc wechseln während initialSync läuft. `isActiveEditorDoc` wird dynamisch geprüft.
+
+---
+
+## Ziel des Users
+
+> "es soll sich smooth und snappy anfühlen"
+
+Kein harter Lock/Freeze beim Startup. Der User soll sofort tippen können und nichts verlieren. Server-Änderungen sollen sauber reingemerged werden ohne den Editor zu "zerreißen".
+
+**Status: Erreicht in v0.2.13** ✓
+
+---
 
 ## SSH / Deploy
 - `SSH_AUTH_SOCK` → 1Password Agent (`~/.1password/agent.sock`)
 - Deploy Server: `cd ~/fleet && just home-deploy vaultcrdt`
-- Server-Tag für Deploy muss mit compose.yaml übereinstimmen (`v0.2.3`)
 - Server-Logs: `ssh home "docker logs vaultcrdt 2>&1 | tail -50"`
 - Plugin an 4 Stellen kopieren: vault-a, vault-b, Dokumente/obsidian-plugins, CloudOrdner/richardsachen
