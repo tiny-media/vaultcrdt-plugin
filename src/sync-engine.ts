@@ -1,17 +1,17 @@
 import { App, TFile, requestUrl } from 'obsidian';
 import { encode, decode } from '@msgpack/msgpack';
 import type { VaultCRDTSettings } from './settings';
-import { createDocument, type WasmSyncDocument } from './wasm-bridge';
+import { type WasmSyncDocument } from './wasm-bridge';
 import { DocumentManager } from './document-manager';
-import type { VVCacheEntry } from './state-storage';
-import { vvCovers, vvEquals, hasSharedHistory, conflictPath, fnv1aHash } from './conflict-utils';
+import { vvCovers } from './conflict-utils';
 import { PromiseManager } from './promise-manager';
 import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn, error } from './logger';
+import { runInitialSync, type SyncMode } from './sync-initial';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
-export type SyncMode = 'pull' | 'push' | 'merge';
+export { type SyncMode } from './sync-initial';
 
 // ── Types mirroring ws.rs ────────────────────────────────────────────────────
 
@@ -83,6 +83,11 @@ export class SyncEngine {
     this.stopped = false;
     await this.auth();
     this.connect();
+  }
+
+  async restart(): Promise<void> {
+    await this.stop();
+    await this.start();
   }
 
   async stop(): Promise<void> {
@@ -189,220 +194,32 @@ export class SyncEngine {
   // ── Initial sync ───────────────────────────────────────────────────────────
 
   async initialSync(onProgress?: (done: number, total: number, changed: number) => void, mode: SyncMode = 'merge'): Promise<void> {
-    const t0 = performance.now();
     this.setStatus('syncing');
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
 
     try {
-      // Build local file index (metadata only — no content reads yet)
-      const localFiles = this.app.vault.getMarkdownFiles() as TFile[];
-      const localFileMap = new Map<string, TFile>();
-      for (const file of localFiles) {
-        localFileMap.set(file.path, file);
-      }
-
-      const { docs: serverDocs, tombstones } = await this.requestDocList();
-      const tombstoneSet = new Set(tombstones);
-      const localPathSet = new Set(localFileMap.keys());
-
-      // Decode server VVs from binary to JSON strings for comparison
-      const serverVVStrings = new Map<string, string>();
-      const serverDocMap = new Map<string, DocEntry>();
-      for (const d of serverDocs) {
-        serverDocMap.set(d.doc_uuid, d);
-        if (d.server_vv && d.server_vv.length > 0) {
-          serverVVStrings.set(d.doc_uuid, new TextDecoder().decode(d.server_vv));
-        }
-      }
-
-      // Load cached VVs from last successful sync
-      const cachedVVs = await this.docs.loadVVCache();
-
-      log(`${this.tag} initialSync start`, {
-        serverDocs: serverDocs.length,
-        localFiles: localFiles.length,
-        tombstones,
-        hasCachedVVs: cachedVVs !== null,
-      });
-
-      // 1. Server-only docs — request delta (no local VV)
-      const serverOnlyUuids = [...serverDocMap.keys()].filter(
-        (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid)
+      await runInitialSync(
+        {
+          app: this.app,
+          docs: this.docs,
+          editor: this.editor,
+          push: this.push,
+          lastServerVV: this.lastServerVV,
+          lastRemoteWrite: this.lastRemoteWrite,
+          writingFromRemote: this.writingFromRemote,
+          tag: this.tag,
+          peerId: this.settings.peerId,
+          ws: this.ws,
+          send: (msg) => this.send(msg),
+          requestDocList: () => this.requestDocList(),
+          requestSyncStart: (uuid, vv) => this.requestSyncStart(uuid, vv),
+        },
+        onProgress,
+        mode,
       );
-      const overlappingFiles = localFiles.filter(
-        (f) => !tombstoneSet.has(f.path) && serverDocMap.has(f.path)
-      );
-      const localOnlyFiles = localFiles.filter(
-        (f) => !tombstoneSet.has(f.path) && !serverDocMap.has(f.path)
-      );
-      const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
-      let stepsDone = 0;
-      let changed = 0;
-      const contentHashes = new Map<string, number>(); // path → fnv1a hash (for VV cache)
-      const syncedPaths = new Set<string>(); // paths already synced (priority doc)
-
-      // Priority sync: sync the currently active editor doc FIRST so the user
-      // can start typing immediately. Edits during the rest of initialSync are
-      // treated as normal offline edits — the CRDT merges them naturally.
-      const activeDoc = this.editor.getActiveEditorPath();
-      if (activeDoc && serverDocMap.has(activeDoc) && localFileMap.has(activeDoc)) {
-        const file = localFileMap.get(activeDoc)!;
-        const localContent = await this.app.vault.read(file);
-        contentHashes.set(activeDoc, fnv1aHash(localContent));
-        await this.syncOverlappingDoc(activeDoc, localContent, serverDocMap);
-        syncedPaths.add(activeDoc);
-        stepsDone++;
-        changed++;
-        onProgress?.(stepsDone, totalSteps, changed);
-        console.info(`${this.tag} priority sync complete (${(performance.now() - t0).toFixed(0)}ms)`, { path: activeDoc });
-      }
-
-      let downloadOk = 0;
-      let downloadFail = 0;
-      if (mode !== 'push') {
-        log(`${this.tag} downloading ${serverOnlyUuids.length} server-only docs (parallel=${PARALLEL_DOWNLOADS})`);
-        // Parallel downloads with sliding window
-        let wsAbortError: Error | null = null;
-        const downloadOne = async (uuid: string): Promise<void> => {
-          // Resumable: skip docs that already have persisted CRDT state
-          const existing = await this.docs.getOrLoad(uuid);
-          if (existing.version() > 0) {
-            downloadOk++;
-            stepsDone++;
-            onProgress?.(stepsDone, totalSteps, changed);
-            return;
-          }
-
-          try {
-            const result = await this.requestSyncStart(uuid, null);
-            if (result) {
-              const doc = await this.docs.getOrLoad(uuid);
-              doc.import_snapshot(result.delta);
-              this.lastServerVV.set(uuid, result.serverVV);
-              await this.editor.writeToVault(uuid, doc.get_text());
-              await this.docs.persist(uuid);
-              downloadOk++;
-              changed++;
-            }
-          } catch (err) {
-            downloadFail++;
-            warn(`${this.tag} download failed for ${uuid}:`, err);
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-              wsAbortError = err as Error;
-            }
-          }
-          stepsDone++;
-          onProgress?.(stepsDone, totalSteps, changed);
-        };
-
-        // Sliding window: keep up to PARALLEL_DOWNLOADS in flight
-        const inFlight = new Set<Promise<void>>();
-        for (const uuid of serverOnlyUuids) {
-          if (wsAbortError) break;
-          const p = downloadOne(uuid).then(() => { inFlight.delete(p); });
-          inFlight.add(p);
-          if (inFlight.size >= PARALLEL_DOWNLOADS) {
-            await Promise.race(inFlight);
-          }
-        }
-        await Promise.all(inFlight);
-
-        if (wsAbortError) {
-          warn(`${this.tag} WS closed during download, aborting (${downloadOk} ok, ${downloadFail} fail)`);
-          throw wsAbortError;
-        }
-      } else {
-        // Push mode: skip downloads, just advance progress
-        stepsDone += serverOnlyUuids.length;
-        onProgress?.(stepsDone, totalSteps, changed);
-      }
-      console.info(`${this.tag} downloads done (${(performance.now() - t0).toFixed(0)}ms): ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
-
-      // 2. Overlapping docs — two-tier skip: VV+hash → full sync
-      let skippedVVMatch = 0;
-
-      for (const file of overlappingFiles) {
-        if (syncedPaths.has(file.path)) { stepsDone++; onProgress?.(stepsDone, totalSteps, changed); continue; }
-        const currentServerVV = serverVVStrings.get(file.path);
-        const cached = cachedVVs?.get(file.path);
-
-        // Tier 0: VV match + cached hash → skip WITHOUT reading file (zero I/O)
-        if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-          // Server unchanged — trust cached content hash, no file read needed.
-          // If the user edited offline, the hash will differ on next sync when
-          // we do read the file (because the server VV will have changed by then
-          // from the push triggered by the file-change listener).
-          this.lastServerVV.set(file.path, currentServerVV);
-          contentHashes.set(file.path, cached.contentHash);
-          skippedVVMatch++;
-          stepsDone++;
-          onProgress?.(stepsDone, totalSteps, changed);
-          continue;
-        }
-
-        // VV changed or no cache — must read file and do full sync
-        const localContent = await this.app.vault.read(file);
-        contentHashes.set(file.path, fnv1aHash(localContent));
-        await this.syncOverlappingDoc(file.path, localContent, serverDocMap);
-        stepsDone++;
-        onProgress?.(stepsDone, totalSteps, changed);
-      }
-
-      console.info(`${this.tag} overlapping done (${(performance.now() - t0).toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
-
-      // 3. Local-only docs — push full snapshot via doc_create (skip in pull mode)
-      if (mode !== 'pull') {
-        for (const file of localOnlyFiles) {
-          const content = await this.app.vault.read(file);
-          contentHashes.set(file.path, fnv1aHash(content));
-          log(`${this.tag} local-only push`, { path: file.path, contentLen: content.length });
-          const doc = await this.docs.getOrLoad(file.path);
-          doc.sync_from_disk(content);
-          this.push.pushDocCreate(file.path, doc);
-          await this.docs.persist(file.path);
-          changed++;
-          stepsDone++;
-          onProgress?.(stepsDone, totalSteps, changed);
-        }
-      } else {
-        stepsDone += localOnlyFiles.length;
-        onProgress?.(stepsDone, totalSteps, changed);
-      }
-
-      // 4. Flush queued offline deletes
-      this.push.flushPendingDeletes();
-
-      // 5. Tombstones — trash local files (skip if server also has the doc — create-after-delete)
-      for (const uuid of tombstoneSet) {
-        if (serverDocMap.has(uuid)) continue;
-        const f = this.app.vault.getAbstractFileByPath(uuid);
-        if (f instanceof TFile) {
-          this.writingFromRemote.add(uuid);
-          try {
-            await this.app.vault.trash(f, true);
-          } finally {
-            setTimeout(() => this.writingFromRemote.delete(uuid), 500);
-          }
-        }
-      }
-
-      // 6. Persist VV cache with content hashes for next startup
-      const vvCacheEntries = new Map<string, VVCacheEntry>();
-      for (const [path, vv] of this.lastServerVV) {
-        vvCacheEntries.set(path, { vv, contentHash: contentHashes.get(path) ?? 0 });
-      }
-      await this.docs.saveVVCache(vvCacheEntries);
-
-      // 7. Clean orphaned .loro files (deleted/renamed docs, old encoding)
-      const validPaths = new Set<string>([...localPathSet, ...serverDocMap.keys()]);
-      const orphansRemoved = await this.docs.cleanOrphans(validPaths);
-      if (orphansRemoved > 0) {
-        log(`${this.tag} cleaned ${orphansRemoved} orphaned state files`);
-      }
     } finally {
       this.initialSyncRunning = false;
-      console.info(`${this.tag} initialSync complete (${(performance.now() - t0).toFixed(0)}ms)`);
 
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type as string;
@@ -416,186 +233,6 @@ export class SyncEngine {
 
       this.setStatus('connected');
     }
-  }
-
-  /** Full sync for a single overlapping doc — conflict detection + merge + push. */
-  private async syncOverlappingDoc(
-    path: string,
-    localContent: string,
-    serverDocMap: Map<string, DocEntry>,
-  ): Promise<void> {
-    const doc = await this.docs.getOrLoad(path);
-    const hadPersistedState = doc.version() > 0;
-
-    // Concurrent-create conflict detection: file created offline without CRDT history
-    if (!hadPersistedState && localContent.trim() !== '') {
-      const result = await this.requestSyncStart(path, null);
-      if (result && result.delta.length > 0) {
-        const tempDoc = createDocument();
-        tempDoc.import_snapshot(result.delta);
-        const serverText = tempDoc.get_text();
-
-        if (serverText.trim() !== '' && serverText !== localContent) {
-          const cPath = conflictPath(this.app, path);
-          warn(`${this.tag} concurrent create conflict`, { path, conflictPath: cPath });
-          await this.app.vault.create(cPath, localContent);
-
-          doc.import_snapshot(result.delta);
-          this.lastServerVV.set(path, result.serverVV);
-          await this.editor.writeToVault(path, doc.get_text());
-          await this.docs.persist(path);
-          return;
-        }
-      }
-    }
-
-    // Detect external disk changes (edits outside Obsidian while it was closed).
-    const hadLocalDiskChange = !doc.text_matches(localContent) && localContent.trim() !== '';
-
-    // Sync local disk changes into CRDT before computing VV
-    if (hadLocalDiskChange) {
-      doc.sync_from_disk(localContent);
-    }
-
-    const clientVV = doc.export_vv_json();
-    const result = await this.requestSyncStart(path, clientVV);
-
-    if (result) {
-      // Concurrent external-edit conflict detection
-      if (result.delta.length > 0 && hadLocalDiskChange) {
-        const persistedSnapshot = await this.docs.loadPersistedSnapshot(path);
-        const tempDoc = createDocument();
-        if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
-        tempDoc.import_snapshot(result.delta);
-        const serverText = tempDoc.get_text();
-
-        if (serverText.trim() !== '' && serverText !== localContent) {
-          const cPath = conflictPath(this.app, path);
-          warn(`${this.tag} concurrent external edit conflict`, { path, conflictPath: cPath });
-          await this.app.vault.create(cPath, localContent);
-
-          await this.docs.removeAndClean(path);
-          const freshDoc = await this.docs.getOrLoad(path);
-          const fullResult = await this.requestSyncStart(path, null);
-          if (fullResult && fullResult.delta.length > 0) {
-            freshDoc.import_snapshot(fullResult.delta);
-            this.lastServerVV.set(path, fullResult.serverVV);
-          }
-          await this.editor.writeToVault(path, freshDoc.get_text());
-          await this.docs.persist(path);
-          return;
-        }
-      }
-
-      // Disjoint-VV conflict detection
-      if (
-        result.delta.length > 0 &&
-        clientVV !== '{}' &&
-        !hasSharedHistory(clientVV, result.serverVV)
-      ) {
-        const tempDoc = createDocument();
-        tempDoc.import_snapshot(result.delta);
-        const serverText = tempDoc.get_text();
-
-        if (serverText.trim() !== '' && localContent.trim() !== '' && serverText !== localContent) {
-          const cPath = conflictPath(this.app, path);
-          warn(`${this.tag} disjoint VV conflict`, { path, conflictPath: cPath });
-          await this.app.vault.create(cPath, localContent);
-
-          await this.docs.removeAndClean(path);
-          const freshDoc = await this.docs.getOrLoad(path);
-          freshDoc.import_snapshot(result.delta);
-          this.lastServerVV.set(path, result.serverVV);
-          await this.editor.writeToVault(path, freshDoc.get_text());
-          await this.docs.persist(path);
-          return;
-        }
-      }
-
-      // For the active editor doc: flush pending keystrokes into the CRDT
-      // before merging so import_and_diff produces a correct surgical diff.
-      // This prevents writeToVault(setValue) from clobbering in-flight typing.
-      const isActiveEditorDoc = this.editor.getActiveEditorPath() === path;
-      if (isActiveEditorDoc && result && result.delta.length > 0) {
-        await this.push.flushPendingEdits(path);
-      }
-
-      // Import server delta — for active editor doc, use import_and_diff
-      // to get a surgical TextDelta instead of a full editor replacement.
-      let diffJson: string | null = null;
-      if (result.delta.length > 0) {
-        if (isActiveEditorDoc) {
-          try {
-            diffJson = doc.import_and_diff(result.delta);
-          } catch (err) {
-            warn(`${this.tag} import_and_diff failed, falling back to import_snapshot`, { path, err });
-            doc.import_snapshot(result.delta);
-          }
-        } else {
-          doc.import_snapshot(result.delta);
-        }
-      }
-      this.lastServerVV.set(path, result.serverVV);
-
-      const serverContent = doc.get_text();
-
-      if (localContent.trim() === '' && serverContent.trim() !== '' && !isActiveEditorDoc) {
-        log(`${this.tag} overlapping: empty local, adopting server`, { path });
-        await this.editor.writeToVault(path, serverContent);
-      } else {
-        const clientVVAfterMerge = doc.export_vv_json();
-        if (!vvCovers(result.serverVV, clientVVAfterMerge)) {
-          const delta = doc.export_delta_since_vv_json(result.serverVV);
-          if (delta.length > 0) {
-            log(`${this.tag} overlapping push delta (VV gap)`, { path, deltaLen: delta.length });
-            this.send({
-              type: 'sync_push',
-              doc_uuid: path,
-              delta,
-              peer_id: this.settings.peerId,
-            });
-          }
-        } else {
-          log(`${this.tag} overlapping match`, { path });
-        }
-
-        // Apply merged content — active editor gets surgical diff, others get full replace
-        if (isActiveEditorDoc) {
-          if (diffJson) {
-            // Check if the diff has actual insert/delete ops (not just retains)
-            let hasTextChanges = false;
-            try {
-              const ops = JSON.parse(diffJson);
-              hasTextChanges = Array.isArray(ops) && ops.some(
-                (op: { insert?: string; delete?: number }) => op.insert !== undefined || op.delete !== undefined
-              );
-            } catch { /* empty */ }
-
-            if (hasTextChanges) {
-              if (this.editor.applyDiffToEditor(path, diffJson, serverContent, true)) {
-                // After surgical apply, sync any concurrent typing back into the CRDT
-                // so CRDT state stays consistent with what's in the editor.
-                const postApplyContent = this.editor.readCurrentContent(path);
-                if (postApplyContent !== null && !doc.text_matches(postApplyContent)) {
-                  doc.sync_from_disk(postApplyContent);
-                }
-                this.lastRemoteWrite.set(path, postApplyContent ?? serverContent);
-              } else {
-                // Editor was closed between check and apply — fall back
-                await this.editor.writeToVault(path, serverContent);
-              }
-            }
-            // else: no text changes from server — user typing is untouched
-          } else if (result.delta.length > 0) {
-            // import_and_diff failed, fell back to import_snapshot — must use writeToVault
-            await this.editor.writeToVault(path, serverContent);
-          }
-        } else if (localContent !== serverContent) {
-          await this.editor.writeToVault(path, serverContent);
-        }
-      }
-    }
-    await this.docs.persist(path);
   }
 
   // ── Message handling ────────────────────────────────────────────────────────

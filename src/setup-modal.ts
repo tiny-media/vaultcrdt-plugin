@@ -117,6 +117,10 @@ export class SetupModal extends Modal {
       this.showError('Server URL is required');
       return;
     }
+    if (/^(http|ws):\/\//i.test(this.serverUrl) && !this.serverUrl.includes('localhost') && !this.serverUrl.includes('127.0.0.1')) {
+      this.showError('Insecure connection (no TLS). Use https:// or wss:// to protect your data.');
+      return;
+    }
     if (!VAULT_NAME_RE.test(this.vaultId)) {
       this.showError('Vault Name must be lowercase letters, numbers, or hyphens (e.g. my-notes)');
       return;
@@ -164,7 +168,7 @@ export class SetupModal extends Modal {
         const msg = String((e as { message?: string })?.message ?? '');
         if (msg.includes('Invalid API key')) {
           this.showError('Wrong password for this vault. Check with your server admin.');
-        } else if (msg.includes('Invalid registration key')) {
+        } else if (msg.includes('Invalid admin token')) {
           this.showError('This vault does not exist on the server. Ask your server admin to create it.');
         } else {
           this.showError('Authentication failed. Check vault name and password.');

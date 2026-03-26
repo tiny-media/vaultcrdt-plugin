@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.15] - 2026-03-26
+
+### Changed
+- Renamed `registration_key` → `admin_token` in server API (old field name still accepted for backwards compatibility)
+- Updated all user-facing strings: "Registration Key" → "Admin Token", "Vault Secret" → "Password"
+- Settings now trigger automatic reconnect when server URL, vault name, or password change (debounced 1.5s)
+- Renamed `FileWatcherV2` → `FileWatcher` (no V1 exists)
+- Extracted initial sync logic from `sync-engine.ts` into `sync-initial.ts` for better maintainability
+
+### Added
+- HTTPS/WSS enforcement in Setup modal — insecure connections are blocked (except localhost)
+- Server-side vault name validation (lowercase alphanumeric, hyphens, underscores; max 64 chars)
+
+### Removed
+- Unused `setDebug()` export from logger
+
 ## [0.2.4] - 2026-03-25
 
 ### Added

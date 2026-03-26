@@ -47,10 +47,18 @@ function defaultDeviceName(): string {
 
 export class VaultCRDTSettingsTab extends PluginSettingTab {
   plugin: VaultCRDTPlugin;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(app: App, plugin: VaultCRDTPlugin) {
     super(app, plugin);
     this.plugin = plugin;
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      void this.plugin.syncEngine.restart();
+    }, 1500);
   }
 
   display(): void {
@@ -102,6 +110,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.serverUrl = value.trim();
             await this.plugin.saveSettings();
+            this.scheduleReconnect();
           })
       );
 
@@ -121,6 +130,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.vaultSecret = value;
             await this.plugin.saveSettings();
+            this.scheduleReconnect();
           });
         text.inputEl.type = 'password';
         return text;
@@ -215,7 +225,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
 
     new Setting(advancedContainer)
       .setName('Vault Name')
-      .setDesc('Identifies this vault on the server. Changing this disconnects from the current vault.')
+      .setDesc('Identifies this vault on the server. Changing this reconnects to a different vault.')
       .addText((text) =>
         text
           .setPlaceholder('my-notes')
@@ -223,6 +233,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.vaultId = value.toLowerCase().trim();
             await this.plugin.saveSettings();
+            this.scheduleReconnect();
           })
       )
       .addButton((btn) =>

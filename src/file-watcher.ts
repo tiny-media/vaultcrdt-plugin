@@ -8,7 +8,7 @@ import type { SyncEngine } from './sync-engine';
  * RULE: Never auto-creates documents. Only acts on docs already loaded into
  * the DocumentManager (i.e. known to the sync engine).
  */
-export class FileWatcherV2 {
+export class FileWatcher {
   constructor(
     private app: App,
     private syncEngine: SyncEngine,

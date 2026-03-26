@@ -3,7 +3,7 @@ import { VaultCRDTSettings, VaultCRDTSettingsTab, DEFAULT_SETTINGS } from './set
 import { initWasm } from './wasm-bridge';
 import { SyncEngine } from './sync-engine';
 import type { SyncMode } from './sync-engine';
-import { FileWatcherV2 } from './file-watcher';
+import { FileWatcher } from './file-watcher';
 import { SetupModal } from './setup-modal';
 import { log, error } from './logger';
 
@@ -13,7 +13,7 @@ const ACTIVITY_TIMEOUT_MS = 60_000;
 export default class VaultCRDTPlugin extends Plugin {
   settings!: VaultCRDTSettings;
   syncEngine!: SyncEngine;
-  fileWatcher!: FileWatcherV2;
+  fileWatcher!: FileWatcher;
   private statusBarEl: HTMLElement | null = null;
   private activityTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -22,7 +22,7 @@ export default class VaultCRDTPlugin extends Plugin {
     await initWasm();
 
     this.syncEngine = new SyncEngine(this.app, this.settings);
-    this.fileWatcher = new FileWatcherV2(this.app, this.syncEngine);
+    this.fileWatcher = new FileWatcher(this.app, this.syncEngine);
 
     // React to editor keystrokes (debounced inside SyncEngine)
     this.registerEvent(

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { FileWatcherV2 } from '../file-watcher';
+import { FileWatcher } from '../file-watcher';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@ const makeApp = (files: Array<{ path: string }>, diskContents: Record<string, st
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-describe('FileWatcherV2', () => {
+describe('FileWatcher', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockDoc.get_text.mockReturnValue('hello world');
@@ -37,7 +37,7 @@ describe('FileWatcherV2', () => {
     const file = makeFile('notes/unloaded.md');
     const app = makeApp([file], { 'notes/unloaded.md': 'some content' });
 
-    const watcher = new FileWatcherV2(app as any, mockSyncEngine as any);
+    const watcher = new FileWatcher(app as any, mockSyncEngine as any);
     await watcher.scanForExternalChanges();
 
     expect(mockSyncEngine.onFileChangedImmediate).not.toHaveBeenCalled();
@@ -49,7 +49,7 @@ describe('FileWatcherV2', () => {
     const file = makeFile('notes/changed.md');
     const app = makeApp([file], { 'notes/changed.md': 'new content from disk' });
 
-    const watcher = new FileWatcherV2(app as any, mockSyncEngine as any);
+    const watcher = new FileWatcher(app as any, mockSyncEngine as any);
     await watcher.scanForExternalChanges();
 
     expect(mockSyncEngine.onFileChangedImmediate).toHaveBeenCalledOnce();
@@ -65,7 +65,7 @@ describe('FileWatcherV2', () => {
     const file = makeFile('notes/same.md');
     const app = makeApp([file], { 'notes/same.md': 'hello world' });
 
-    const watcher = new FileWatcherV2(app as any, mockSyncEngine as any);
+    const watcher = new FileWatcher(app as any, mockSyncEngine as any);
     await watcher.scanForExternalChanges();
 
     expect(mockSyncEngine.onFileChangedImmediate).not.toHaveBeenCalled();
@@ -91,7 +91,7 @@ describe('FileWatcherV2', () => {
       'c.md': 'ignored',
     });
 
-    const watcher = new FileWatcherV2(app as any, mockSyncEngine as any);
+    const watcher = new FileWatcher(app as any, mockSyncEngine as any);
     await watcher.scanForExternalChanges();
 
     expect(mockSyncEngine.onFileChangedImmediate).toHaveBeenCalledOnce();
