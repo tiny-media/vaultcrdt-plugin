@@ -6,6 +6,7 @@ import { vvCovers, hasSharedHistory, vvEquals, conflictPath, fnv1aHash } from '.
 import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn, error } from './logger';
+import { isSyncablePath } from './path-policy';
 
 export type SyncMode = 'pull' | 'push' | 'merge';
 
@@ -77,7 +78,7 @@ export async function runInitialSync(
 
   // 1. Server-only docs — request delta (no local VV)
   const serverOnlyUuids = [...serverDocMap.keys()].filter(
-    (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid)
+    (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid) && isSyncablePath(uuid)
   );
   const overlappingFiles = localFiles.filter(
     (f) => !tombstoneSet.has(f.path) && serverDocMap.has(f.path)
@@ -172,9 +173,22 @@ export async function runInitialSync(
     const cached = cachedVVs?.get(file.path);
 
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-      lastServerVV.set(file.path, currentServerVV);
-      contentHashes.set(file.path, cached.contentHash);
-      skippedVVMatch++;
+      // VV matches — but verify local content hasn't changed externally
+      // (git pull, Syncthing, manual edit while Obsidian was closed)
+      const diskContent = await app.vault.read(file);
+      const diskHash = fnv1aHash(diskContent);
+      contentHashes.set(file.path, diskHash);
+
+      if (diskHash === cached.contentHash) {
+        lastServerVV.set(file.path, currentServerVV);
+        skippedVVMatch++;
+        stepsDone++;
+        onProgress?.(stepsDone, totalSteps, changed);
+        continue;
+      }
+      // Local content changed externally — fall through to full sync
+      await syncOverlappingDoc(deps, file.path, diskContent, serverDocMap);
+      changed++;
       stepsDone++;
       onProgress?.(stepsDone, totalSteps, changed);
       continue;
@@ -214,6 +228,7 @@ export async function runInitialSync(
   // 5. Tombstones — trash local files (skip if server also has the doc — create-after-delete)
   for (const uuid of tombstoneSet) {
     if (serverDocMap.has(uuid)) continue;
+    if (!isSyncablePath(uuid)) continue;
     const f = app.vault.getAbstractFileByPath(uuid);
     if (f instanceof TFile) {
       writingFromRemote.add(uuid);

@@ -425,15 +425,16 @@ describe('SyncEngine', () => {
   // ── initialSync — content-hash fast-path (Tier 1) ──────────────────────────
 
   describe('initialSync — content-hash fast-path', () => {
-    it('skips file read and CRDT load when VV matches (zero I/O)', async () => {
+    it('skips CRDT sync when VV and content hash both match', async () => {
       const tfile = Object.create(TFile.prototype);
       tfile.path = 'cached.md';
       mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+      mockVault.read.mockResolvedValue('hello world');
 
       const { fnv1aHash } = await import('../conflict-utils');
       const expectedHash = fnv1aHash('hello world');
 
-      // Pre-populate VV cache with matching VV
+      // Pre-populate VV cache with matching VV and content hash
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
         _version: 3,
@@ -454,8 +455,8 @@ describe('SyncEngine', () => {
 
       await syncPromise;
 
-      // Zero I/O: vault.read NOT called, no sync_start sent
-      expect(mockVault.read).not.toHaveBeenCalled();
+      // File is read for hash check, but no sync_start is sent (skip)
+      expect(mockVault.read).toHaveBeenCalled();
       const syncStartCalls = mockEncode.mock.calls.filter(
         (c: any[]) => c[0]?.type === 'sync_start'
       );
@@ -506,10 +507,12 @@ describe('SyncEngine', () => {
       await syncPromise;
     });
 
-    it('migrates old v1 cache format — VV match still skips (zero I/O)', async () => {
+    it('migrates old v1 cache format — VV match triggers full sync (sentinel hash never matches)', async () => {
       const tfile = Object.create(TFile.prototype);
       tfile.path = 'old.md';
       mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+      mockVault.read.mockResolvedValue('some content');
+      mockDocInstance.version.mockReturnValue(5);
 
       // Old v1 format: no _version, plain string values → parsed with contentHash=0
       mockAdapter.exists.mockResolvedValue(true);
@@ -529,14 +532,23 @@ describe('SyncEngine', () => {
         tombstones: [],
       });
 
-      await syncPromise;
+      await flush();
 
-      // VV matches → skipped via Tier 0 (no file read, no sync_start)
-      expect(mockVault.read).not.toHaveBeenCalled();
+      // v1 cache has contentHash=0 (sentinel) → hash mismatch → full sync
       const syncStartCalls = mockEncode.mock.calls.filter(
         (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'old.md'
       );
-      expect(syncStartCalls.length).toBe(0);
+      expect(syncStartCalls.length).toBe(1);
+
+      // Respond with sync_delta to unblock
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'old.md',
+        delta: new Uint8Array(0),
+        server_vv: new TextEncoder().encode('{"peer1":10}'),
+      });
+
+      await syncPromise;
     });
   });
 

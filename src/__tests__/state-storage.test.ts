@@ -82,18 +82,24 @@ describe('StateStorage', () => {
     expect(await storage.load('y.md')).toBeNull();
   });
 
-  it('path encoding handles slashes and dots', () => {
+  it('path encoding uses URI encoding', () => {
     expect(storage.stateKey('notes/daily/2026-03-16.md')).toBe(
-      'notes__daily__2026-03-16.loro'
+      'notes%2Fdaily%2F2026-03-16.md.loro'
     );
-    expect(storage.stateKey('simple.md')).toBe('simple.loro');
-    expect(storage.stateKey('a/b/c.md')).toBe('a__b__c.loro');
+    expect(storage.stateKey('simple.md')).toBe('simple.md.loro');
+    expect(storage.stateKey('a/b/c.md')).toBe('a%2Fb%2Fc.md.loro');
   });
 
   it('path encoding avoids collisions between slash and underscore', () => {
-    // These must produce different keys
     expect(storage.stateKey('notes/daily.md')).not.toBe(
       storage.stateKey('notes_daily.md')
+    );
+  });
+
+  it('path encoding avoids old __ collision', () => {
+    // Old encoding: a/b.md and a__b.md both mapped to a__b.loro
+    expect(storage.stateKey('a/b.md')).not.toBe(
+      storage.stateKey('a__b.md')
     );
   });
 });

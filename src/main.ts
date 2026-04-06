@@ -6,6 +6,7 @@ import type { SyncMode } from './sync-engine';
 import { FileWatcher } from './file-watcher';
 import { SetupModal } from './setup-modal';
 import { log, error } from './logger';
+import { isSyncablePath } from './path-policy';
 
 /** If no server response (pong/ack/delta) for this long, show disconnected. */
 const ACTIVITY_TIMEOUT_MS = 60_000;
@@ -28,7 +29,7 @@ export default class VaultCRDTPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on('editor-change', (editor, view) => {
         const file = view.file;
-        if (file && !this.syncEngine.isWritingFromRemote(file.path) && !this.syncEngine.isUpdatingEditorFromRemote(file.path)) {
+        if (file && isSyncablePath(file.path) && !this.syncEngine.isWritingFromRemote(file.path) && !this.syncEngine.isUpdatingEditorFromRemote(file.path)) {
           this.syncEngine.onFileChanged(file.path);
         }
       })
@@ -41,6 +42,7 @@ export default class VaultCRDTPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('modify', async (abstractFile) => {
         if (!(abstractFile instanceof TFile)) return;
+        if (!isSyncablePath(abstractFile.path)) return;
         if (this.syncEngine.isWritingFromRemote(abstractFile.path)) return;
         if (this.syncEngine.readCurrentContent(abstractFile.path) !== null) return;
         const content = await this.app.vault.read(abstractFile);
@@ -51,7 +53,7 @@ export default class VaultCRDTPlugin extends Plugin {
     // File creation — push immediately
     this.registerEvent(
       this.app.vault.on('create', async (file) => {
-        if (!(file instanceof TFile) || file.extension !== 'md') return;
+        if (!(file instanceof TFile) || !isSyncablePath(file.path)) return;
         if (this.syncEngine.isWritingFromRemote(file.path)) return;
         const content = await this.app.vault.read(file);
         this.syncEngine.onFileChangedImmediate(file.path, content);
@@ -61,7 +63,7 @@ export default class VaultCRDTPlugin extends Plugin {
     // File deletion — push tombstone + clean up local CRDT
     this.registerEvent(
       this.app.vault.on('delete', (file) => {
-        if (!(file instanceof TFile)) return;
+        if (!(file instanceof TFile) || !isSyncablePath(file.path)) return;
         if (this.syncEngine.isWritingFromRemote(file.path)) return;
         this.syncEngine.onFileDeleted(file.path);
       })
@@ -70,7 +72,7 @@ export default class VaultCRDTPlugin extends Plugin {
     // File rename — tombstone old path, push under new path
     this.registerEvent(
       this.app.vault.on('rename', async (file, oldPath) => {
-        if (file instanceof TFile && file.extension === 'md') {
+        if (file instanceof TFile && isSyncablePath(file.path)) {
           const content = await this.app.vault.read(file);
           this.syncEngine.onFileRenamed(oldPath, file.path, content);
         }

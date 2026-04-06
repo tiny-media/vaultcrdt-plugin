@@ -10,16 +10,16 @@ export interface VVCacheEntry {
 
 /**
  * Persists CRDT snapshots as `.loro` files under `.obsidian/plugins/vaultcrdt/state/`.
- * One file per vault document — path-safe encoding replaces `/` with `_`.
+ * One file per vault document — URI-encoded path ensures collision-free keys.
  */
 export class StateStorage {
   private dirEnsured = false;
 
   constructor(private app: App) {}
 
-  /** `notes/daily/2026-03-16.md` → `notes__daily__2026-03-16.loro` */
+  /** `notes/daily/2026-03-16.md` → `notes%2Fdaily%2F2026-03-16.md.loro` */
   stateKey(filePath: string): string {
-    return filePath.replace(/\.md$/, '').replace(/\//g, '__') + '.loro';
+    return encodeURIComponent(filePath) + '.loro';
   }
 
   private statePath(filePath: string): string {

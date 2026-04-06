@@ -2324,9 +2324,9 @@ var StateStorage = class {
     // ── VV Cache ──────────────────────────────────────────────────────────────
     __publicField(this, "vvCachePath", `${STATE_DIR}/vv-cache.json`);
   }
-  /** `notes/daily/2026-03-16.md` → `notes__daily__2026-03-16.loro` */
+  /** `notes/daily/2026-03-16.md` → `notes%2Fdaily%2F2026-03-16.md.loro` */
   stateKey(filePath) {
-    return filePath.replace(/\.md$/, "").replace(/\//g, "__") + ".loro";
+    return encodeURIComponent(filePath) + ".loro";
   }
   statePath(filePath) {
     return `${STATE_DIR}/${this.stateKey(filePath)}`;
@@ -2950,6 +2950,23 @@ var PushHandler = class {
   }
 };
 
+// src/path-policy.ts
+var BLOCKED_PREFIXES = [".obsidian/", ".trash/"];
+var BLOCKED_SEGMENTS = ["..", "."];
+function isSyncablePath(path) {
+  if (!path || typeof path !== "string") return false;
+  if (!path.endsWith(".md")) return false;
+  if (path.startsWith("/")) return false;
+  for (const prefix of BLOCKED_PREFIXES) {
+    if (path.startsWith(prefix)) return false;
+  }
+  const segments = path.split("/");
+  for (const seg of segments) {
+    if (seg === "" || BLOCKED_SEGMENTS.includes(seg)) return false;
+  }
+  return true;
+}
+
 // src/sync-initial.ts
 var import_obsidian3 = require("obsidian");
 var PARALLEL_DOWNLOADS = 5;
@@ -2981,7 +2998,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     hasCachedVVs: cachedVVs !== null
   });
   const serverOnlyUuids = [...serverDocMap.keys()].filter(
-    (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid)
+    (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid) && isSyncablePath(uuid)
   );
   const overlappingFiles = localFiles.filter(
     (f) => !tombstoneSet.has(f.path) && serverDocMap.has(f.path)
@@ -3071,9 +3088,18 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     const currentServerVV = serverVVStrings.get(file.path);
     const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-      lastServerVV.set(file.path, currentServerVV);
-      contentHashes.set(file.path, cached.contentHash);
-      skippedVVMatch++;
+      const diskContent = await app.vault.read(file);
+      const diskHash = fnv1aHash(diskContent);
+      contentHashes.set(file.path, diskHash);
+      if (diskHash === cached.contentHash) {
+        lastServerVV.set(file.path, currentServerVV);
+        skippedVVMatch++;
+        stepsDone++;
+        onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+        continue;
+      }
+      await syncOverlappingDoc(deps, file.path, diskContent, serverDocMap);
+      changed++;
       stepsDone++;
       onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
       continue;
@@ -3105,6 +3131,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   push.flushPendingDeletes();
   for (const uuid of tombstoneSet) {
     if (serverDocMap.has(uuid)) continue;
+    if (!isSyncablePath(uuid)) continue;
     const f = app.vault.getAbstractFileByPath(uuid);
     if (f instanceof import_obsidian3.TFile) {
       writingFromRemote.add(uuid);
@@ -3505,6 +3532,10 @@ var SyncEngine = class {
   }
   async onDeltaBroadcast(msg) {
     const docUuid = msg.doc_uuid;
+    if (!isSyncablePath(docUuid)) {
+      warn(`${this.tag} rejected broadcast for invalid path`, { docUuid });
+      return;
+    }
     const delta = msg.delta;
     await this.push.flushPendingEdits(docUuid);
     const doc = await this.docs.getOrLoad(docUuid);
@@ -3594,6 +3625,10 @@ var SyncEngine = class {
     await this.docs.persist(docUuid);
   }
   async onDocDeleted(docUuid) {
+    if (!isSyncablePath(docUuid)) {
+      warn(`${this.tag} rejected delete for invalid path`, { docUuid });
+      return;
+    }
     this.docs.remove(docUuid);
     this.lastServerVV.delete(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
@@ -3857,7 +3892,7 @@ var VaultCRDTPlugin = class extends import_obsidian6.Plugin {
     this.registerEvent(
       this.app.workspace.on("editor-change", (editor, view) => {
         const file = view.file;
-        if (file && !this.syncEngine.isWritingFromRemote(file.path) && !this.syncEngine.isUpdatingEditorFromRemote(file.path)) {
+        if (file && isSyncablePath(file.path) && !this.syncEngine.isWritingFromRemote(file.path) && !this.syncEngine.isUpdatingEditorFromRemote(file.path)) {
           this.syncEngine.onFileChanged(file.path);
         }
       })
@@ -3865,6 +3900,7 @@ var VaultCRDTPlugin = class extends import_obsidian6.Plugin {
     this.registerEvent(
       this.app.vault.on("modify", async (abstractFile) => {
         if (!(abstractFile instanceof import_obsidian6.TFile)) return;
+        if (!isSyncablePath(abstractFile.path)) return;
         if (this.syncEngine.isWritingFromRemote(abstractFile.path)) return;
         if (this.syncEngine.readCurrentContent(abstractFile.path) !== null) return;
         const content = await this.app.vault.read(abstractFile);
@@ -3873,7 +3909,7 @@ var VaultCRDTPlugin = class extends import_obsidian6.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("create", async (file) => {
-        if (!(file instanceof import_obsidian6.TFile) || file.extension !== "md") return;
+        if (!(file instanceof import_obsidian6.TFile) || !isSyncablePath(file.path)) return;
         if (this.syncEngine.isWritingFromRemote(file.path)) return;
         const content = await this.app.vault.read(file);
         this.syncEngine.onFileChangedImmediate(file.path, content);
@@ -3881,14 +3917,14 @@ var VaultCRDTPlugin = class extends import_obsidian6.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
-        if (!(file instanceof import_obsidian6.TFile)) return;
+        if (!(file instanceof import_obsidian6.TFile) || !isSyncablePath(file.path)) return;
         if (this.syncEngine.isWritingFromRemote(file.path)) return;
         this.syncEngine.onFileDeleted(file.path);
       })
     );
     this.registerEvent(
       this.app.vault.on("rename", async (file, oldPath) => {
-        if (file instanceof import_obsidian6.TFile && file.extension === "md") {
+        if (file instanceof import_obsidian6.TFile && isSyncablePath(file.path)) {
           const content = await this.app.vault.read(file);
           this.syncEngine.onFileRenamed(oldPath, file.path, content);
         }

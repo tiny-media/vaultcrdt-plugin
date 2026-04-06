@@ -8,6 +8,7 @@ import { PromiseManager } from './promise-manager';
 import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn, error } from './logger';
+import { isSyncablePath } from './path-policy';
 import { runInitialSync, type SyncMode } from './sync-initial';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
@@ -302,6 +303,10 @@ export class SyncEngine {
 
   private async onDeltaBroadcast(msg: Record<string, unknown>): Promise<void> {
     const docUuid = msg.doc_uuid as string;
+    if (!isSyncablePath(docUuid)) {
+      warn(`${this.tag} rejected broadcast for invalid path`, { docUuid });
+      return;
+    }
     const delta = msg.delta as Uint8Array;
 
     await this.push.flushPendingEdits(docUuid);
@@ -404,6 +409,10 @@ export class SyncEngine {
   }
 
   private async onDocDeleted(docUuid: string): Promise<void> {
+    if (!isSyncablePath(docUuid)) {
+      warn(`${this.tag} rejected delete for invalid path`, { docUuid });
+      return;
+    }
     this.docs.remove(docUuid);
     this.lastServerVV.delete(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
