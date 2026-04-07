@@ -1,75 +1,98 @@
-# Session Handoff — nach Phase B
+# Session Handoff — nach Drift-Discovery + CLAUDE.md-Orientation
 
-Datum: 2026-04-07
-Branch: main (alle drei Repos)
+Datum: 2026-04-07 (dritte Session des Tages)
+Branch: main (alle Repos)
 
-## Was diese Session gemacht hat
+## Was diese Session erreicht hat
 
-Phase B des GPT-Audits vollständig umgesetzt — Items 4, 5, 6. Vier Commits:
+**1. Option A′ (Phase-B-Abschluss-Smoke-Test):**
+- `vaultcrdt/Cargo.toml`: `"v2/server"` aus members entfernt (Eltern-Repo commit `13ba39f`)
+- `cargo build -p vaultcrdt-wasm --target wasm32-unknown-unknown --release` → grün
+- `./scripts/check-wasm-fresh.sh` → `OK: committed WASM artifacts are fresh`
+- **Phase B Item 5 (wasm-bindgen Pin) ist damit end-to-end verifiziert.** Die committed Plugin-WASM-Artefakte sind bit-identisch reproduzierbar.
+
+**2. Drift-Discovery zwischen Monorepo und standalone Server:**
+- Source-Drift in `crates/vaultcrdt-{wasm,crdt}` zwischen `vaultcrdt/` und `vaultcrdt-server/`
+- Der bit-identische Build-Beweis zeigt: **`vaultcrdt/` ist die Source-of-Truth**, die Kopien im standalone Server waren stale Forks vom Split-Zeitpunkt
+
+**3. Standalone Server aufgeräumt (commit `084daf3`):**
+- `vaultcrdt-server/crates/` komplett gelöscht (1141 Zeilen dead code)
+- `vaultcrdt-server/Cargo.toml` members auf `["."]` reduziert, `[workspace.dependencies]` block entfernt
+- `cargo build` + `cargo test` → 35/35 grün
+
+**4. CLAUDE.md-Orientation in allen drei Repos:**
+- `vaultcrdt-plugin/CLAUDE.md` — neu, mit Drei-Repo-Layout, gpt-audit/-Navigation, `bun run test` vs `bun test` Warnung, Invarianten
+- `vaultcrdt-server/CLAUDE.md` — neu, mit Drei-Repo-Layout, Phase B Status, Env-Vars, Auth-/Tombstone-Invarianten
+- `vaultcrdt/CLAUDE.md` — überarbeitet mit expliziter "LEGACY" Kennzeichnung, Live-Zweck (nur WASM-Build), D1-D7 Cleanup-Liste, Gotcha zum Eltern-Git-Repo
+
+Jedes zukünftige Coding-Tool, das einen der drei Ordner öffnet, bekommt jetzt sofort die wichtigste Info: welcher Ordner bin ich, welche zwei anderen gibt es, wo ist die Source-of-Truth, was darf ich nicht kaputt machen.
+
+## Nächste Session: D1-D7 — Monorepo-Cleanup
+
+Der 2026-03-19 Split (`b3afcf2`) war unvollständig. Folgender dead code lebt im Monorepo und ist seit 3 Wochen tot, aber nie aufgeräumt:
+
+| # | Was | Aktion |
+|---|---|---|
+| D1 | `crates/vaultcrdt-server/` | Löschen (drifted Snapshot, canonical ist `../vaultcrdt-server/`) |
+| D2 | standalone `crates/{wasm,crdt}/` | ✅ bereits erledigt (`084daf3`) |
+| D3 | `Dockerfile` referenziert nicht-existentes `vaultcrdt-server-v2` | Löschen |
+| D4 | `.forgejo/workflows/release.yaml` baut kaputten Dockerfile | Löschen |
+| D5 | `Justfile` hat ~10 dead targets (`run`, `deploy`, `restart`, `build-remote`, `build-docker`, `logs`, `status`, `e2e`, `e2e-train`, `shell`) | Trimmen auf `wasm` / `wasm-check` / `check` |
+| D6 | `Cargo.lock` Leicheneintrag `vaultcrdt-server-v2` | Regenerieren (`cargo update -w` nach D1) |
+| D7 | `obsidian-plugin/` — vierte vollständige Plugin-Kopie mit eigenem `main.js`, `wasm/`, `node_modules/` | **Mit User klären**, wahrscheinlich löschen |
+
+**Ausserdem:**
+- `docker-compose.yml` löschen (baut den kaputten Dockerfile)
+- `Cargo.toml` `[workspace.dependencies]` ausmisten — nach D1 sind server-only deps (axum, sqlx, jsonwebtoken, tower, tower-http, libsqlite3-sys, rmp-serde, futures-util, clap, anyhow, tracing-subscriber) überflüssig
+
+### Vorgeschlagener Ablauf
+
+1. **D7 zuerst klären** (30 Sekunden Konversation mit User) — ist `obsidian-plugin/` im Monorepo Altlast oder dient sie noch irgendwas?
+2. **D1, D3, D4, `docker-compose.yml` löschen** — ein Commit „retire dead deploy pipeline"
+3. **D5, Cargo.toml `[workspace.dependencies]`, D6** — ein Commit „trim monorepo to WASM build role"
+4. **Smoke-Test nach jedem Commit:** `cargo build -p vaultcrdt-wasm --target wasm32-unknown-unknown --release` + `./scripts/check-wasm-fresh.sh`
+5. **CLAUDE.md im Monorepo final updaten** — D1-D7 als erledigt markieren, Cleanup-Section entfernen
+
+**Aufwand:** ~45 min, ~5 Edit-Stellen, nichts davon risky weil alles seit 3 Wochen nachweislich tot ist.
+
+**Commit-Gotcha:** Alle Änderungen im Monorepo müssen in den Eltern-Repo `/home/richard/projects/` committed werden mit expliziten Pfaden (`git add vaultcrdt/path`).
+
+## Offene Runtime-Observations (unverändert)
+
+- **Lazy-Auth-Migration:** beim ersten Real-Login eines bestehenden Vaults soll der Klartext-API-Key automatisch zu Argon2id-PHC upgegradet werden. Server-Log beim ersten Verify beobachten.
+- **Plugin nach Delete:** nach `removeAndClean()` sollte das Plugin nicht mehr für denselben Pfad pushen. Falls doch: Server antwortet mit `DocTombstoned` und Plugin loggt Warnung.
+
+Beides bei normaler Nutzung im Blick behalten, kein separater Coding-Aufwand nötig.
+
+## Aufgeschobene Audit-Items
+
+- **#7 Multi-Editor-Konsistenz** — UX-Polish, kein Korrektheitsproblem, deferred bis Public Release
+- **#8 WS-Token-Logging** — Self-Hosted ausreichend, Ticket-Modell nice-to-have, deferred
+
+Beide gehören in eine Public-Release-Session, nicht jetzt.
+
+## Commits dieser Session
 
 | Commit | Repo | Inhalt |
 |--------|------|--------|
-| `124a2d7` | vaultcrdt-server | Argon2id-Hashing + Lazy-Migration, generische Auth-Fehler, Tombstone-Guard (`is_tombstoned`), neuer `DocTombstoned`-ServerMsg, 90d Default-Retention via `VAULTCRDT_TOMBSTONE_DAYS` |
-| `3280be4` | vaultcrdt-plugin | `removeAndClean()` statt `remove()` in Delete-Pfaden, neuer `case 'doc_tombstoned'` |
-| `b18532c` | parent (`/home/richard/projects`) | `wasm-bindgen = "=0.2.114"` Pin im Monorepo, `scripts/build-wasm.sh`, `scripts/check-wasm-fresh.sh`, Justfile-Update |
-| `a2bc6f3` | vaultcrdt-plugin | `gpt-audit/claude-response.md` mit Phase-B-Notizen + Lessons Learned |
+| `13ba39f` | parent (`/home/richard/projects`) | monorepo Cargo.toml: drop dead `v2/server` member |
+| `084daf3` | vaultcrdt-server | remove stale `crates/` leftover from repo split |
+| — | vaultcrdt-plugin | CLAUDE.md + aktualisierter Handoff (nicht committed, bis User es will) |
+| — | vaultcrdt-server | CLAUDE.md (nicht committed, bis User es will) |
+| — | parent (`/home/richard/projects`) | vaultcrdt/CLAUDE.md Update (nicht committed, bis User es will) |
 
-**Tests:** Server 35/35, Plugin 129/129. Plugin-Build sauber.
-
-**6 von 8 Audit-Punkten umgesetzt.** Verbleibend: Multi-Editor-Konsistenz (#7) und WS-Token-Logging (#8) — beide bewusst aufgeschoben.
-
-## Status der Audit-Roadmap
-
-Siehe `gpt-audit/claude-response.md` (vollständig aktualisiert) und `gpt-audit/09-decision-matrix.md`.
-
-## Offene Followups
-
-### 1. Monorepo-Workspace reparieren (Blocker für `cargo check`)
-
-`/home/richard/projects/vaultcrdt/Cargo.toml` listet `v2/server` als Workspace-Member, das Verzeichnis existiert aber nicht. `cargo check --workspace` schlägt sofort fehl. Pre-existing, nicht durch Phase B verursacht.
-
-**Optionen:**
-- `v2/server`-Eintrag aus `[workspace] members` entfernen (wenn die v2-Linie tot ist)
-- `v2/server/Cargo.toml` neu anlegen (wenn sie wiederbelebt werden soll)
-
-**Konsequenz:** Erst nach Fix kann `just wasm-check` lokal validieren, dass die committed Plugin-WASMs frisch sind.
-
-### 2. WASM-Build-Skripte einmal real laufen lassen
-
-`scripts/build-wasm.sh` und `scripts/check-wasm-fresh.sh` sind geschrieben, aber wegen #1 nie ausgeführt. Sobald der Workspace baut: `just wasm` einmal aufrufen, prüfen ob die Output-Pfade stimmen, Diff zu den committed Artefakten ansehen.
-
-### 3. Lazy-Auth-Migration im Real-Betrieb beobachten
-
-Beim ersten Login eines existierenden Vaults nach Server-Update wird der Klartext-API-Key automatisch zu Argon2id-PHC upgegradet. Empfehlung: einmal im Server-Log nach dem ersten Verify nachschauen, dass der `UPDATE vaults SET api_key` durchläuft und nachfolgende Verifies den `$argon2id$`-Pfad nehmen.
-
-### 4. Plugin-Verhalten nach Delete prüfen
-
-Nach einem lokalen Delete sollte das Plugin nicht mehr für denselben Pfad pushen. Aktuell passiert das implizit (`DocumentManager` kennt den Doc nach `removeAndClean()` nicht mehr). Wenn etwas doch erneut pusht, antwortet der Server jetzt mit `DocTombstoned` und das Plugin loggt eine Warnung — beides im Console-Log sichtbar machen, falls auffällig.
-
-### 5. Aufgeschobene Items (#7, #8)
-
-- **#7 Multi-Editor-Konsistenz** — UX-Polish, kein Korrektheitsproblem
-- **#8 WS-Token-Logging** — Self-Hosted ausreichend, Ticket-Modell wäre nice-to-have
-
-Beide würde ich erst angehen, wenn ein Public Release konkret wird.
-
-## Wichtige Kontextinfos
+## Wichtige Kontextinfos (für jede künftige Session)
 
 - **Einziger User**, kein Backwards-Compat-Zwang
-- **Android-mtime unzuverlässig** — niemals für Caching/Skip-Logik
-- **`/home/richard/projects/vaultcrdt`** lebt **inside** des Eltern-Git-Repos `/home/richard/projects/` — Commits dort mit explizit gestageten Pfaden machen, sonst zeigt `git status` dutzende Geschwister-Projekte
-- **Server-Repo:** `/home/richard/projects/vaultcrdt-server` (eigenes Repo)
-- **Plugin-Repo:** `/home/richard/projects/vaultcrdt-plugin` (eigenes Repo)
-- **Monorepo:** `/home/richard/projects/vaultcrdt` (Subdir im Parent-Repo)
+- **Android-mtime unzuverlässig** — niemals für Caching
+- **`vaultcrdt/`** ist Legacy, NUR für WASM-Build
+- **`vaultcrdt/`** lebt inside `/home/richard/projects/`-Eltern-Repo → explizite Pfade beim `git add`
+- **`bun run test`** verwenden, NICHT `bun test` (unterschiedliche Runner)
+- **Drei CLAUDE.md-Dateien** existieren jetzt — jede erklärt sich selbst und die anderen beiden
 
-## Deploy-Hinweise für Phase-B-Änderungen
+## Einstiegspunkte für neue Sessions
 
-- **Server:** `VAULTCRDT_TOMBSTONE_DAYS=90` ist Default, kein Setzen nötig wenn 90 ok ist. Argon2-Migration läuft automatisch bei nächstem Login.
-- **Plugin:** `main.js` im Commit `3280be4` enthalten. Standard-Deploy-Pfad (Plugin-Kopie an die 4 bekannten Orte).
-- **Monorepo:** Commit `b18532c` lebt im Parent-Repo, nicht im `vaultcrdt`-Subdir.
-
-## Dateien zum Lesen als Einstieg
-
-- `gpt-audit/claude-response.md` — vollständige Bewertung + Phase-A/B-Status + Lessons Learned
-- `gpt-audit/09-decision-matrix.md` — Übersicht aller 8 Audit-Punkte
-- `gpt-audit/next-session-phase-b.md` — Plan, der diese Session umgesetzt hat (jetzt historisch)
+1. `memory_session_start` (via `/begin`)
+2. Diesen Handoff lesen
+3. `CLAUDE.md` im aktuellen Arbeitsverzeichnis lesen
+4. Bei Audit-Fragen: `gpt-audit/09-decision-matrix.md` und `gpt-audit/claude-response.md`
