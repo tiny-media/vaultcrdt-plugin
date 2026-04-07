@@ -1,98 +1,117 @@
-# Session Handoff — nach Drift-Discovery + CLAUDE.md-Orientation
+# Session Handoff — Two-Repo Consolidation + Audit Cleanup
 
-Datum: 2026-04-07 (dritte Session des Tages)
+Datum: 2026-04-07 (vierte Session des Tages)
 Branch: main (alle Repos)
 
 ## Was diese Session erreicht hat
 
-**1. Option A′ (Phase-B-Abschluss-Smoke-Test):**
-- `vaultcrdt/Cargo.toml`: `"v2/server"` aus members entfernt (Eltern-Repo commit `13ba39f`)
-- `cargo build -p vaultcrdt-wasm --target wasm32-unknown-unknown --release` → grün
-- `./scripts/check-wasm-fresh.sh` → `OK: committed WASM artifacts are fresh`
-- **Phase B Item 5 (wasm-bindgen Pin) ist damit end-to-end verifiziert.** Die committed Plugin-WASM-Artefakte sind bit-identisch reproduzierbar.
+### D1-D7: Legacy-Monorepo bereinigt (Commit `a379a36`, Eltern-Repo)
 
-**2. Drift-Discovery zwischen Monorepo und standalone Server:**
-- Source-Drift in `crates/vaultcrdt-{wasm,crdt}` zwischen `vaultcrdt/` und `vaultcrdt-server/`
-- Der bit-identische Build-Beweis zeigt: **`vaultcrdt/` ist die Source-of-Truth**, die Kopien im standalone Server waren stale Forks vom Split-Zeitpunkt
+Alle 7 Cleanup-Punkte aus dem Backlog in einem Commit erledigt:
+- `crates/vaultcrdt-server/` gelöscht (D1 — drifted snapshot)
+- `Dockerfile`, `docker-compose.yml` gelöscht (D3)
+- `.forgejo/` komplett gelöscht (D4 + CI)
+- `devices/` gelöscht (leerer Stub)
+- `obsidian-plugin/` gelöscht (D7 — stale vierte Plugin-Kopie)
+- `Cargo.toml` auf 3 WASM-Crates reduziert + server-only deps entfernt
+- `Justfile` auf `wasm / wasm-check / check / test` getrimmt (D5)
+- `Cargo.lock` regeneriert, server-deps-frei (D6)
 
-**3. Standalone Server aufgeräumt (commit `084daf3`):**
-- `vaultcrdt-server/crates/` komplett gelöscht (1141 Zeilen dead code)
-- `vaultcrdt-server/Cargo.toml` members auf `["."]` reduziert, `[workspace.dependencies]` block entfernt
-- `cargo build` + `cargo test` → 35/35 grün
+### Rust WASM-Crates in Plugin-Repo absorbiert (Plugin-Commit)
 
-**4. CLAUDE.md-Orientation in allen drei Repos:**
-- `vaultcrdt-plugin/CLAUDE.md` — neu, mit Drei-Repo-Layout, gpt-audit/-Navigation, `bun run test` vs `bun test` Warnung, Invarianten
-- `vaultcrdt-server/CLAUDE.md` — neu, mit Drei-Repo-Layout, Phase B Status, Env-Vars, Auth-/Tombstone-Invarianten
-- `vaultcrdt/CLAUDE.md` — überarbeitet mit expliziter "LEGACY" Kennzeichnung, Live-Zweck (nur WASM-Build), D1-D7 Cleanup-Liste, Gotcha zum Eltern-Git-Repo
+Endgültiger Abschluss des 2026-03-19-Splits. Das Plugin-Repo ist jetzt ein Rust+TS-Hybrid:
 
-Jedes zukünftige Coding-Tool, das einen der drei Ordner öffnet, bekommt jetzt sofort die wichtigste Info: welcher Ordner bin ich, welche zwei anderen gibt es, wo ist die Source-of-Truth, was darf ich nicht kaputt machen.
+```
+vaultcrdt-plugin/
+├── crates/vaultcrdt-{core,crdt,wasm}/   ← Rust CRDT engine
+├── scripts/{build-wasm.sh,check-wasm-fresh.sh}
+├── Cargo.toml + Cargo.lock + .cargo/ + rust-toolchain.toml + rustfmt.toml
+└── wasm/                                 ← committed artifacts (bit-identisch)
+```
 
-## Nächste Session: D1-D7 — Monorepo-Cleanup
+Neue Befehle:
+```bash
+bun run wasm         # rebuild WASM aus crates/
+bun run wasm:check   # drift-guard gegen committed wasm/
+```
 
-Der 2026-03-19 Split (`b3afcf2`) war unvollständig. Folgender dead code lebt im Monorepo und ist seit 3 Wochen tot, aber nie aufgeräumt:
+Smoke-Test: `bun run wasm:check` → `OK: committed WASM artifacts are fresh` ✓  
+`bun run test` → 129/129 ✓
 
-| # | Was | Aktion |
-|---|---|---|
-| D1 | `crates/vaultcrdt-server/` | Löschen (drifted Snapshot, canonical ist `../vaultcrdt-server/`) |
-| D2 | standalone `crates/{wasm,crdt}/` | ✅ bereits erledigt (`084daf3`) |
-| D3 | `Dockerfile` referenziert nicht-existentes `vaultcrdt-server-v2` | Löschen |
-| D4 | `.forgejo/workflows/release.yaml` baut kaputten Dockerfile | Löschen |
-| D5 | `Justfile` hat ~10 dead targets (`run`, `deploy`, `restart`, `build-remote`, `build-docker`, `logs`, `status`, `e2e`, `e2e-train`, `shell`) | Trimmen auf `wasm` / `wasm-check` / `check` |
-| D6 | `Cargo.lock` Leicheneintrag `vaultcrdt-server-v2` | Regenerieren (`cargo update -w` nach D1) |
-| D7 | `obsidian-plugin/` — vierte vollständige Plugin-Kopie mit eigenem `main.js`, `wasm/`, `node_modules/` | **Mit User klären**, wahrscheinlich löschen |
+### Legacy-Ordner pensioniert (Eltern-Repo)
 
-**Ausserdem:**
-- `docker-compose.yml` löschen (baut den kaputten Dockerfile)
-- `Cargo.toml` `[workspace.dependencies]` ausmisten — nach D1 sind server-only deps (axum, sqlx, jsonwebtoken, tower, tower-http, libsqlite3-sys, rmp-serde, futures-util, clap, anyhow, tracing-subscriber) überflüssig
+`/home/richard/projects/vaultcrdt/` existiert nicht mehr.
 
-### Vorgeschlagener Ablauf
+**Finales Layout:**
+```
+/home/richard/projects/
+├── vaultcrdt-plugin/    ← Rust CRDT engine + WASM build + TypeScript plugin
+└── vaultcrdt-server/    ← Rust/Axum sync server
+```
 
-1. **D7 zuerst klären** (30 Sekunden Konversation mit User) — ist `obsidian-plugin/` im Monorepo Altlast oder dient sie noch irgendwas?
-2. **D1, D3, D4, `docker-compose.yml` löschen** — ein Commit „retire dead deploy pipeline"
-3. **D5, Cargo.toml `[workspace.dependencies]`, D6** — ein Commit „trim monorepo to WASM build role"
-4. **Smoke-Test nach jedem Commit:** `cargo build -p vaultcrdt-wasm --target wasm32-unknown-unknown --release` + `./scripts/check-wasm-fresh.sh`
-5. **CLAUDE.md im Monorepo final updaten** — D1-D7 als erledigt markieren, Cleanup-Section entfernen
+### gpt-audit/ bereinigt für neuen Audit-Zyklus
 
-**Aufwand:** ~45 min, ~5 Edit-Stellen, nichts davon risky weil alles seit 3 Wochen nachweislich tot ist.
+Erster Zyklus (2026-04-06) vollständig archiviert in `gpt-audit/archive-2026-04-06/`.
 
-**Commit-Gotcha:** Alle Änderungen im Monorepo müssen in den Eltern-Repo `/home/richard/projects/` committed werden mit expliziten Pfaden (`git add vaultcrdt/path`).
+Neue Top-Level-Struktur:
+```
+gpt-audit/
+├── README.md             ← Workflow für neue Zyklen
+├── previous-cycles.md    ← rolling Summary, 1 Absatz pro geschlossenem Zyklus
+└── archive-2026-04-06/   ← erster Zyklus, closed (6/8 done, 2 deferred)
+```
 
-## Offene Runtime-Observations (unverändert)
+---
 
-- **Lazy-Auth-Migration:** beim ersten Real-Login eines bestehenden Vaults soll der Klartext-API-Key automatisch zu Argon2id-PHC upgegradet werden. Server-Log beim ersten Verify beobachten.
-- **Plugin nach Delete:** nach `removeAndClean()` sollte das Plugin nicht mehr für denselben Pfad pushen. Falls doch: Server antwortet mit `DocTombstoned` und Plugin loggt Warnung.
+## Nächste Session: Neuer GPT-Audit
 
-Beides bei normaler Nutzung im Blick behalten, kein separater Coding-Aufwand nötig.
+**Vorbereitung ist erledigt.** Das Repo ist jetzt in einer sauberen Zwei-Repo-Struktur, die sich deutlich von der Drei-Repo-Struktur unterscheidet, die der erste Audit bewertet hat.
 
-## Aufgeschobene Audit-Items
+Ablauf:
+1. GPT bekommt aktuelle Code-Basis (`vaultcrdt-plugin/src/`, `vaultcrdt-server/src/`) + Kontext aus `gpt-audit/previous-cycles.md`
+2. Neues Audit landet in `gpt-audit/archive-<datum>/audit-<datum>.md`
+3. Danach: Proposals, Decision-Matrix, Claude-Response wie im ersten Zyklus
 
-- **#7 Multi-Editor-Konsistenz** — UX-Polish, kein Korrektheitsproblem, deferred bis Public Release
-- **#8 WS-Token-Logging** — Self-Hosted ausreichend, Ticket-Modell nice-to-have, deferred
+**Seed-Kontext für den Audit-Prompt:** `gpt-audit/previous-cycles.md` — beschreibt was im ersten Zyklus bereits behoben wurde, verhindert Rehashing.
 
-Beide gehören in eine Public-Release-Session, nicht jetzt.
+---
+
+## Dauerhaft offene Punkte (deferred bis Public Release)
+
+- **#7 Multi-Editor-Konsistenz** — UX-Polish, kein Korrektheitsproblem
+- **#8 WS-Token-Logging** — Self-Hosted ausreichend, Ticket-Modell nice-to-have
+
+Detail: `gpt-audit/archive-2026-04-06/claude-response.md`
+
+## Runtime-Observations (bei normaler Nutzung beobachten)
+
+- **Lazy-Auth-Migration:** Beim ersten Login eines bestehenden Vaults: Server-Log beobachten → PHC-Upgrade passiert beim ersten `verify_secret`-Aufruf
+- **Plugin nach Delete:** Nach `removeAndClean()` pusht das Plugin nicht mehr für denselben Pfad. Falls doch → Server antwortet mit `DocTombstoned`, Plugin loggt Warnung.
+
+---
 
 ## Commits dieser Session
 
 | Commit | Repo | Inhalt |
 |--------|------|--------|
-| `13ba39f` | parent (`/home/richard/projects`) | monorepo Cargo.toml: drop dead `v2/server` member |
-| `084daf3` | vaultcrdt-server | remove stale `crates/` leftover from repo split |
-| — | vaultcrdt-plugin | CLAUDE.md + aktualisierter Handoff (nicht committed, bis User es will) |
-| — | vaultcrdt-server | CLAUDE.md (nicht committed, bis User es will) |
-| — | parent (`/home/richard/projects`) | vaultcrdt/CLAUDE.md Update (nicht committed, bis User es will) |
+| `a379a36` | parent (`/home/richard/projects`) | D1-D7: trim legacy monorepo to WASM build role |
+| *(neu)* | vaultcrdt-plugin | feat(wasm): absorb Rust CRDT crates — retire legacy monorepo split |
+| `c357354` | vaultcrdt-server | docs(claude): two-repo layout — legacy monorepo retired |
+| *(neu)* | parent | retire legacy vaultcrdt/ monorepo |
+| *(neu)* | vaultcrdt-plugin | docs(gpt-audit): archive first cycle, prep for new audit |
 
-## Wichtige Kontextinfos (für jede künftige Session)
+## Wichtige Kontextinfos
 
 - **Einziger User**, kein Backwards-Compat-Zwang
 - **Android-mtime unzuverlässig** — niemals für Caching
-- **`vaultcrdt/`** ist Legacy, NUR für WASM-Build
-- **`vaultcrdt/`** lebt inside `/home/richard/projects/`-Eltern-Repo → explizite Pfade beim `git add`
-- **`bun run test`** verwenden, NICHT `bun test` (unterschiedliche Runner)
-- **Drei CLAUDE.md-Dateien** existieren jetzt — jede erklärt sich selbst und die anderen beiden
+- **`bun run test`** verwenden, NICHT `bun test`
+- **wasm-bindgen CLI** muss Version `0.2.114` sein (Cargo.toml-Pin); `bun run wasm:check` fängt Drift ab
+- **Zwei CLAUDE.md-Dateien** — eine pro Repo, jede erklärt sich selbst und den Nachbarn
+- **Eltern-Repo-Gotcha ist hinfällig** — `vaultcrdt/` ist weg, kein Parent-Git-Tanz mehr nötig
 
 ## Einstiegspunkte für neue Sessions
 
-1. `memory_session_start` (via `/begin`)
+1. `/begin` (invokes `memory_session_start`)
 2. Diesen Handoff lesen
 3. `CLAUDE.md` im aktuellen Arbeitsverzeichnis lesen
-4. Bei Audit-Fragen: `gpt-audit/09-decision-matrix.md` und `gpt-audit/claude-response.md`
+4. Bei Audit-Fragen: `gpt-audit/previous-cycles.md`
