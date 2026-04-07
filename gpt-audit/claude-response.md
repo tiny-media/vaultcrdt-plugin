@@ -1,6 +1,7 @@
 # Claude-Antwort auf den GPT-Audit
 
-Erstellt: 2026-04-07  
+Erstellt: 2026-04-07 (Phase A)  
+Aktualisiert: 2026-04-07 (Phase B abgeschlossen — siehe unten)  
 Modell: Claude Opus 4.6 (ultrathink)  
 Kontext: Vollzugriff auf Plugin-Code, Server-Repo und WASM-Monorepo
 
@@ -58,19 +59,75 @@ Drei Punkte, die ich anders gewichte als der Audit:
 
 ---
 
-## Was wir nicht umgesetzt haben und warum
+## Was wir umgesetzt haben (Phase B)
 
-### Delete-/Tombstone-Härtung (Phase 1)
+Commits:  
+- Server `124a2d7` — argon2id auth + tombstone anti-resurrection  
+- Plugin `3280be4` — tombstone-aware push + .loro cleanup  
+- Monorepo `b18532c` — wasm-bindgen pin + reproducible build scripts
 
-**Nicht umgesetzt weil:** Der Fix erfordert koordinierte Änderungen in Server + Plugin. Der Server muss zuerst Tombstone-Guards in `sync_push` und `doc_create` einbauen, bevor die Plugin-Seite sinnvoll ist. Das ist kein Quick-Patch.
+### 4. Auth-/Secret-Härtung (Item 6)
 
-### WASM-Build-Reproduzierbarkeit
+**Umgesetzt:**
+- `db::hash_secret` / `db::verify_secret` (Argon2id, PHC-String-Format via `argon2 = "0.5"`)
+- `create_vault` hasht vor `INSERT OR IGNORE`
+- `verify_vault` mit Lazy-Migration: legacy Klartext-Einträge werden beim ersten erfolgreichen Verify automatisch zu Argon2id-PHC upgegradet — kein separates Migrationsskript nötig
+- `auth_verify` gibt einheitlich `"Authentication failed"` zurück (vorher unterschied "Invalid API key" vs "Invalid admin token" → Vault-Enumeration)
+- 3 neue Tests: `test_create_vault_stores_argon2_hash`, `test_verify_vault_with_legacy_plaintext_migrates`, sowie der bestehende `test_vault_create_and_verify` läuft mit den neuen Hash-Pfaden weiter
 
-**Nicht umgesetzt weil:** Reiner Tooling-/Prozess-Fix. Null Auswirkung auf den laufenden Sync. Richtig priorisiert als "vor Public Release".
+**Real-Life-Beobachtung:** Die Lazy-Migration ist überraschend angenehm — sie verlagert die Migration vom Deploy-Zeitpunkt in den ersten erfolgreichen Login. Kein Downtime, kein Backfill. Funktioniert nur, weil wir Single-User sind und die Migration deterministisch und idempotent ist. Bei mehreren parallelen Verifies derselben Vault könnte theoretisch der `UPDATE` doppelt feuern — aber das `UPDATE` ist ein Rewrite des gleichen Hashes, also harmlos.
 
-### Auth-/Secret-Härtung
+### 5. Tombstone-Härtung (Item 4)
 
-**Nicht umgesetzt weil:** Für Self-Hosted-Einzel-User mit VPN/Tailscale-Zugang kein akutes Risiko. Klarer Blocker vor GitHub-Public, aber nicht vor privatem Betrieb.
+**Server umgesetzt:**
+- Default-Retention `7d → 90d`, env-konfigurierbar via `VAULTCRDT_TOMBSTONE_DAYS`
+- Neue `db::is_tombstoned()`-Hilfsfunktion
+- `handle_sync_push` und `handle_doc_create` prüfen **vor** dem Schreiben den Tombstone-Status. Bei Treffer wird der Push/Create abgelehnt und ein neuer `ServerMsg::DocTombstoned { doc_uuid }` zurückgeschickt
+- Die `db::remove_tombstone()`-Aufrufe in `sync_push`/`doc_create` wurden ersatzlos entfernt — Tombstones sind jetzt sticky bis zur Expiry
+- 1 neuer Test: `test_is_tombstoned`
+
+**Plugin umgesetzt:**
+- `push-handler.ts:onFileDeleted` und `sync-engine.ts:onDocDeleted` rufen jetzt `removeAndClean()` statt `remove()` — die `.loro`-Snapshot-Datei auf Disk wird mit gelöscht
+- Neuer `case 'doc_tombstoned'` in `onMessage` loggt eine Warnung. Kein Recreate-Flow in Phase 1: tombstoned Docs können erst nach 90 Tagen am gleichen Pfad neu erstellt werden — für Single-User-Betrieb akzeptabel.
+
+**Real-Life-Beobachtung 1:** Die Plan-Skizze sagte "`handlers.rs` ruft `remove_tombstone()` in `sync_push` (Z.186) und `doc_create` (Z.235) auf" — exakt korrekt. Der Audit hatte das Problem in beiden Pfaden lokalisiert. Nichts überraschendes beim Editieren.
+
+**Real-Life-Beobachtung 2:** Server-seitige Pfadvalidierung (im Plan als "Bonus" markiert) wurde **bewusst nicht umgesetzt**. Begründung: Auf dem Server ist `doc_uuid` ein opaker String — die "ist das ein gültiger Vault-Pfad?"-Logik gehört konzeptionell ins Plugin, weil nur das Plugin weiß, was ein gültiger Vault-Pfad ist. Die Plugin-Seite filtert eingehende `delta_broadcast`/`doc_deleted` schon via `isSyncablePath()`. Eine Server-seitige Duplizierung würde TypeScript-Logik in Rust spiegeln müssen, mit der Gefahr, dass beide auseinanderdriften. Stattdessen: Server bleibt Transport, Plugin ist Policy-Owner.
+
+**Real-Life-Beobachtung 3:** Das `.loro`-Cleanup hat eine subtile Asymmetrie: `push-handler.ts:onFileDeleted` ist synchron (`void this.docs.removeAndClean(path)` als Fire-and-Forget), während `sync-engine.ts:onDocDeleted` async ist und `await`. Grund: das Plugin-API-Vertrag von `onFileDeleted` ist sync (Obsidian-Event-Handler), aber `onDocDeleted` läuft schon in einer async Broadcast-Queue. Der Fire-and-Forget-Pfad ist eine bewusste Lockerung — Worst Case ist eine verwaiste `.loro`-Datei, die beim nächsten Start von `cleanOrphans()` aufgeräumt wird.
+
+### 6. WASM-Build-Reproduzierbarkeit (Item 5)
+
+**Umgesetzt im Monorepo:**
+- `Cargo.toml`: `wasm-bindgen = "=0.2.114"` (exakt zum `Cargo.lock`-Eintrag)
+- Neue `scripts/build-wasm.sh` schreibt Artefakte direkt nach `../vaultcrdt-plugin/wasm/` — manuelles Kopieren entfällt
+- Neue `scripts/check-wasm-fresh.sh` baut WASM in ein TempDir und diff't gegen die committed Artefakte (CI-Guard gegen veraltete Plugin-WASMs)
+- `Justfile`: `just wasm` ruft jetzt `build-wasm.sh`; neues `just wasm-check`
+
+**Real-Life-Beobachtung 1 (negativ):** Der `vaultcrdt`-Workspace ist auf Disk **kaputt** — `Cargo.toml` referenziert `v2/server` als Workspace-Member, das Verzeichnis existiert aber nicht. `cargo check`/`cargo tree` schlagen sofort fehl. Das ist pre-existing, hat nichts mit dem Pin zu tun, blockiert aber lokales Smoke-Testing der Build-Skripte. Der Pin selbst ist nachweislich konsistent: `Cargo.lock` enthält bereits exakt `wasm-bindgen 0.2.114` — `cargo` würde beim ersten erfolgreichen Build die Pin-Constraint erfüllen, ohne Lock-Änderung. **Followup:** v2/server entweder anlegen oder aus Workspace-Members entfernen.
+
+**Real-Life-Beobachtung 2 (überraschend):** `/home/richard/projects/vaultcrdt` ist **nicht** ein eigenes Git-Repo, sondern lebt innerhalb eines Eltern-Repos `/home/richard/projects/`. Beim Commit musste ich `git add` mit expliziten Pfaden machen, weil `git status` aus dem Monorepo-Verzeichnis dutzende Geschwister-Projekte auflistete. Dokumentiert hier, damit zukünftige Sessions nicht in dieselbe Falle laufen.
+
+---
+
+## Status der Audit-Punkte nach Phase B
+
+| # | Audit-Item | Status |
+|---|-----------|--------|
+| 1 | Initial-Sync Hash | ✅ Phase A (db26525) |
+| 2 | State-Key Encoding | ✅ Phase A (db26525) |
+| 3 | Pfad-Policy | ✅ Phase A (db26525) |
+| 4 | Tombstone-Härtung | ✅ Phase B (124a2d7 + 3280be4) |
+| 5 | WASM-Build | ✅ Phase B (b18532c) |
+| 6 | Auth-Härtung | ✅ Phase B (124a2d7) |
+| 7 | Multi-Editor-Konsistenz | ⏸ aufgeschoben (UX-Polish) |
+| 8 | WS-Token-Logging | ⏸ aufgeschoben (Self-Hosted ausreichend) |
+
+**6 von 8 Audit-Punkten umgesetzt.** Die zwei verbleibenden sind bewusste Defer-Entscheidungen, kein technischer Schuldenrest.
+
+---
+
+## Was wir NICHT umgesetzt haben und warum
 
 ### Multi-Editor-Konsistenz
 
@@ -99,3 +156,17 @@ Der GPT-Audit arbeitet primär von der Dokumentation und Codestruktur her — gu
 Mein Ansatz: Code lesen, Hypothese bilden, gegen realen Code verifizieren, Fix schreiben, Tests laufen lassen. Beispiel: Der Audit sagt "State-Key-Kollision ist selten". Ich kann den konkreten `stateKey()`-Code zeigen und die Kollision mit zwei realen Pfaden demonstrieren.
 
 Beide Ansätze ergänzen sich gut. Der Audit liefert die richtige Vogelperspektive, die Code-Verifikation die konkreten Fixes.
+
+---
+
+## Lessons Learned aus Phase B
+
+1. **Lazy-Migration ist Single-User-Gold.** Für Multi-Tenant-Systeme zu fragil, aber bei einem User mit deterministischen Auth-Flows ist es die einfachste denkbare Migration.
+
+2. **Sticky Tombstones brauchen Plugin-Disziplin.** Der Server allein reicht nicht — wenn das Plugin nach einem Delete weiter pusht, sammelt es nur `DocTombstoned`-Warnungen. Der Plugin-Pfad muss aktiv aufhören zu pushen, sobald ein Delete bekannt wurde. Aktuell passiert das implizit, weil `DocumentManager` den Doc nach `removeAndClean()` nicht mehr kennt — beim nächsten `getOrLoad()` würde er ihn neu holen, was den `is_tombstoned`-Guard auf dem Server triggert. Sauber, aber sollte beobachtet werden.
+
+3. **Pre-existing Workspace-Bruch im Monorepo wurde erst beim Verifizieren entdeckt.** Lehre: bei Cross-Repo-Arbeit immer früh `cargo check` als Smoke-Test laufen lassen, nicht erst nach den Edits. Spart Zeit beim Differenzieren von "ich habe etwas kaputt gemacht" vs "es war schon kaputt".
+
+4. **Plan-Skizzen mit konkreten Zeilennummern (`handlers.rs:186`) waren extrem wertvoll.** Der Phase-B-Plan hat alle Edit-Stellen vorab lokalisiert, sodass die Implementierung praktisch mechanisch wurde. Das ist die beste Form von Pair-Programming zwischen Plan- und Execute-Phase.
+
+5. **Server-seitige Pfadvalidierung haben wir bewusst weggelassen** (siehe Real-Life-Beobachtung 2 zu Item 4). Audit-Empfehlungen sind keine Pflichtprogramme — sie sind Vorschläge, die im Licht der konkreten Architektur nochmal gewogen werden müssen.
