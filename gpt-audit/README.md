@@ -1,22 +1,32 @@
-# GPT Audit
+# gpt-audit/
 
-## Vorhandene Dateien
+External audits of the VaultCRDT codebase, one cycle per dated archive directory.
 
-- `audit-2026-04-06.md` — vollständiger Audit-Bericht für Plugin + Server
-- `00-change-roadmap.md` — empfohlene Reihenfolge der Verbesserungen
-- `01-proposal-initial-sync-consistency.md` — Vorschlag für robusteren Initial-Sync
-- `02-proposal-path-and-file-policy.md` — Vorschlag für klare Pfad-/Dateityp-Regeln
-- `03-proposal-delete-tombstone-model.md` — Vorschlag für stabilere Delete-Semantik
-- `04-proposal-wasm-source-artifact-sync.md` — Vorschlag für saubere WASM-Quelle/Artefakt-Kette
-- `05-proposal-auth-and-secret-hardening.md` — Vorschlag für härtere Auth-/Secret-Behandlung
-- `06-proposal-state-key-encoding.md` — Vorschlag für kollisionsfreies State-Key-Encoding
-- `07-proposal-multi-editor-consistency.md` — Vorschlag für konsistente Split-/Multi-Editor-Updates
-- `08-proposal-websocket-token-and-logging.md` — Vorschlag für härteres WS-Token-/Logging-Modell
-- `09-decision-matrix.md` — kompakte Priorisierung: privat / GitHub / Community
-- `10-minimal-safe-private-release.md` — kleinster sinnvoller Stand für privaten Einsatz
-- `11-public-release-checklist.md` — praktische Checkliste für GitHub / Community-Release
-- `12-risk-register.md` — Risiken mit Wahrscheinlichkeit, Auswirkung und Gegenmaßnahmen
+## Layout
 
-## Hinweis
+```
+gpt-audit/
+├── README.md                    ← you are here
+├── previous-cycles.md           ← rolling status summary across all past audits
+└── archive-<date>/              ← one directory per completed audit cycle
+    ├── audit-*.md               ← the raw audit as received
+    ├── NN-proposal-*.md         ← expanded per-finding proposals
+    ├── 09-decision-matrix.md    ← priority / stage matrix
+    ├── claude-response.md       ← Claude's implementation notes + real-life observations
+    └── ...                      ← supporting docs (roadmap, risk register, release checklists)
+```
 
-Diese Dateien enthalten **nur Vorschläge und Abwägungen**, keine umgesetzten Code-Änderungen.
+## Workflow for a new audit cycle
+
+1. **Seed an empty cycle directory** when a fresh audit arrives:
+   `mkdir gpt-audit/archive-<YYYY-MM-DD>/`
+2. Drop the raw audit into it (`audit-<YYYY-MM-DD>.md`).
+3. Expand findings into per-item proposal files, priority matrix, roadmap as needed.
+4. Implement. Document what landed (and what was deliberately deferred) in `claude-response.md` inside the cycle directory.
+5. When the cycle is closed, append a 1-paragraph status line to `previous-cycles.md` at the top level and move on.
+
+Cycles never get rewritten after they close — they are historical record. New work lives in a new cycle directory.
+
+## Status
+
+- `archive-2026-04-06/` — first audit cycle, **closed**. 6/8 items implemented, 2 deliberately deferred. See `previous-cycles.md` for the one-paragraph summary.

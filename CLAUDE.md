@@ -60,26 +60,21 @@ The distinction `bun run test` vs `bun test` is load-bearing: `bun test` runs Bu
 ## Where to start each session
 
 1. **Read `next-session-handoff.md`** — it is the living session state
-2. **Read `gpt-audit/claude-response.md`** for the current audit status (Phase A + B done, 6/8 items resolved)
-3. **Read `gpt-audit/09-decision-matrix.md`** for the 8-item overview
+2. **Read `gpt-audit/previous-cycles.md`** for the status of past external audits
+3. For the full detail of a closed cycle, descend into `gpt-audit/archive-<date>/`
 
 ## gpt-audit/ layout
 
-Structured GPT-authored audit from 2026-04-06 with numbered proposals plus a Claude response documenting what was implemented:
+External audits are organised as one directory per cycle. The top level stays minimal so new audits can land on a clean slate:
 
 ```
 gpt-audit/
-├── audit-2026-04-06.md               ← original audit
-├── 00-change-roadmap.md              ← master plan
-├── 01..08-proposal-*.md              ← one file per audit finding
-├── 09-decision-matrix.md             ← 8-item status overview
-├── 10-minimal-safe-private-release.md
-├── 11-public-release-checklist.md
-├── 12-risk-register.md
-├── claude-response.md                ← Claude's Phase A + B implementation notes
-├── next-session-phase-b.md           ← Phase B plan (now historical)
-└── README.md
+├── README.md                 ← workflow for running a new cycle
+├── previous-cycles.md        ← rolling 1-paragraph summary per closed cycle
+└── archive-<YYYY-MM-DD>/     ← one directory per completed audit cycle
 ```
+
+The first cycle (`archive-2026-04-06/`) is closed: 6/8 items implemented, 2 deliberately deferred to a public-release session. See `previous-cycles.md` for the short form.
 
 ## Deploy
 
