@@ -1,62 +1,75 @@
-# Session Handoff — Phase B vorbereiten
+# Session Handoff — nach Phase B
 
-Datum: 2026-04-07  
-Letzter Commit: fcf8667 (v0.2.15)  
-Branch: main
-
----
+Datum: 2026-04-07
+Branch: main (alle drei Repos)
 
 ## Was diese Session gemacht hat
 
-GPT 5.4 hat einen umfassenden Audit in `gpt-audit/` geschrieben (8 Vorschläge). Claude Opus 4.6 hat die Top-3 umgesetzt:
+Phase B des GPT-Audits vollständig umgesetzt — Items 4, 5, 6. Vier Commits:
 
-1. **Initial-Sync Content-Hash-Check** — `sync-initial.ts`: VV-Skip prüft jetzt zusätzlich `fnv1aHash(diskContent)` gegen gecachten Hash. Externe Änderungen werden nicht mehr verschluckt.
-2. **State-Key Encoding** — `state-storage.ts`: `encodeURIComponent()` statt `__`-Separator. Keine Kollisionen mehr.
-3. **Zentrale Path-Policy** — Neue `path-policy.ts` mit `isSyncablePath()`. Angewendet in `main.ts` (5 Handler), `sync-engine.ts` (2 Remote-Handler), `sync-initial.ts` (Downloads + Tombstones).
+| Commit | Repo | Inhalt |
+|--------|------|--------|
+| `124a2d7` | vaultcrdt-server | Argon2id-Hashing + Lazy-Migration, generische Auth-Fehler, Tombstone-Guard (`is_tombstoned`), neuer `DocTombstoned`-ServerMsg, 90d Default-Retention via `VAULTCRDT_TOMBSTONE_DAYS` |
+| `3280be4` | vaultcrdt-plugin | `removeAndClean()` statt `remove()` in Delete-Pfaden, neuer `case 'doc_tombstoned'` |
+| `b18532c` | parent (`/home/richard/projects`) | `wasm-bindgen = "=0.2.114"` Pin im Monorepo, `scripts/build-wasm.sh`, `scripts/check-wasm-fresh.sh`, Justfile-Update |
+| `a2bc6f3` | vaultcrdt-plugin | `gpt-audit/claude-response.md` mit Phase-B-Notizen + Lessons Learned |
 
-**Status: alles implementiert, 129 Tests grün, Build sauber. Noch NICHT committed.**
+**Tests:** Server 35/35, Plugin 129/129. Plugin-Build sauber.
 
-### Untracked neue Dateien
-- `src/path-policy.ts`
-- `src/__tests__/path-policy.test.ts`
-- `gpt-audit/` (kompletter Audit-Ordner)
+**6 von 8 Audit-Punkten umgesetzt.** Verbleibend: Multi-Editor-Konsistenz (#7) und WS-Token-Logging (#8) — beide bewusst aufgeschoben.
 
----
+## Status der Audit-Roadmap
 
-## Nächste Session: Phase B (Items 4, 5, 6)
+Siehe `gpt-audit/claude-response.md` (vollständig aktualisiert) und `gpt-audit/09-decision-matrix.md`.
 
-Detaillierter Plan mit Ist-Zustand, Designentscheidungen und Implementierungsschritten: **`gpt-audit/next-session-phase-b.md`**
+## Offene Followups
 
-### Kurzfassung
+### 1. Monorepo-Workspace reparieren (Blocker für `cargo check`)
 
-| # | Was | Repo | Aufwand | Kern |
-|---|-----|------|---------|------|
-| 6 | Auth-/Secret-Härtung | vaultcrdt-server | ~45 min | Argon2id statt Klartext, Lazy Migration, generische Fehlermeldungen |
-| 4 | Tombstone-Härtung | Server + Plugin | ~60-90 min | 90 Tage Retention, Anti-Resurrection-Guard, `.loro`-Cleanup |
-| 5 | WASM-Build-Reproduzierbarkeit | vaultcrdt (Monorepo) | ~30 min | Build-Script, Version-Pinning, Freshness-Check |
+`/home/richard/projects/vaultcrdt/Cargo.toml` listet `v2/server` als Workspace-Member, das Verzeichnis existiert aber nicht. `cargo check --workspace` schlägt sofort fehl. Pre-existing, nicht durch Phase B verursacht.
 
-### Empfohlener Ablauf
+**Optionen:**
+- `v2/server`-Eintrag aus `[workspace] members` entfernen (wenn die v2-Linie tot ist)
+- `v2/server/Cargo.toml` neu anlegen (wenn sie wiederbelebt werden soll)
 
-1. **Zuerst committen** was von Phase A noch offen ist (diese Session)
-2. Items 5 + 6 können **parallel** bearbeitet werden (verschiedene Repos, null Überlappung)
-3. Item 4 danach — einziges Cross-Repo-Item (Server zuerst, dann Plugin)
+**Konsequenz:** Erst nach Fix kann `just wasm-check` lokal validieren, dass die committed Plugin-WASMs frisch sind.
 
----
+### 2. WASM-Build-Skripte einmal real laufen lassen
+
+`scripts/build-wasm.sh` und `scripts/check-wasm-fresh.sh` sind geschrieben, aber wegen #1 nie ausgeführt. Sobald der Workspace baut: `just wasm` einmal aufrufen, prüfen ob die Output-Pfade stimmen, Diff zu den committed Artefakten ansehen.
+
+### 3. Lazy-Auth-Migration im Real-Betrieb beobachten
+
+Beim ersten Login eines existierenden Vaults nach Server-Update wird der Klartext-API-Key automatisch zu Argon2id-PHC upgegradet. Empfehlung: einmal im Server-Log nach dem ersten Verify nachschauen, dass der `UPDATE vaults SET api_key` durchläuft und nachfolgende Verifies den `$argon2id$`-Pfad nehmen.
+
+### 4. Plugin-Verhalten nach Delete prüfen
+
+Nach einem lokalen Delete sollte das Plugin nicht mehr für denselben Pfad pushen. Aktuell passiert das implizit (`DocumentManager` kennt den Doc nach `removeAndClean()` nicht mehr). Wenn etwas doch erneut pusht, antwortet der Server jetzt mit `DocTombstoned` und das Plugin loggt eine Warnung — beides im Console-Log sichtbar machen, falls auffällig.
+
+### 5. Aufgeschobene Items (#7, #8)
+
+- **#7 Multi-Editor-Konsistenz** — UX-Polish, kein Korrektheitsproblem
+- **#8 WS-Token-Logging** — Self-Hosted ausreichend, Ticket-Modell wäre nice-to-have
+
+Beide würde ich erst angehen, wenn ein Public Release konkret wird.
 
 ## Wichtige Kontextinfos
 
-- **Einziger User** — kein Backwards-Compat-Zwang, Resets jederzeit möglich
-- **Android mtime unzuverlässig** — nie für Caching/Skip-Logik verwenden
-- **Server-Repo**: `/home/richard/projects/vaultcrdt-server`
-- **Monorepo (WASM)**: `/home/richard/projects/vaultcrdt`
-- **wasm-bindgen im Lock**: 0.2.114 (Cargo.toml sagt nur `"0.2"`, soll auf `"=0.2.114"` gepinnt werden)
-- **Tombstone-Expiry im Server**: aktuell 7 Tage (`main.rs:22`), soll auf 90
-- **Anti-Resurrection-Lücke**: `handlers.rs` ruft `remove_tombstone()` in `sync_push` (Z.186) und `doc_create` (Z.235) auf — jeder Push löscht den Tombstone
+- **Einziger User**, kein Backwards-Compat-Zwang
+- **Android-mtime unzuverlässig** — niemals für Caching/Skip-Logik
+- **`/home/richard/projects/vaultcrdt`** lebt **inside** des Eltern-Git-Repos `/home/richard/projects/` — Commits dort mit explizit gestageten Pfaden machen, sonst zeigt `git status` dutzende Geschwister-Projekte
+- **Server-Repo:** `/home/richard/projects/vaultcrdt-server` (eigenes Repo)
+- **Plugin-Repo:** `/home/richard/projects/vaultcrdt-plugin` (eigenes Repo)
+- **Monorepo:** `/home/richard/projects/vaultcrdt` (Subdir im Parent-Repo)
 
----
+## Deploy-Hinweise für Phase-B-Änderungen
+
+- **Server:** `VAULTCRDT_TOMBSTONE_DAYS=90` ist Default, kein Setzen nötig wenn 90 ok ist. Argon2-Migration läuft automatisch bei nächstem Login.
+- **Plugin:** `main.js` im Commit `3280be4` enthalten. Standard-Deploy-Pfad (Plugin-Kopie an die 4 bekannten Orte).
+- **Monorepo:** Commit `b18532c` lebt im Parent-Repo, nicht im `vaultcrdt`-Subdir.
 
 ## Dateien zum Lesen als Einstieg
 
-- `gpt-audit/next-session-phase-b.md` — vollständiger Plan mit Code-Skizzen
-- `gpt-audit/claude-response.md` — Bewertung des GPT-Audits, Gewichtungsunterschiede
-- `gpt-audit/09-decision-matrix.md` — Gesamtübersicht aller 8 Audit-Punkte
+- `gpt-audit/claude-response.md` — vollständige Bewertung + Phase-A/B-Status + Lessons Learned
+- `gpt-audit/09-decision-matrix.md` — Übersicht aller 8 Audit-Punkte
+- `gpt-audit/next-session-phase-b.md` — Plan, der diese Session umgesetzt hat (jetzt historisch)
