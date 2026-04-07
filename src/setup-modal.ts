@@ -167,14 +167,7 @@ export class SetupModal extends Modal {
       // requestUrl throws on non-2xx status codes — extract status from error
       const status = (e as { status?: number })?.status;
       if (status === 401) {
-        const msg = String((e as { message?: string })?.message ?? '');
-        if (msg.includes('Invalid API key')) {
-          this.showError('Wrong password for this vault. Check with your server admin.');
-        } else if (msg.includes('Invalid admin token')) {
-          this.showError('This vault does not exist on the server. Ask your server admin to create it.');
-        } else {
-          this.showError('Authentication failed. Check vault name and password.');
-        }
+        this.showError('Authentication failed. Check vault name and password.');
       } else if (status) {
         this.showError(`Server returned status ${status}. Check the server URL.`);
       } else {

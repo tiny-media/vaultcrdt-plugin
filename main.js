@@ -3950,7 +3950,7 @@ var SetupModal = class extends import_obsidian5.Modal {
     this.errorEl.style.display = "none";
   }
   async submit(btn) {
-    var _a, _b, _c;
+    var _a, _b;
     this.hideError();
     if (!this.serverUrl) {
       this.showError("Server URL is required");
@@ -3996,14 +3996,7 @@ var SetupModal = class extends import_obsidian5.Modal {
     } catch (e) {
       const status = e == null ? void 0 : e.status;
       if (status === 401) {
-        const msg = String((_c = e == null ? void 0 : e.message) != null ? _c : "");
-        if (msg.includes("Invalid API key")) {
-          this.showError("Wrong password for this vault. Check with your server admin.");
-        } else if (msg.includes("Invalid admin token")) {
-          this.showError("This vault does not exist on the server. Ask your server admin to create it.");
-        } else {
-          this.showError("Authentication failed. Check vault name and password.");
-        }
+        this.showError("Authentication failed. Check vault name and password.");
       } else if (status) {
         this.showError(`Server returned status ${status}. Check the server URL.`);
       } else {
