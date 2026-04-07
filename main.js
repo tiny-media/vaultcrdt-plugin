@@ -2853,7 +2853,7 @@ var PushHandler = class {
     this.pushFileDelta(path, content);
   }
   onFileDeleted(path) {
-    this.docs.remove(path);
+    void this.docs.removeAndClean(path);
     this.lastServerVV.delete(path);
     if (this.isWsOpen()) {
       this.send({ type: "doc_delete", doc_uuid: path, peer_id: this.settings.peerId });
@@ -3513,6 +3513,9 @@ var SyncEngine = class {
           void this.onDocDeleted(msg.doc_uuid);
         }
         break;
+      case "doc_tombstoned":
+        warn(`${this.tag} doc is tombstoned on server \u2014 push refused`, { doc: msg.doc_uuid });
+        break;
       case "ack":
         this.setStatus("connected");
         break;
@@ -3629,7 +3632,7 @@ var SyncEngine = class {
       warn(`${this.tag} rejected delete for invalid path`, { docUuid });
       return;
     }
-    this.docs.remove(docUuid);
+    await this.docs.removeAndClean(docUuid);
     this.lastServerVV.delete(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
     if (f instanceof import_obsidian4.TFile) {

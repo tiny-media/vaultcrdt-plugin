@@ -280,6 +280,10 @@ export class SyncEngine {
         }
         break;
 
+      case 'doc_tombstoned':
+        warn(`${this.tag} doc is tombstoned on server — push refused`, { doc: msg.doc_uuid });
+        break;
+
       case 'ack':
         this.setStatus('connected');
         break;
@@ -413,7 +417,7 @@ export class SyncEngine {
       warn(`${this.tag} rejected delete for invalid path`, { docUuid });
       return;
     }
-    this.docs.remove(docUuid);
+    await this.docs.removeAndClean(docUuid);
     this.lastServerVV.delete(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
     if (f instanceof TFile) {

@@ -40,7 +40,7 @@ export class PushHandler {
   }
 
   onFileDeleted(path: string): void {
-    this.docs.remove(path);
+    void this.docs.removeAndClean(path);
     this.lastServerVV.delete(path);
     if (this.isWsOpen()) {
       this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId });
