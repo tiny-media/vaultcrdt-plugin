@@ -57,17 +57,23 @@ export async function runInitialSync(
     localFileMap.set(file.path, file);
   }
 
-  // Offline deletes recorded in the persistent journal MUST be flushed to
-  // the server before we download server-only docs — otherwise the server
-  // would still list the doc in requestDocList and we would redownload it
-  // locally, undoing the delete. We also drop any server/overlap entries
-  // that are still in the pending-delete set (covers same-session races).
+  // Snapshot the delete-journal BEFORE any reconcile — downstream filtering
+  // uses this stable snapshot so that even if reconcilePendingDeletes() clears
+  // an entry, we still don't re-download the path in this same run.
+  //
+  // Then resend all pending deletes (idempotent; reconcile-based semantics:
+  // the journal is an intent list and only shrinks once the server's
+  // doc_list view has confirmed the outcome — see reconcilePendingDeletes()).
+  // WS FIFO per connection guarantees the server processes the resends
+  // before answering the subsequent request_doc_list.
   const pendingDeleteSet = new Set(push.pendingDeletePaths());
-  push.flushPendingDeletes();
+  push.resendPendingDeletes();
 
   const { docs: serverDocs, tombstones } = await deps.requestDocList();
   const tombstoneSet = new Set(tombstones);
   const localPathSet = new Set(localFileMap.keys());
+  const serverUuidSet = new Set(serverDocs.map((d) => d.doc_uuid));
+  push.reconcilePendingDeletes(tombstoneSet, serverUuidSet);
 
   // Decode server VVs from binary to JSON strings for comparison
   const serverVVStrings = new Map<string, string>();

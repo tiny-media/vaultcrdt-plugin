@@ -437,6 +437,175 @@ describe('SyncEngine — edge cases (S34)', () => {
     expect(syncStartCalls.length).toBe(0);
   });
 
+  // ── delete-ack hardening: online delete keeps journal entry until reconcile
+
+  it('online delete keeps journal entry until reconcile (WS open)', async () => {
+    await engine.start();
+    mockWsInstance.readyState = 1; // OPEN
+
+    engine.onFileDeleted('online-del.md');
+    await flush();
+
+    // doc_delete sent immediately
+    const deleteCalls = mockEncode.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'online-del.md'
+    );
+    expect(deleteCalls.length).toBe(1);
+
+    // Journal still contains the path (persisted to disk)
+    const journalWrites = mockAdapter.write.mock.calls.filter(
+      (c: any[]) => typeof c[0] === 'string' && c[0].endsWith('delete-journal.json'),
+    );
+    expect(journalWrites.length).toBeGreaterThanOrEqual(1);
+    const lastPayload = journalWrites[journalWrites.length - 1][1];
+    expect(lastPayload).toContain('online-del.md');
+  });
+
+  // ── delete-ack hardening: resend before request_doc_list on reconnect ──────
+
+  it('reconnect resends pending deletes BEFORE request_doc_list', async () => {
+    mockAdapter.exists.mockImplementation(async (p: string) =>
+      p.endsWith('delete-journal.json'),
+    );
+    mockAdapter.read.mockImplementation(async (p: string) => {
+      if (p.endsWith('delete-journal.json')) {
+        return JSON.stringify({ _version: 1, paths: ['resent.md'] });
+      }
+      return '';
+    });
+
+    engine = new SyncEngine(makeApp(), makeSettings());
+    await engine.start();
+
+    mockVault.getMarkdownFiles.mockReturnValue([]);
+    const syncPromise = engine.initialSync();
+    await flush();
+
+    // Capture index of doc_delete vs request_doc_list in the encode call log
+    const sentTypes = mockEncode.mock.calls.map((c: any[]) => c[0]?.type);
+    const deleteIdx = sentTypes.indexOf('doc_delete');
+    const listIdx = sentTypes.indexOf('request_doc_list');
+    expect(deleteIdx).toBeGreaterThanOrEqual(0);
+    expect(listIdx).toBeGreaterThanOrEqual(0);
+    expect(deleteIdx).toBeLessThan(listIdx);
+
+    fireMessage({ type: 'doc_list', docs: [], tombstones: ['resent.md'] });
+    await syncPromise;
+  });
+
+  // ── delete-ack hardening: tombstone → clear ────────────────────────────────
+
+  it('reconcile clears journal entry when path is tombstoned on server', async () => {
+    mockAdapter.exists.mockImplementation(async (p: string) =>
+      p.endsWith('delete-journal.json'),
+    );
+    mockAdapter.read.mockImplementation(async (p: string) => {
+      if (p.endsWith('delete-journal.json')) {
+        return JSON.stringify({ _version: 1, paths: ['tombs.md'] });
+      }
+      return '';
+    });
+
+    engine = new SyncEngine(makeApp(), makeSettings());
+    await engine.start();
+
+    mockAdapter.write.mockClear();
+    mockVault.getMarkdownFiles.mockReturnValue([]);
+    const syncPromise = engine.initialSync();
+    await flush();
+    fireMessage({ type: 'doc_list', docs: [], tombstones: ['tombs.md'] });
+    await syncPromise;
+
+    // Journal persisted empty after reconcile
+    const journalWrites = mockAdapter.write.mock.calls.filter(
+      (c: any[]) => typeof c[0] === 'string' && c[0].endsWith('delete-journal.json'),
+    );
+    expect(journalWrites.length).toBeGreaterThanOrEqual(1);
+    const lastPayload = journalWrites[journalWrites.length - 1][1];
+    expect(lastPayload).not.toContain('tombs.md');
+  });
+
+  // ── delete-ack hardening: active on server → stays pending, not downloaded
+
+  it('reconcile keeps journal entry and does not redownload when path still active', async () => {
+    mockAdapter.exists.mockImplementation(async (p: string) =>
+      p.endsWith('delete-journal.json'),
+    );
+    mockAdapter.read.mockImplementation(async (p: string) => {
+      if (p.endsWith('delete-journal.json')) {
+        return JSON.stringify({ _version: 1, paths: ['active.md'] });
+      }
+      return '';
+    });
+
+    engine = new SyncEngine(makeApp(), makeSettings());
+    await engine.start();
+
+    mockAdapter.write.mockClear();
+    mockVault.getMarkdownFiles.mockReturnValue([]);
+    const syncPromise = engine.initialSync();
+    await flush();
+    fireMessage({
+      type: 'doc_list',
+      docs: [{ doc_uuid: 'active.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' }],
+      tombstones: [],
+    });
+    await syncPromise;
+
+    // Resend happened
+    const deleteCalls = mockEncode.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'active.md',
+    );
+    expect(deleteCalls.length).toBe(1);
+
+    // Path was NOT redownloaded (pendingDeleteSnapshot filter)
+    const syncStartCalls = mockEncode.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'active.md',
+    );
+    expect(syncStartCalls.length).toBe(0);
+
+    // Journal persisted still containing the path
+    const journalWrites = mockAdapter.write.mock.calls.filter(
+      (c: any[]) => typeof c[0] === 'string' && c[0].endsWith('delete-journal.json'),
+    );
+    expect(journalWrites.length).toBeGreaterThanOrEqual(1);
+    const lastPayload = journalWrites[journalWrites.length - 1][1];
+    expect(lastPayload).toContain('active.md');
+  });
+
+  // ── delete-ack hardening: neither branch (tombstone-GC / unknown path) ─────
+
+  it('reconcile clears journal entry when path is neither tombstoned nor active', async () => {
+    // Real case: server tombstone-expiry (default 90 days) has already GC'd
+    // the tombstone, or the path never existed server-side at all.
+    mockAdapter.exists.mockImplementation(async (p: string) =>
+      p.endsWith('delete-journal.json'),
+    );
+    mockAdapter.read.mockImplementation(async (p: string) => {
+      if (p.endsWith('delete-journal.json')) {
+        return JSON.stringify({ _version: 1, paths: ['gc.md'] });
+      }
+      return '';
+    });
+
+    engine = new SyncEngine(makeApp(), makeSettings());
+    await engine.start();
+
+    mockAdapter.write.mockClear();
+    mockVault.getMarkdownFiles.mockReturnValue([]);
+    const syncPromise = engine.initialSync();
+    await flush();
+    fireMessage({ type: 'doc_list', docs: [], tombstones: [] });
+    await syncPromise;
+
+    const journalWrites = mockAdapter.write.mock.calls.filter(
+      (c: any[]) => typeof c[0] === 'string' && c[0].endsWith('delete-journal.json'),
+    );
+    expect(journalWrites.length).toBeGreaterThanOrEqual(1);
+    const lastPayload = journalWrites[journalWrites.length - 1][1];
+    expect(lastPayload).not.toContain('gc.md');
+  });
+
   // ── disjoint VV conflict after offline edit on both sides ─────────────────
 
   it('disjoint VV conflict after offline edit on both sides', async () => {

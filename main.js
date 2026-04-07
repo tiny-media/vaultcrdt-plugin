@@ -2956,7 +2956,6 @@ var PushHandler = class {
     this.pendingDeletes.add(path);
     if (this.isWsOpen()) {
       this.send({ type: "doc_delete", doc_uuid: path, peer_id: this.settings.peerId });
-      this.pendingDeletes.delete(path);
     }
     void this.persistJournal();
   }
@@ -3027,17 +3026,62 @@ var PushHandler = class {
     }
   }
   /**
-   * Flush queued offline deletes synchronously (keeps the WS FIFO in order
-   * with whatever the caller sends next). Journal persistence runs in the
-   * background.
+   * Resend all pending-delete entries as `doc_delete` messages. Idempotent
+   * on the server side (tombstone upsert + delete no-op). Does NOT modify
+   * the journal — clearing happens only via reconcilePendingDeletes() after
+   * request_doc_list has confirmed the outcome.
    */
-  flushPendingDeletes() {
+  resendPendingDeletes() {
     if (this.pendingDeletes.size === 0) return;
     for (const path of this.pendingDeletes) {
-      log(`${this.tag} flushing offline delete`, { path });
+      log(`${this.tag} resending pending delete`, { path });
       this.send({ type: "doc_delete", doc_uuid: path, peer_id: this.settings.peerId });
     }
-    this.pendingDeletes.clear();
+  }
+  /**
+   * Reconcile the delete journal against the server's current doc_list view.
+   *
+   * - tombstoneSet: paths the server reports as tombstoned → confirmed delete,
+   *   remove from journal.
+   * - activeSet: paths the server still lists as live → our delete has not
+   *   (yet) landed; keep the entry so the next reconnect resends it. Logged
+   *   at warn level because within one connection, WS FIFO guarantees the
+   *   server saw our resend before producing the doc_list response, so a
+   *   still-active path is unexpected.
+   * - neither: path gone entirely. Valid real case because the server runs
+   *   a periodic tombstone-expiry task (default 90 days, see
+   *   vaultcrdt-server/src/main.rs). Also catches "path never existed
+   *   server-side". Safe to clear.
+   *
+   * Builds a new Set instead of mutating during iteration.
+   */
+  reconcilePendingDeletes(tombstoneSet, activeSet) {
+    if (this.pendingDeletes.size === 0) return;
+    const nextPending = /* @__PURE__ */ new Set();
+    const confirmed = [];
+    const stillPending = [];
+    const unknown = [];
+    for (const path of this.pendingDeletes) {
+      if (tombstoneSet.has(path)) {
+        confirmed.push(path);
+      } else if (activeSet.has(path)) {
+        stillPending.push(path);
+        nextPending.add(path);
+      } else {
+        unknown.push(path);
+      }
+    }
+    this.pendingDeletes = nextPending;
+    log(`${this.tag} delete reconcile`, {
+      confirmed: confirmed.length,
+      stillPending: stillPending.length,
+      unknown: unknown.length
+    });
+    if (stillPending.length > 0) {
+      warn(`${this.tag} deletes not yet landed on server \u2014 will retry on next reconnect`, {
+        paths: stillPending
+      });
+    }
     void this.persistJournal();
   }
   stopAllTimers() {
@@ -3111,10 +3155,12 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     localFileMap.set(file.path, file);
   }
   const pendingDeleteSet = new Set(push.pendingDeletePaths());
-  push.flushPendingDeletes();
+  push.resendPendingDeletes();
   const { docs: serverDocs, tombstones } = await deps.requestDocList();
   const tombstoneSet = new Set(tombstones);
   const localPathSet = new Set(localFileMap.keys());
+  const serverUuidSet = new Set(serverDocs.map((d) => d.doc_uuid));
+  push.reconcilePendingDeletes(tombstoneSet, serverUuidSet);
   const serverVVStrings = /* @__PURE__ */ new Map();
   const serverDocMap = /* @__PURE__ */ new Map();
   for (const d of serverDocs) {
