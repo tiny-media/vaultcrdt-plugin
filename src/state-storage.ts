@@ -117,6 +117,7 @@ export class StateStorage {
 
     for (const key of allKeys) {
       if (key === 'vv-cache.json') continue;
+      if (key === 'delete-journal.json') continue;
       if (validKeys.has(key)) continue;
       try {
         await adapter.remove(`${STATE_DIR}/${key}`);
@@ -173,6 +174,42 @@ export class StateStorage {
       return result;
     } catch {
       return null;
+    }
+  }
+
+  // ── Delete Journal ────────────────────────────────────────────────────────
+
+  private deleteJournalPath = `${STATE_DIR}/delete-journal.json`;
+
+  /**
+   * Persist the set of paths that have an outstanding (unsent or unacknowledged)
+   * delete intent. Survives plugin restart so offline deletes cannot be lost.
+   */
+  async saveDeleteJournal(paths: string[]): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    if (!this.dirEnsured) {
+      const dirExists = await adapter.exists(STATE_DIR);
+      if (!dirExists) await adapter.mkdir(STATE_DIR);
+      this.dirEnsured = true;
+    }
+    await adapter.write(
+      this.deleteJournalPath,
+      JSON.stringify({ _version: 1, paths }),
+    );
+  }
+
+  /** Load the offline delete journal. Returns [] if the file doesn't exist. */
+  async loadDeleteJournal(): Promise<string[]> {
+    const adapter = this.app.vault.adapter;
+    try {
+      const exists = await adapter.exists(this.deleteJournalPath);
+      if (!exists) return [];
+      const raw = await adapter.read(this.deleteJournalPath);
+      const obj = JSON.parse(raw) as { paths?: unknown };
+      if (!Array.isArray(obj.paths)) return [];
+      return obj.paths.filter((p): p is string => typeof p === 'string');
+    } catch {
+      return [];
     }
   }
 

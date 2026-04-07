@@ -45,12 +45,25 @@ export async function runInitialSync(
   const t0 = performance.now();
   const { app, docs, editor, push, lastServerVV, lastRemoteWrite, writingFromRemote, tag } = deps;
 
-  // Build local file index (metadata only — no content reads yet)
-  const localFiles = app.vault.getMarkdownFiles() as TFile[];
+  // Build local file index (metadata only — no content reads yet).
+  // Filter by isSyncablePath() at the source so every downstream stage
+  // (overlapping, local-only, rename, create) inherits the policy instead
+  // of re-checking it and occasionally forgetting.
+  const localFiles = (app.vault.getMarkdownFiles() as TFile[]).filter((f) =>
+    isSyncablePath(f.path),
+  );
   const localFileMap = new Map<string, TFile>();
   for (const file of localFiles) {
     localFileMap.set(file.path, file);
   }
+
+  // Offline deletes recorded in the persistent journal MUST be flushed to
+  // the server before we download server-only docs — otherwise the server
+  // would still list the doc in requestDocList and we would redownload it
+  // locally, undoing the delete. We also drop any server/overlap entries
+  // that are still in the pending-delete set (covers same-session races).
+  const pendingDeleteSet = new Set(push.pendingDeletePaths());
+  push.flushPendingDeletes();
 
   const { docs: serverDocs, tombstones } = await deps.requestDocList();
   const tombstoneSet = new Set(tombstones);
@@ -76,15 +89,28 @@ export async function runInitialSync(
     hasCachedVVs: cachedVVs !== null,
   });
 
-  // 1. Server-only docs — request delta (no local VV)
+  // 1. Server-only docs — request delta (no local VV).
+  // isSyncablePath() filters untrusted server entries (`.obsidian/*`, etc).
+  // pendingDeleteSet prevents resurrection of locally-deleted paths even if
+  // the server hasn't yet processed our just-flushed delete message.
   const serverOnlyUuids = [...serverDocMap.keys()].filter(
-    (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid) && isSyncablePath(uuid)
+    (uuid) =>
+      !tombstoneSet.has(uuid) &&
+      !localPathSet.has(uuid) &&
+      !pendingDeleteSet.has(uuid) &&
+      isSyncablePath(uuid),
   );
   const overlappingFiles = localFiles.filter(
-    (f) => !tombstoneSet.has(f.path) && serverDocMap.has(f.path)
+    (f) =>
+      !tombstoneSet.has(f.path) &&
+      !pendingDeleteSet.has(f.path) &&
+      serverDocMap.has(f.path),
   );
   const localOnlyFiles = localFiles.filter(
-    (f) => !tombstoneSet.has(f.path) && !serverDocMap.has(f.path)
+    (f) =>
+      !tombstoneSet.has(f.path) &&
+      !pendingDeleteSet.has(f.path) &&
+      !serverDocMap.has(f.path),
   );
   const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
   let stepsDone = 0;
@@ -222,8 +248,7 @@ export async function runInitialSync(
     onProgress?.(stepsDone, totalSteps, changed);
   }
 
-  // 4. Flush queued offline deletes
-  push.flushPendingDeletes();
+  // 4. Offline deletes were already flushed above, before any downloads.
 
   // 5. Tombstones — trash local files (skip if server also has the doc — create-after-delete)
   for (const uuid of tombstoneSet) {

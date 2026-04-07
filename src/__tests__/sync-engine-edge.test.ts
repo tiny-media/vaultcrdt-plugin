@@ -377,6 +377,66 @@ describe('SyncEngine — edge cases (S34)', () => {
     expect(deleteCallsAfter.length).toBe(0);
   });
 
+  // ── offline delete persists to journal file on disk ────────────────────────
+
+  it('offline delete writes path to the delete-journal file', async () => {
+    await engine.start();
+    mockWsInstance.readyState = 3; // offline
+
+    engine.onFileDeleted('notes/x.md');
+    await flush();
+
+    const journalWrites = mockAdapter.write.mock.calls.filter(
+      (c: any[]) => typeof c[0] === 'string' && c[0].endsWith('delete-journal.json'),
+    );
+    expect(journalWrites.length).toBeGreaterThanOrEqual(1);
+    const lastPayload = journalWrites[journalWrites.length - 1][1];
+    expect(lastPayload).toContain('notes/x.md');
+  });
+
+  // ── journal-flagged paths are NOT redownloaded as server-only on reconnect ─
+
+  it('server-only download skips paths present in the delete journal', async () => {
+    // Preload the journal file so the fresh engine picks it up in start().
+    mockAdapter.exists.mockImplementation(async (p: string) =>
+      p.endsWith('delete-journal.json'),
+    );
+    mockAdapter.read.mockImplementation(async (p: string) => {
+      if (p.endsWith('delete-journal.json')) {
+        return JSON.stringify({ _version: 1, paths: ['ghost.md'] });
+      }
+      return '';
+    });
+
+    // Rebuild engine so start() picks up the preloaded journal.
+    engine = new SyncEngine(makeApp(), makeSettings());
+    await engine.start();
+
+    mockVault.getMarkdownFiles.mockReturnValue([]);
+    const syncPromise = engine.initialSync();
+    await flush();
+
+    fireMessage({
+      type: 'doc_list',
+      docs: [{ doc_uuid: 'ghost.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' }],
+      tombstones: [],
+    });
+    await syncPromise;
+
+    // The flush already sent a doc_delete for ghost.md before requestDocList.
+    const deleteCalls = mockEncode.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'ghost.md',
+    );
+    expect(deleteCalls.length).toBe(1);
+
+    // Critically: sync_start for the ghost path must NOT have been issued,
+    // because the pending-delete filter excluded it from serverOnlyUuids.
+    const syncStartCalls = mockEncode.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'ghost.md',
+    );
+    expect(syncStartCalls.length).toBe(0);
+  });
+
   // ── disjoint VV conflict after offline edit on both sides ─────────────────
 
   it('disjoint VV conflict after offline edit on both sides', async () => {

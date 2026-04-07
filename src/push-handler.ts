@@ -42,16 +42,51 @@ export class PushHandler {
   onFileDeleted(path: string): void {
     void this.docs.removeAndClean(path);
     this.lastServerVV.delete(path);
+    // Add to the in-memory journal *synchronously* — the disk write is
+    // fire-and-forget so callers (and tests) see the send happen on the
+    // same tick. If the WS is open we also remove the path right after
+    // send succeeded. Either way the final persistJournal() reflects the
+    // resulting in-memory state.
+    this.pendingDeletes.add(path);
     if (this.isWsOpen()) {
       this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId });
-    } else {
-      this.pendingDeletes.add(path);
+      this.pendingDeletes.delete(path);
     }
+    void this.persistJournal();
   }
 
   onFileRenamed(oldPath: string, newPath: string, content: string): void {
     this.onFileDeleted(oldPath);
     this.pushFileDelta(newPath, content);
+  }
+
+  /** Standalone delete for the unsyncable-transition case in main.ts. */
+  deleteOnly(path: string): void {
+    this.onFileDeleted(path);
+  }
+
+  /** True if `path` has an outstanding offline/unacknowledged delete. */
+  hasPendingDelete(path: string): boolean {
+    return this.pendingDeletes.has(path);
+  }
+
+  /** Snapshot of the pending delete set. */
+  pendingDeletePaths(): string[] {
+    return [...this.pendingDeletes];
+  }
+
+  /** Load the persistent delete journal into memory. Call during plugin start. */
+  async loadPendingDeletesFromJournal(): Promise<void> {
+    const paths = await this.docs.loadDeleteJournal();
+    for (const p of paths) this.pendingDeletes.add(p);
+  }
+
+  private async persistJournal(): Promise<void> {
+    try {
+      await this.docs.saveDeleteJournal([...this.pendingDeletes]);
+    } catch (err) {
+      warn(`${this.tag} delete journal persist failed`, { err });
+    }
   }
 
   /** Flush pending debounce edits into CRDT before merging broadcast. */
@@ -96,13 +131,19 @@ export class PushHandler {
     }
   }
 
-  /** Flush queued offline deletes. */
+  /**
+   * Flush queued offline deletes synchronously (keeps the WS FIFO in order
+   * with whatever the caller sends next). Journal persistence runs in the
+   * background.
+   */
   flushPendingDeletes(): void {
+    if (this.pendingDeletes.size === 0) return;
     for (const path of this.pendingDeletes) {
       log(`${this.tag} flushing offline delete`, { path });
       this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId });
     }
     this.pendingDeletes.clear();
+    void this.persistJournal();
   }
 
   stopAllTimers(): void {

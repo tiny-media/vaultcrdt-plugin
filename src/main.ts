@@ -69,12 +69,29 @@ export default class VaultCRDTPlugin extends Plugin {
       })
     );
 
-    // File rename — tombstone old path, push under new path
+    // File rename — four transitions depending on whether each side is
+    // syncable. Folders fire per-file rename events, so we only care about TFile.
+    //
+    //   old syncable | new syncable → rename (tombstone old, push new)
+    //   old syncable | new unsync   → deleteOnly(old) — file moved out of policy
+    //   old unsync   | new syncable → push new as a fresh file, do NOT emit
+    //                                  a spurious doc_delete for a path the
+    //                                  server has never seen
+    //   old unsync   | new unsync   → ignore
     this.registerEvent(
       this.app.vault.on('rename', async (file, oldPath) => {
-        if (file instanceof TFile && isSyncablePath(file.path)) {
+        if (!(file instanceof TFile)) return;
+        const oldSync = isSyncablePath(oldPath);
+        const newSync = isSyncablePath(file.path);
+        if (oldSync && newSync) {
           const content = await this.app.vault.read(file);
           this.syncEngine.onFileRenamed(oldPath, file.path, content);
+        } else if (oldSync && !newSync) {
+          this.syncEngine.onFileDeletedOnly(oldPath);
+        } else if (!oldSync && newSync) {
+          if (this.syncEngine.isWritingFromRemote(file.path)) return;
+          const content = await this.app.vault.read(file);
+          this.syncEngine.onFileChangedImmediate(file.path, content);
         }
       })
     );

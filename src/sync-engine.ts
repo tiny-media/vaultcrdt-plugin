@@ -9,6 +9,7 @@ import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn, error } from './logger';
 import { isSyncablePath } from './path-policy';
+import { validateServerUrl, toHttpBase, toWsBase } from './url-policy';
 import { runInitialSync, type SyncMode } from './sync-initial';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
@@ -82,6 +83,19 @@ export class SyncEngine {
 
   async start(): Promise<void> {
     this.stopped = false;
+    // Last line of defence: refuse to start if the saved server URL is not
+    // acceptable to the central policy (plain http/ws outside localhost/LAN,
+    // malformed, wrong scheme). This catches any bypass that may have slipped
+    // past SetupModal or SettingsTab.
+    const check = validateServerUrl(this.settings.serverUrl);
+    if (!check.ok) {
+      error(`${this.tag} refusing to start: ${check.reason}`);
+      throw new Error(`Invalid server URL: ${check.reason}`);
+    }
+    // Restore offline delete intents from the persistent journal before we
+    // reconnect, so initialSync can skip redownloading paths that were
+    // deleted while offline.
+    await this.push.loadPendingDeletesFromJournal();
     await this.auth();
     this.connect();
   }
@@ -105,9 +119,7 @@ export class SyncEngine {
   // ── Server communication ────────────────────────────────────────────────────
 
   private httpBase(): string {
-    return this.settings.serverUrl
-      .replace(/^ws:\/\//, 'http://')
-      .replace(/^wss:\/\//, 'https://');
+    return toHttpBase(this.settings.serverUrl);
   }
 
   private async auth(): Promise<void> {
@@ -124,11 +136,7 @@ export class SyncEngine {
   }
 
   private wsUrl(): string {
-    return (
-      this.settings.serverUrl
-        .replace(/^http:\/\//, 'ws://')
-        .replace(/^https:\/\//, 'wss://') + '/ws'
-    );
+    return toWsBase(this.settings.serverUrl) + '/ws';
   }
 
   private connect(): void {
@@ -446,6 +454,15 @@ export class SyncEngine {
 
   onFileRenamed(oldPath: string, newPath: string, content: string): void {
     this.push.onFileRenamed(oldPath, newPath, content);
+  }
+
+  /**
+   * Delete the old path only (used when a rename crosses the syncable-path
+   * boundary: syncable → unsyncable). The new path is outside the policy,
+   * so nothing is pushed for it.
+   */
+  onFileDeletedOnly(path: string): void {
+    this.push.deleteOnly(path);
   }
 
   // ── Guards ──────────────────────────────────────────────────────────────────

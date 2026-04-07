@@ -93,4 +93,12 @@ export class DocumentManager {
   async loadVVCache(): Promise<Map<string, VVCacheEntry> | null> {
     return this.storage.loadVVCache();
   }
+
+  async saveDeleteJournal(paths: string[]): Promise<void> {
+    return this.storage.saveDeleteJournal(paths);
+  }
+
+  async loadDeleteJournal(): Promise<string[]> {
+    return this.storage.loadDeleteJournal();
+  }
 }

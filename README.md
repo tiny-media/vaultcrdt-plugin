@@ -68,7 +68,14 @@ bun install
 bun run build
 ```
 
-The WASM module (`wasm/`) is pre-built and committed to the repository. To rebuild it from the Rust source, see [vaultcrdt-server](https://github.com/tiny-media/vaultcrdt-server).
+The WASM module (`wasm/`) is pre-built and committed to the repository, so `bun run build` works without a Rust toolchain. The Rust CRDT engine now lives in this repo under `crates/` — to rebuild the WASM artifacts from source:
+
+```
+bun run wasm         # rebuild wasm/ from crates/
+bun run wasm:check   # verify committed wasm/ matches a fresh build
+```
+
+This requires Rust (stable) with the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` at the version pinned in `Cargo.toml`.
 
 ## Tests
 

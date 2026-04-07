@@ -1,5 +1,6 @@
 import { Modal, App, Setting, requestUrl, Notice } from 'obsidian';
 import type { VaultCRDTSettings } from './settings';
+import { validateServerUrl } from './url-policy';
 
 export interface SetupResult {
   serverUrl: string;
@@ -117,8 +118,9 @@ export class SetupModal extends Modal {
       this.showError('Server URL is required');
       return;
     }
-    if (/^(http|ws):\/\//i.test(this.serverUrl) && !this.serverUrl.includes('localhost') && !this.serverUrl.includes('127.0.0.1')) {
-      this.showError('Insecure connection (no TLS). Use https:// or wss:// to protect your data.');
+    const urlCheck = validateServerUrl(this.serverUrl);
+    if (!urlCheck.ok) {
+      this.showError(urlCheck.reason);
       return;
     }
     if (!VAULT_NAME_RE.test(this.vaultId)) {

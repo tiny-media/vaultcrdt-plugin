@@ -1,5 +1,6 @@
 import { App, Platform, PluginSettingTab, Setting, requestUrl, Notice } from 'obsidian';
 import type VaultCRDTPlugin from './main';
+import { validateServerUrl, toHttpBase } from './url-policy';
 
 export interface VaultCRDTSettings {
   serverUrl: string;
@@ -108,7 +109,18 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           .setPlaceholder('https://obsidian-sync.example.com')
           .setValue(this.plugin.settings.serverUrl)
           .onChange(async (value) => {
-            this.plugin.settings.serverUrl = value.trim();
+            const trimmed = value.trim();
+            // Allow an empty field (user clearing the input) without
+            // spamming Notices, but reject any non-empty invalid URL here
+            // so we never persist something the SyncEngine will later refuse.
+            if (trimmed.length > 0) {
+              const check = validateServerUrl(trimmed);
+              if (!check.ok) {
+                new Notice(`VaultCRDT: ${check.reason}`, 6000);
+                return;
+              }
+            }
+            this.plugin.settings.serverUrl = trimmed;
             await this.plugin.saveSettings();
             this.scheduleReconnect();
           })
@@ -304,9 +316,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
   private async loadPeers(container: HTMLElement): Promise<void> {
     container.createEl('p', { text: 'Loading...', cls: 'setting-item-description' });
 
-    const httpBase = this.plugin.settings.serverUrl
-      .replace(/^ws:\/\//, 'http://')
-      .replace(/^wss:\/\//, 'https://');
+    const httpBase = toHttpBase(this.plugin.settings.serverUrl);
 
     try {
       const authResp = await requestUrl({
@@ -355,9 +365,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
   }
 
   private async loadServerStats(container: HTMLElement): Promise<void> {
-    const httpBase = this.plugin.settings.serverUrl
-      .replace(/^ws:\/\//, 'http://')
-      .replace(/^wss:\/\//, 'https://');
+    const httpBase = toHttpBase(this.plugin.settings.serverUrl);
 
     try {
       // Authenticate to get JWT
@@ -409,9 +417,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
   }
 
   private async checkServerHealth(setting: Setting): Promise<void> {
-    const httpBase = this.plugin.settings.serverUrl
-      .replace(/^ws:\/\//, 'http://')
-      .replace(/^wss:\/\//, 'https://');
+    const httpBase = toHttpBase(this.plugin.settings.serverUrl);
     try {
       const resp = await requestUrl({ url: `${httpBase}/health`, method: 'GET' });
       const version: string = resp.json?.version ?? '?';
