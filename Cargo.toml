@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vaultcrdt-core",
+    "crates/vaultcrdt-crdt",
+    "crates/vaultcrdt-wasm",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+
+[workspace.dependencies]
+# CRDT
+loro = "1.10"
+
+# Hashing
+blake3 = "1"
+
+# Diffing
+similar = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# WASM — pinned to lockfile version for reproducible plugin builds
+wasm-bindgen = "=0.2.114"
+
+# Error handling
+thiserror = "2"
+
+# Testing
+proptest = "1"

@@ -1,0 +1,20 @@
+[package]
+name = "vaultcrdt-wasm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[dependencies]
+vaultcrdt-core = { path = "../vaultcrdt-core" }
+vaultcrdt-crdt = { path = "../vaultcrdt-crdt" }
+wasm-bindgen = { workspace = true }
+serde_json = { workspace = true }
+# uuid needs js feature for wasm32-unknown-unknown randomness (transitive via vaultcrdt-core)
+uuid = { workspace = true, features = ["js"] }

@@ -2,27 +2,60 @@
 
 ## What this is
 
-The Obsidian plugin side of **VaultCRDT**, a self-hosted Obsidian sync using Loro CRDTs.
+The Obsidian plugin side of **VaultCRDT**, a self-hosted Obsidian sync using Loro CRDTs. This repo is a **Rust + TypeScript hybrid**: the CRDT engine is Rust compiled to WASM, the Obsidian integration is TypeScript bundled with esbuild.
 
-## Three-repo layout (read this first)
+## Two-repo layout
 
-The project started as one monorepo and was split. There are now **three** directories on disk, and knowing which is which is the single most important thing for a new session:
+The project was originally a monorepo, split 2026-03-19, and fully consolidated into two repos on 2026-04-07:
 
 ```
 /home/richard/projects/
-├── vaultcrdt-plugin/     ← YOU ARE HERE — canonical plugin (TypeScript)
-├── vaultcrdt-server/     ← canonical Rust/Axum sync server
-└── vaultcrdt/            ← historical monorepo, kept ONLY for the WASM build
-                            (contains crates/vaultcrdt-{core,crdt,wasm})
+├── vaultcrdt-plugin/     ← YOU ARE HERE — plugin + Rust CRDT engine + WASM build
+└── vaultcrdt-server/     ← canonical Rust/Axum sync server
 ```
 
-**Active development happens in `vaultcrdt-plugin/` and `vaultcrdt-server/`.** The `vaultcrdt/` monorepo is legacy — its only live purpose is building the WASM artifacts that land in `vaultcrdt-plugin/wasm/`. Its server crate, Dockerfile, Justfile deploy targets and CI workflow are dead since the March 19 split (cleanup tracked as D1-D7 in `next-session-handoff.md`).
+The old `vaultcrdt/` legacy monorepo has been retired; its last live role (the WASM build) lives here now.
+
+## Repo layout
+
+```
+src/                        # TypeScript plugin source
+wasm/                       # Committed WASM artifacts (reproducible, see below)
+crates/
+├── vaultcrdt-core/         # shared Rust types
+├── vaultcrdt-crdt/         # Loro wrapper + merge logic
+└── vaultcrdt-wasm/         # wasm-bindgen shell
+scripts/
+├── build-wasm.sh           # cargo → wasm-bindgen → wasm/
+└── check-wasm-fresh.sh     # diff committed wasm/ vs fresh build
+Cargo.toml, Cargo.lock      # 3-crate workspace
+.cargo/config.toml          # release profile: opt-level=z, lto, strip
+rust-toolchain.toml         # stable + wasm32-unknown-unknown
+```
 
 ## How the WASM build works
 
-The committed `wasm/` directory in this repo contains `vaultcrdt_wasm.js` + `.wasm` + `.d.ts`. These are reproducible bit-identically from `../vaultcrdt/crates/vaultcrdt-wasm` via `../vaultcrdt/scripts/build-wasm.sh` (writes directly into this repo's `wasm/` dir) and verified via `../vaultcrdt/scripts/check-wasm-fresh.sh`. The `wasm-bindgen` version is pinned to `=0.2.114` in the monorepo Cargo.toml.
+`wasm/` contains `vaultcrdt_wasm.js` + `.wasm` + `.d.ts`, **committed**. They are reproducible bit-identically from `crates/vaultcrdt-wasm/` via:
 
-You normally do not rebuild WASM. Only touch it when `crates/vaultcrdt-{core,crdt,wasm}/` in the monorepo change.
+```bash
+bun run wasm         # ./scripts/build-wasm.sh — build + write into wasm/
+bun run wasm:check   # ./scripts/check-wasm-fresh.sh — drift guard
+```
+
+The `wasm-bindgen` crate is pinned to `=0.2.114` in `Cargo.toml`. The `wasm-bindgen` CLI used for the post-cargo step must match that version, or `wasm:check` will report drift.
+
+You normally do not rebuild WASM. Only touch it when something in `crates/` changes. Fresh clones already have a working `wasm/` — no Rust toolchain required for `bun run build`.
+
+## Build + test commands
+
+```bash
+bun run test         # Vitest — MUST be `bun run test`, NOT `bun test`
+bun run build        # esbuild → main.js
+bun run wasm         # rebuild WASM from crates/
+bun run wasm:check   # verify committed wasm/ is fresh
+```
+
+The distinction `bun run test` vs `bun test` is load-bearing: `bun test` runs Bun's own test runner and silently skips Vitest tests.
 
 ## Where to start each session
 
@@ -48,15 +81,6 @@ gpt-audit/
 └── README.md
 ```
 
-## Build + test commands
-
-```bash
-bun run test       # Vitest — MUST be `bun run test`, NOT `bun test`
-bun run build      # esbuild → main.js
-```
-
-The distinction `bun run test` vs `bun test` is load-bearing: `bun test` runs Bun's own test runner and silently skips Vitest tests.
-
 ## Deploy
 
 Plugin deploy copies `main.js` + `manifest.json` + `wasm/` to four locations. See the `deploy` skill or the reference_deploy memory. Server deploy is via `fleet` from the sibling `vaultcrdt-server` repo.
@@ -66,6 +90,8 @@ Plugin deploy copies `main.js` + `manifest.json` + `wasm/` to four locations. Se
 - Single user, no backwards compatibility concerns — remove dead code freely
 - Android mtime is unreliable, never use for caching or skip logic (bitten by this before)
 - LLM-friendly code style: balanced file sizes, no magic, clear structures (see `memory/feedback_code_style.md`)
+- Rust edition 2024, MSRV 1.94
+- German docs, English code/comments
 - All 8 gpt-audit items are tracked to completion (6 done, 2 deliberately deferred until public release)
 
 ## Session workflow

@@ -1,0 +1,11 @@
+[target.'cfg(all())']
+rustflags = ["-D", "warnings"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
