@@ -44,6 +44,57 @@ var import_obsidian6 = require("obsidian");
 
 // src/settings.ts
 var import_obsidian = require("obsidian");
+
+// src/url-policy.ts
+var ALLOWED_SCHEMES = /* @__PURE__ */ new Set(["http:", "https:", "ws:", "wss:"]);
+var INSECURE_SCHEMES = /* @__PURE__ */ new Set(["http:", "ws:"]);
+function validateServerUrl(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) return { ok: false, reason: "Server URL is required" };
+  let url;
+  try {
+    url = new URL(trimmed);
+  } catch (e) {
+    return { ok: false, reason: "Not a valid URL (expected e.g. https://sync.example.com)" };
+  }
+  if (!ALLOWED_SCHEMES.has(url.protocol)) {
+    return {
+      ok: false,
+      reason: `Unsupported scheme "${url.protocol}". Use https://, wss://, or http(s)://localhost for local testing.`
+    };
+  }
+  if (INSECURE_SCHEMES.has(url.protocol) && !isLocalOrPrivateHost(url.hostname)) {
+    return {
+      ok: false,
+      reason: "Insecure connection (no TLS). Use https:// or wss:// \u2014 plain http/ws is only allowed for localhost or a private LAN address."
+    };
+  }
+  return { ok: true, url };
+}
+function isLocalOrPrivateHost(hostname) {
+  const host = hostname.toLowerCase();
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]") {
+    return true;
+  }
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if ([a, b, Number(m[3]), Number(m[4])].some((n) => n < 0 || n > 255)) return false;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  return false;
+}
+function toHttpBase(raw) {
+  return raw.trim().replace(/^ws:\/\//i, "http://").replace(/^wss:\/\//i, "https://");
+}
+function toWsBase(raw) {
+  return raw.trim().replace(/^http:\/\//i, "ws://").replace(/^https:\/\//i, "wss://");
+}
+
+// src/settings.ts
 var DEFAULT_SETTINGS = {
   serverUrl: "",
   vaultSecret: "",
@@ -112,7 +163,15 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
     containerEl.createEl("h2", { text: "Connection" });
     new import_obsidian.Setting(containerEl).setName("Server").setDesc("Address of your VaultCRDT server. WebSocket connection is derived automatically.").addText(
       (text) => text.setPlaceholder("https://obsidian-sync.example.com").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
-        this.plugin.settings.serverUrl = value.trim();
+        const trimmed = value.trim();
+        if (trimmed.length > 0) {
+          const check = validateServerUrl(trimmed);
+          if (!check.ok) {
+            new import_obsidian.Notice(`VaultCRDT: ${check.reason}`, 6e3);
+            return;
+          }
+        }
+        this.plugin.settings.serverUrl = trimmed;
         await this.plugin.saveSettings();
         this.scheduleReconnect();
       })
@@ -227,7 +286,7 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
   async loadPeers(container) {
     var _a, _b, _c;
     container.createEl("p", { text: "Loading...", cls: "setting-item-description" });
-    const httpBase = this.plugin.settings.serverUrl.replace(/^ws:\/\//, "http://").replace(/^wss:\/\//, "https://");
+    const httpBase = toHttpBase(this.plugin.settings.serverUrl);
     try {
       const authResp = await (0, import_obsidian.requestUrl)({
         url: `${httpBase}/auth/verify`,
@@ -269,7 +328,7 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
   }
   async loadServerStats(container) {
     var _a, _b;
-    const httpBase = this.plugin.settings.serverUrl.replace(/^ws:\/\//, "http://").replace(/^wss:\/\//, "https://");
+    const httpBase = toHttpBase(this.plugin.settings.serverUrl);
     try {
       const authResp = await (0, import_obsidian.requestUrl)({
         url: `${httpBase}/auth/verify`,
@@ -305,7 +364,7 @@ var VaultCRDTSettingsTab = class extends import_obsidian.PluginSettingTab {
   }
   async checkServerHealth(setting) {
     var _a, _b;
-    const httpBase = this.plugin.settings.serverUrl.replace(/^ws:\/\//, "http://").replace(/^wss:\/\//, "https://");
+    const httpBase = toHttpBase(this.plugin.settings.serverUrl);
     try {
       const resp = await (0, import_obsidian.requestUrl)({ url: `${httpBase}/health`, method: "GET" });
       const version = (_b = (_a = resp.json) == null ? void 0 : _a.version) != null ? _b : "?";
@@ -2323,6 +2382,8 @@ var StateStorage = class {
     __publicField(this, "dirEnsured", false);
     // ── VV Cache ──────────────────────────────────────────────────────────────
     __publicField(this, "vvCachePath", `${STATE_DIR}/vv-cache.json`);
+    // ── Delete Journal ────────────────────────────────────────────────────────
+    __publicField(this, "deleteJournalPath", `${STATE_DIR}/delete-journal.json`);
   }
   /** `notes/daily/2026-03-16.md` → `notes%2Fdaily%2F2026-03-16.md.loro` */
   stateKey(filePath) {
@@ -2410,6 +2471,7 @@ var StateStorage = class {
     let removed = 0;
     for (const key of allKeys) {
       if (key === "vv-cache.json") continue;
+      if (key === "delete-journal.json") continue;
       if (validKeys.has(key)) continue;
       try {
         await adapter.remove(`${STATE_DIR}/${key}`);
@@ -2454,6 +2516,36 @@ var StateStorage = class {
       return result;
     } catch (e) {
       return null;
+    }
+  }
+  /**
+   * Persist the set of paths that have an outstanding (unsent or unacknowledged)
+   * delete intent. Survives plugin restart so offline deletes cannot be lost.
+   */
+  async saveDeleteJournal(paths) {
+    const adapter = this.app.vault.adapter;
+    if (!this.dirEnsured) {
+      const dirExists = await adapter.exists(STATE_DIR);
+      if (!dirExists) await adapter.mkdir(STATE_DIR);
+      this.dirEnsured = true;
+    }
+    await adapter.write(
+      this.deleteJournalPath,
+      JSON.stringify({ _version: 1, paths })
+    );
+  }
+  /** Load the offline delete journal. Returns [] if the file doesn't exist. */
+  async loadDeleteJournal() {
+    const adapter = this.app.vault.adapter;
+    try {
+      const exists = await adapter.exists(this.deleteJournalPath);
+      if (!exists) return [];
+      const raw = await adapter.read(this.deleteJournalPath);
+      const obj = JSON.parse(raw);
+      if (!Array.isArray(obj.paths)) return [];
+      return obj.paths.filter((p) => typeof p === "string");
+    } catch (e) {
+      return [];
     }
   }
   /** Delete all persisted state (full reset). */
@@ -2554,6 +2646,12 @@ var DocumentManager = class {
   }
   async loadVVCache() {
     return this.storage.loadVVCache();
+  }
+  async saveDeleteJournal(paths) {
+    return this.storage.saveDeleteJournal(paths);
+  }
+  async loadDeleteJournal() {
+    return this.storage.loadDeleteJournal();
   }
 };
 
@@ -2855,15 +2953,40 @@ var PushHandler = class {
   onFileDeleted(path) {
     void this.docs.removeAndClean(path);
     this.lastServerVV.delete(path);
+    this.pendingDeletes.add(path);
     if (this.isWsOpen()) {
       this.send({ type: "doc_delete", doc_uuid: path, peer_id: this.settings.peerId });
-    } else {
-      this.pendingDeletes.add(path);
+      this.pendingDeletes.delete(path);
     }
+    void this.persistJournal();
   }
   onFileRenamed(oldPath, newPath, content) {
     this.onFileDeleted(oldPath);
     this.pushFileDelta(newPath, content);
+  }
+  /** Standalone delete for the unsyncable-transition case in main.ts. */
+  deleteOnly(path) {
+    this.onFileDeleted(path);
+  }
+  /** True if `path` has an outstanding offline/unacknowledged delete. */
+  hasPendingDelete(path) {
+    return this.pendingDeletes.has(path);
+  }
+  /** Snapshot of the pending delete set. */
+  pendingDeletePaths() {
+    return [...this.pendingDeletes];
+  }
+  /** Load the persistent delete journal into memory. Call during plugin start. */
+  async loadPendingDeletesFromJournal() {
+    const paths = await this.docs.loadDeleteJournal();
+    for (const p of paths) this.pendingDeletes.add(p);
+  }
+  async persistJournal() {
+    try {
+      await this.docs.saveDeleteJournal([...this.pendingDeletes]);
+    } catch (err) {
+      warn(`${this.tag} delete journal persist failed`, { err });
+    }
   }
   /** Flush pending debounce edits into CRDT before merging broadcast. */
   async flushPendingEdits(path) {
@@ -2903,13 +3026,19 @@ var PushHandler = class {
       error(`${this.tag} export_snapshot failed:`, filePath, err);
     }
   }
-  /** Flush queued offline deletes. */
+  /**
+   * Flush queued offline deletes synchronously (keeps the WS FIFO in order
+   * with whatever the caller sends next). Journal persistence runs in the
+   * background.
+   */
   flushPendingDeletes() {
+    if (this.pendingDeletes.size === 0) return;
     for (const path of this.pendingDeletes) {
       log(`${this.tag} flushing offline delete`, { path });
       this.send({ type: "doc_delete", doc_uuid: path, peer_id: this.settings.peerId });
     }
     this.pendingDeletes.clear();
+    void this.persistJournal();
   }
   stopAllTimers() {
     for (const timer of this.pushDebounceTimers.values()) clearTimeout(timer);
@@ -2974,11 +3103,15 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   var _a;
   const t0 = performance.now();
   const { app, docs, editor, push, lastServerVV, lastRemoteWrite, writingFromRemote, tag } = deps;
-  const localFiles = app.vault.getMarkdownFiles();
+  const localFiles = app.vault.getMarkdownFiles().filter(
+    (f) => isSyncablePath(f.path)
+  );
   const localFileMap = /* @__PURE__ */ new Map();
   for (const file of localFiles) {
     localFileMap.set(file.path, file);
   }
+  const pendingDeleteSet = new Set(push.pendingDeletePaths());
+  push.flushPendingDeletes();
   const { docs: serverDocs, tombstones } = await deps.requestDocList();
   const tombstoneSet = new Set(tombstones);
   const localPathSet = new Set(localFileMap.keys());
@@ -2998,13 +3131,13 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     hasCachedVVs: cachedVVs !== null
   });
   const serverOnlyUuids = [...serverDocMap.keys()].filter(
-    (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid) && isSyncablePath(uuid)
+    (uuid) => !tombstoneSet.has(uuid) && !localPathSet.has(uuid) && !pendingDeleteSet.has(uuid) && isSyncablePath(uuid)
   );
   const overlappingFiles = localFiles.filter(
-    (f) => !tombstoneSet.has(f.path) && serverDocMap.has(f.path)
+    (f) => !tombstoneSet.has(f.path) && !pendingDeleteSet.has(f.path) && serverDocMap.has(f.path)
   );
   const localOnlyFiles = localFiles.filter(
-    (f) => !tombstoneSet.has(f.path) && !serverDocMap.has(f.path)
+    (f) => !tombstoneSet.has(f.path) && !pendingDeleteSet.has(f.path) && !serverDocMap.has(f.path)
   );
   const totalSteps = serverOnlyUuids.length + overlappingFiles.length + localOnlyFiles.length;
   let stepsDone = 0;
@@ -3128,7 +3261,6 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     stepsDone += localOnlyFiles.length;
     onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
   }
-  push.flushPendingDeletes();
   for (const uuid of tombstoneSet) {
     if (serverDocMap.has(uuid)) continue;
     if (!isSyncablePath(uuid)) continue;
@@ -3347,6 +3479,12 @@ var SyncEngine = class {
   // ── Lifecycle ───────────────────────────────────────────────────────────────
   async start() {
     this.stopped = false;
+    const check = validateServerUrl(this.settings.serverUrl);
+    if (!check.ok) {
+      error(`${this.tag} refusing to start: ${check.reason}`);
+      throw new Error(`Invalid server URL: ${check.reason}`);
+    }
+    await this.push.loadPendingDeletesFromJournal();
     await this.auth();
     this.connect();
   }
@@ -3367,7 +3505,7 @@ var SyncEngine = class {
   }
   // ── Server communication ────────────────────────────────────────────────────
   httpBase() {
-    return this.settings.serverUrl.replace(/^ws:\/\//, "http://").replace(/^wss:\/\//, "https://");
+    return toHttpBase(this.settings.serverUrl);
   }
   async auth() {
     const resp = await (0, import_obsidian4.requestUrl)({
@@ -3382,7 +3520,7 @@ var SyncEngine = class {
     this.token = resp.json.token;
   }
   wsUrl() {
-    return this.settings.serverUrl.replace(/^http:\/\//, "ws://").replace(/^https:\/\//, "wss://") + "/ws";
+    return toWsBase(this.settings.serverUrl) + "/ws";
   }
   connect() {
     var _a;
@@ -3657,6 +3795,14 @@ var SyncEngine = class {
   onFileRenamed(oldPath, newPath, content) {
     this.push.onFileRenamed(oldPath, newPath, content);
   }
+  /**
+   * Delete the old path only (used when a rename crosses the syncable-path
+   * boundary: syncable → unsyncable). The new path is outside the policy,
+   * so nothing is pushed for it.
+   */
+  onFileDeletedOnly(path) {
+    this.push.deleteOnly(path);
+  }
   // ── Guards ──────────────────────────────────────────────────────────────────
   isWritingFromRemote(path) {
     return this.writingFromRemote.has(path);
@@ -3810,8 +3956,9 @@ var SetupModal = class extends import_obsidian5.Modal {
       this.showError("Server URL is required");
       return;
     }
-    if (/^(http|ws):\/\//i.test(this.serverUrl) && !this.serverUrl.includes("localhost") && !this.serverUrl.includes("127.0.0.1")) {
-      this.showError("Insecure connection (no TLS). Use https:// or wss:// to protect your data.");
+    const urlCheck = validateServerUrl(this.serverUrl);
+    if (!urlCheck.ok) {
+      this.showError(urlCheck.reason);
       return;
     }
     if (!VAULT_NAME_RE.test(this.vaultId)) {
@@ -3927,9 +4074,18 @@ var VaultCRDTPlugin = class extends import_obsidian6.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("rename", async (file, oldPath) => {
-        if (file instanceof import_obsidian6.TFile && isSyncablePath(file.path)) {
+        if (!(file instanceof import_obsidian6.TFile)) return;
+        const oldSync = isSyncablePath(oldPath);
+        const newSync = isSyncablePath(file.path);
+        if (oldSync && newSync) {
           const content = await this.app.vault.read(file);
           this.syncEngine.onFileRenamed(oldPath, file.path, content);
+        } else if (oldSync && !newSync) {
+          this.syncEngine.onFileDeletedOnly(oldPath);
+        } else if (!oldSync && newSync) {
+          if (this.syncEngine.isWritingFromRemote(file.path)) return;
+          const content = await this.app.vault.read(file);
+          this.syncEngine.onFileChangedImmediate(file.path, content);
         }
       })
     );
