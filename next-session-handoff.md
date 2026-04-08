@@ -1,117 +1,122 @@
-# Session Handoff — Two-Repo Consolidation + Audit Cleanup
+# Session Handoff — Conflict-Storm Follow-up landed
 
-Datum: 2026-04-07 (vierte Session des Tages)
-Branch: main (alle Repos)
+Datum: 2026-04-08 (Ende der achten Session)
+Branch: `main`, **2 Commits vor `origin/main`**, nicht gepusht.
 
-## Was diese Session erreicht hat
+## Status in einem Satz
 
-### D1-D7: Legacy-Monorepo bereinigt (Commit `a379a36`, Eltern-Repo)
+Conflict-Storm-Härtung *und* Follow-up sind beide committet — nächste Session
+ist Deploy + Recovery-Entscheidung für den richardsachen-Vault + Dogfooding.
 
-Alle 7 Cleanup-Punkte aus dem Backlog in einem Commit erledigt:
-- `crates/vaultcrdt-server/` gelöscht (D1 — drifted snapshot)
-- `Dockerfile`, `docker-compose.yml` gelöscht (D3)
-- `.forgejo/` komplett gelöscht (D4 + CI)
-- `devices/` gelöscht (leerer Stub)
-- `obsidian-plugin/` gelöscht (D7 — stale vierte Plugin-Kopie)
-- `Cargo.toml` auf 3 WASM-Crates reduziert + server-only deps entfernt
-- `Justfile` auf `wasm / wasm-check / check / test` getrimmt (D5)
-- `Cargo.lock` regeneriert, server-deps-frei (D6)
+## Was gelandet ist
 
-### Rust WASM-Crates in Plugin-Repo absorbiert (Plugin-Commit)
+Zwei Commits on top von `991c222`:
 
-Endgültiger Abschluss des 2026-03-19-Splits. Das Plugin-Repo ist jetzt ein Rust+TS-Hybrid:
+1. **`3276d16` — `chore: vendor coding-agent tooling, pin-aligned to wasm-bindgen 0.2.117`**
+   - Bringt `.claude/` und `.pi/` erstmals unter Versionskontrolle (rules,
+     commands, settings, hooks, agent, skills, pi-ultrathink)
+   - Pin-Align auf `=0.2.117` mit drin (CLAUDE.md + alle Tooling-Files) —
+     also *Option A*, nicht die im letzten Handoff vorgeschlagene Option B.
+     Grund: nach dem vollgelaufenen Context war ein gebündelter Commit
+     sauberer als die Retro-Pin-Manöver aus dem Runsheet
+   - `.claude/settings.local.json` liegt bewusst via global gitignore ausserhalb
 
-```
-vaultcrdt-plugin/
-├── crates/vaultcrdt-{core,crdt,wasm}/   ← Rust CRDT engine
-├── scripts/{build-wasm.sh,check-wasm-fresh.sh}
-├── Cargo.toml + Cargo.lock + .cargo/ + rust-toolchain.toml + rustfmt.toml
-└── wasm/                                 ← committed artifacts (bit-identisch)
-```
+2. **`f366dd8` — `fix(sync): stable peer-id, adopt-not-merge, and editor-first content reads`**
+   - Subsumiert beide Lücken-Ebenen in einem Commit (wieder zugunsten eines
+     sauberen Git-Verlaufs statt zwei kleiner Commits)
+   - Stabile Loro-PeerID via `derive_peer_id` (BLAKE3-Hash, Sentinel-Mapping,
+     `set_peer_id()` vor den ersten Ops) — `crates/vaultcrdt-crdt/src/document.rs`
+   - `createDocument(doc_uuid, peer_id)` durch WASM-Shell und DocumentManager
+     bis in SyncEngine (`settings.peerId`)
+   - `ensureDeviceIdentity(settings, …)` Helper in `src/settings.ts`, von
+     `main.ts::loadSettings()` aufgerufen — Startup-Invariante jetzt unit-testbar
+   - Phase-2 + Phase-3 Initial-Sync adoptiert Server-Snapshot wholesale
+     (kein Loro-Merge mehr); Conflict-Files nur bei echter Text-Differenz
+   - `PROBE_DOC_UUID` / `PROBE_PEER_ID` Konstanten in `src/sync-initial.ts`
+   - `readEffectiveLocalContent(app, editor, file)` an 4 Stellen
+     (priority active, overlapping loop incl. hash-skip, local-only loop) plus
+     belt-and-suspenders im Kopf von `syncOverlappingDoc`
+   - Tests: 5 Rust-Unit-Tests fuer `derive_peer_id`, 5 Faelle in der neuen
+     `src/__tests__/settings-identity.test.ts`, Phase-2/3-Regression plus
+     stale-disk-vs-fresh-editor Abdeckung in `sync-engine.test.ts`
+   - Verifikation im Commit-Zeitpunkt: 168 Plugin-Tests gruen, cargo test
+     workspace 36 gruen, `wasm:check` clean, `bun run build` clean
 
-Neue Befehle:
+Die einzige noch offene Aenderung war der Handoff selbst — Commit 3
+(`docs(handoff): close conflict-storm follow-up cycle`) schliesst den Zyklus.
+
+## Naechste Session — Aufgaben
+
+1. **Push** `git push origin main` (zwei Commits warten)
+2. **Plugin deployen** an die 4 Vault-Locations — siehe `reference_deploy` Memory
+3. **Server-Redeploy** (unveraendert seit Zyklus 2, unproblematisch)
+4. **Recovery richardsachen-Vault** — *vor* Dogfooding entscheiden:
+   - Der Code-Fix heilt den existierenden Schaden (805 Conflict-Files) **nicht**.
+   - Source-of-Truth-Entscheidung: Welche Seite (Desktop-Vault / Mobile-Vault /
+     Server-Snapshot) ist die Wahrheit? Danach Aufraeum-Strategie
+     (Conflict-Files sichten, Duplikate mergen, Loro-Snapshots ggf. verwerfen
+     damit stabile PeerID greift)
+5. **Dogfooding-Checkliste** abarbeiten — `dogfooding-checklist.md` im Repo-Root
+   ist noch leer, muss vorher befuellt werden (sinnvolle Pfade: frischer Edit
+   auf Device A waehrend Device B offline, Sync-Reconnect, Conflict-Provokation,
+   Delete-Ack)
+
+## Uncommittete Artefakte (bewusst liegengelassen)
+
+Diese sind Arbeitsdokumente aus dem Zyklus und koennen in der naechsten Session
+aufgeraeumt werden (oder als Referenz bleiben — keine harte Regel):
+
+- `gpt-audit/conflict-storm-plan.md`
+- `gpt-audit/conflict-storm-follow-up-plan.md`
+- `gpt-audit/conflict-storm-follow-up-runsheet.md`
+- `gpt-audit/delete-ack-plan.md`
+- `gpt-audit/delete-ack-second-opinion.md`
+- `dogfooding-checklist.md` (leer)
+
+Gemaess gpt-audit-Workflow sind die keine offiziellen Zyklen (kein
+`archive-<datum>/`). Zwei Moeglichkeiten:
+
+- **Archivieren**: `mkdir gpt-audit/archive-2026-04-07-conflict-storm/`, die
+  vier conflict-storm-Files reinziehen, `previous-cycles.md` um einen Absatz
+  ergaenzen. Analog fuer delete-ack.
+- **Wegwerfen**: wenn die Informationen ausschliesslich im Commit-Message und
+  Handoff leben, sind die Plan-/Runsheet-Files redundant.
+
+Entscheidung auf die naechste Session verschoben, weil das nichts am
+Code-Zustand aendert.
+
+## Verifikation, falls nochmal noetig
+
 ```bash
-bun run wasm         # rebuild WASM aus crates/
-bun run wasm:check   # drift-guard gegen committed wasm/
+cargo fmt --all
+cargo clippy --all-targets --workspace -- -D warnings
+cargo test --workspace
+bun run wasm:check
+bun run test
+bun run build
+# verify_plugin (pi-coding-agent)
 ```
 
-Smoke-Test: `bun run wasm:check` → `OK: committed WASM artifacts are fresh` ✓  
-`bun run test` → 129/129 ✓
+Alles war zum Commit-Zeitpunkt gruen. Wenn in der naechsten Session etwas
+dazwischenkommt, hier erneut durchlaufen.
 
-### Legacy-Ordner pensioniert (Eltern-Repo)
+## Offene Edge Cases / parkend
 
-`/home/richard/projects/vaultcrdt/` existiert nicht mehr.
+- **Vault-Klon-Caveat**: `peerId` liegt vault-lokal in `data.json`. Wer Vault
+  inkl. Plugin-Konfig auf ein zweites Geraet kopiert, schleppt dieselbe
+  Loro-PeerID mit. Memory: `project_peerid_clone_caveat.md`. Loesung ist ein
+  Klon-Detection-Hook spaeter — nicht jetzt.
+- **Snapshot-Migration**: bestehende `.loro`-Files enthalten Ops von frueheren
+  zufaelligen Loro-PeerIDs. Praktisch unkritisch (die Fix-Logik greift beim
+  naechsten vollen Initial-Sync), aber fuer den richardsachen-Vault evtl.
+  Teil der Recovery-Strategie (vgl. Punkt 4 oben).
+- **Delete-Ack** (`gpt-audit/delete-ack-*.md`): separates Thema, in dieser
+  Session nicht angefasst. Wenn die delete-ack-Plan-Files nicht
+  aufgeraeumt werden, beim naechsten `/audit`-Start darauf zurueckkommen.
 
-**Finales Layout:**
-```
-/home/richard/projects/
-├── vaultcrdt-plugin/    ← Rust CRDT engine + WASM build + TypeScript plugin
-└── vaultcrdt-server/    ← Rust/Axum sync server
-```
+## Deferred (unveraendert)
 
-### gpt-audit/ bereinigt für neuen Audit-Zyklus
+- **#7 Multi-Editor-Konsistenz** — public release
+- **#8 WS-Token-Logging** — public release
 
-Erster Zyklus (2026-04-06) vollständig archiviert in `gpt-audit/archive-2026-04-06/`.
-
-Neue Top-Level-Struktur:
-```
-gpt-audit/
-├── README.md             ← Workflow für neue Zyklen
-├── previous-cycles.md    ← rolling Summary, 1 Absatz pro geschlossenem Zyklus
-└── archive-2026-04-06/   ← erster Zyklus, closed (6/8 done, 2 deferred)
-```
-
----
-
-## Nächste Session: Neuer GPT-Audit
-
-**Vorbereitung ist erledigt.** Das Repo ist jetzt in einer sauberen Zwei-Repo-Struktur, die sich deutlich von der Drei-Repo-Struktur unterscheidet, die der erste Audit bewertet hat.
-
-Ablauf:
-1. GPT bekommt aktuelle Code-Basis (`vaultcrdt-plugin/src/`, `vaultcrdt-server/src/`) + Kontext aus `gpt-audit/previous-cycles.md`
-2. Neues Audit landet in `gpt-audit/archive-<datum>/audit-<datum>.md`
-3. Danach: Proposals, Decision-Matrix, Claude-Response wie im ersten Zyklus
-
-**Seed-Kontext für den Audit-Prompt:** `gpt-audit/previous-cycles.md` — beschreibt was im ersten Zyklus bereits behoben wurde, verhindert Rehashing.
-
----
-
-## Dauerhaft offene Punkte (deferred bis Public Release)
-
-- **#7 Multi-Editor-Konsistenz** — UX-Polish, kein Korrektheitsproblem
-- **#8 WS-Token-Logging** — Self-Hosted ausreichend, Ticket-Modell nice-to-have
-
-Detail: `gpt-audit/archive-2026-04-06/claude-response.md`
-
-## Runtime-Observations (bei normaler Nutzung beobachten)
-
-- **Lazy-Auth-Migration:** Beim ersten Login eines bestehenden Vaults: Server-Log beobachten → PHC-Upgrade passiert beim ersten `verify_secret`-Aufruf
-- **Plugin nach Delete:** Nach `removeAndClean()` pusht das Plugin nicht mehr für denselben Pfad. Falls doch → Server antwortet mit `DocTombstoned`, Plugin loggt Warnung.
-
----
-
-## Commits dieser Session
-
-| Commit | Repo | Inhalt |
-|--------|------|--------|
-| `a379a36` | parent (`/home/richard/projects`) | D1-D7: trim legacy monorepo to WASM build role |
-| *(neu)* | vaultcrdt-plugin | feat(wasm): absorb Rust CRDT crates — retire legacy monorepo split |
-| `c357354` | vaultcrdt-server | docs(claude): two-repo layout — legacy monorepo retired |
-| *(neu)* | parent | retire legacy vaultcrdt/ monorepo |
-| *(neu)* | vaultcrdt-plugin | docs(gpt-audit): archive first cycle, prep for new audit |
-
-## Wichtige Kontextinfos
-
-- **Einziger User**, kein Backwards-Compat-Zwang
-- **Android-mtime unzuverlässig** — niemals für Caching
-- **`bun run test`** verwenden, NICHT `bun test`
-- **wasm-bindgen CLI** muss Version `0.2.114` sein (Cargo.toml-Pin); `bun run wasm:check` fängt Drift ab
-- **Zwei CLAUDE.md-Dateien** — eine pro Repo, jede erklärt sich selbst und den Nachbarn
-- **Eltern-Repo-Gotcha ist hinfällig** — `vaultcrdt/` ist weg, kein Parent-Git-Tanz mehr nötig
-
-## Einstiegspunkte für neue Sessions
-
-1. `/begin` (invokes `memory_session_start`)
-2. Diesen Handoff lesen
-3. `CLAUDE.md` im aktuellen Arbeitsverzeichnis lesen
-4. Bei Audit-Fragen: `gpt-audit/previous-cycles.md`
+Siehe `gpt-audit/archive-2026-04-06/claude-response.md`.
