@@ -51,7 +51,7 @@ describe('DocumentManager', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    dm = new DocumentManager({} as any);
+    dm = new DocumentManager({} as any, 'test-peer-id');
   });
 
   describe('getOrLoad', () => {
