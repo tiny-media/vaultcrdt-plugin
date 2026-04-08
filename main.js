@@ -4071,24 +4071,9 @@ var SyncEngine = class {
       }
       this.lastServerVV.set(docUuid, serverVVStr);
     }
-    const editorTextBeforeApply = this.editor.readCurrentContent(docUuid);
-    const preserveConcurrentTyping = editorTextBeforeApply !== null && editorTextBeforeApply !== textBefore;
     try {
-      if (diffJson && this.editor.applyDiffToEditor(
-        docUuid,
-        diffJson,
-        doc.get_text(),
-        preserveConcurrentTyping
-      )) {
-        const postContent = this.editor.readCurrentContent(docUuid);
-        if (postContent !== null) {
-          if (!doc.text_matches(postContent)) {
-            doc.sync_from_disk(postContent);
-          }
-          this.lastRemoteWrite.set(docUuid, postContent);
-        } else {
-          this.lastRemoteWrite.set(docUuid, doc.get_text());
-        }
+      if (diffJson && this.editor.applyDiffToEditor(docUuid, diffJson, doc.get_text())) {
+        this.lastRemoteWrite.set(docUuid, doc.get_text());
         await this.docs.persist(docUuid);
         return;
       }

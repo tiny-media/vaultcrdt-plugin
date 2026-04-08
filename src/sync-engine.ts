@@ -444,32 +444,10 @@ export class SyncEngine {
       this.lastServerVV.set(docUuid, serverVVStr);
     }
 
-    // Try surgical editor update via diff. If the editor currently contains
-    // fresher user typing than the CRDT snapshot we started from, NEVER fall
-    // back to a full setValue overwrite on mismatch — preserve the visible
-    // buffer and re-import it into the CRDT instead.
-    const editorTextBeforeApply = this.editor.readCurrentContent(docUuid);
-    const preserveConcurrentTyping =
-      editorTextBeforeApply !== null && editorTextBeforeApply !== textBefore;
+    // Try surgical editor update via diff; fall back to full writeToVault
     try {
-      if (
-        diffJson &&
-        this.editor.applyDiffToEditor(
-          docUuid,
-          diffJson,
-          doc.get_text(),
-          preserveConcurrentTyping,
-        )
-      ) {
-        const postContent = this.editor.readCurrentContent(docUuid);
-        if (postContent !== null) {
-          if (!doc.text_matches(postContent)) {
-            doc.sync_from_disk(postContent);
-          }
-          this.lastRemoteWrite.set(docUuid, postContent);
-        } else {
-          this.lastRemoteWrite.set(docUuid, doc.get_text());
-        }
+      if (diffJson && this.editor.applyDiffToEditor(docUuid, diffJson, doc.get_text())) {
+        this.lastRemoteWrite.set(docUuid, doc.get_text());
         await this.docs.persist(docUuid);
         return;
       }
