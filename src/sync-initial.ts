@@ -473,21 +473,18 @@ async function syncOverlappingDoc(
       return;
     }
 
-    // For any doc with an open editor: flush pending keystrokes into the
-    // CRDT before merging so import_and_diff sees the freshest user text.
-    // Relying on getActiveViewOfType() alone is too narrow on mobile during
-    // startup/reconnect — the file can be visibly open while Obsidian has
-    // not yet established it as the active MarkdownView.
-    const hasOpenEditorDoc = editor.hasOpenEditor(path);
-    if (hasOpenEditorDoc && result && result.delta.length > 0) {
+    // For the active editor doc: flush pending keystrokes into the CRDT
+    // before merging so import_and_diff produces a correct surgical diff.
+    const isActiveEditorDoc = editor.getActiveEditorPath() === path;
+    if (isActiveEditorDoc && result && result.delta.length > 0) {
       await push.flushPendingEdits(path);
     }
 
-    // Import server delta — docs with an open editor use import_and_diff to
-    // preserve live typing, others can take the simpler snapshot path.
+    // Import server delta — for active editor doc, use import_and_diff
+    // to get a surgical TextDelta instead of a full editor replacement.
     let diffJson: string | null = null;
     if (result.delta.length > 0) {
-      if (hasOpenEditorDoc) {
+      if (isActiveEditorDoc) {
         try {
           diffJson = doc.import_and_diff(result.delta);
         } catch (err) {
@@ -502,7 +499,7 @@ async function syncOverlappingDoc(
 
     const serverContent = doc.get_text();
 
-    if (localContent.trim() === '' && serverContent.trim() !== '' && !hasOpenEditorDoc) {
+    if (localContent.trim() === '' && serverContent.trim() !== '' && !isActiveEditorDoc) {
       log(`${tag} overlapping: empty local, adopting server`, { path });
       await editor.writeToVault(path, serverContent);
     } else {
@@ -522,9 +519,8 @@ async function syncOverlappingDoc(
         log(`${tag} overlapping match`, { path });
       }
 
-      // Apply merged content — open editors get a surgical diff, closed docs
-      // can take a full replace.
-      if (hasOpenEditorDoc) {
+      // Apply merged content — active editor gets surgical diff, others get full replace
+      if (isActiveEditorDoc) {
         if (diffJson) {
           let hasTextChanges = false;
           try {
