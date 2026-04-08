@@ -1,0 +1,71 @@
+{
+  "language": "de",
+  "permissions": {
+    "allow": [
+      "Bash(bun run:*)",
+      "Bash(bun install:*)",
+      "Bash(bun add:*)",
+      "Bash(bunx:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo metadata:*)",
+      "Bash(rustc --version)",
+      "Bash(rustup show)",
+      "Bash(./scripts/build-wasm.sh)",
+      "Bash(./scripts/check-wasm-fresh.sh)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git stash:*)",
+      "Bash(git tag:*)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(file:*)",
+      "Bash(stat:*)",
+      "Bash(rsync -n:*)",
+      "mcp__memory__memory_session_start",
+      "mcp__memory__memory_session_end",
+      "mcp__memory__memory_search",
+      "mcp__memory__memory_list",
+      "mcp__memory__memory_get",
+      "mcp__memory__memory_stats",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:registry.npmjs.org)",
+      "WebFetch(domain:rustwasm.github.io)",
+      "WebSearch"
+    ]
+  },
+  "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat <<'CONTEXT'\n[Kritische Regeln nach Compaction — vaultcrdt-plugin]\n- Test-Befehl: `bun run test`, NICHT `bun test` (Bun-Runner skippt Vitest still)\n- Android mtime ist unzuverlaessig — niemals fuer Caching/Skip-Logik\n- wasm-bindgen ist auf =0.2.117 gepinnt; CLI muss exakt matchen sonst meldet wasm:check Drift\n- wasm/ wird NIEMALS von Hand editiert — nur via `bun run wasm`\n- Einziger User, keine Backwards-Compat noetig — toter Code darf weg\n- LLM-freundlicher Code: ausgewogene Dateigroessen, keine Magie, klare Strukturen\n- Rust Edition 2024, MSRV 1.94\n- Deutsche Docs, English code/comments\n- Handoff lebt in `next-session-handoff.md` (committed!), nicht .claude/handoff.md\nCONTEXT",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '[Erinnerung] Falls diese Session substanzielle Aenderungen hatte: next-session-handoff.md aktualisieren (/handoff) — diese Datei wird committed und ist die Bruecke zur naechsten Session.'",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -42,7 +42,7 @@ bun run wasm         # ./scripts/build-wasm.sh — build + write into wasm/
 bun run wasm:check   # ./scripts/check-wasm-fresh.sh — drift guard
 ```
 
-The `wasm-bindgen` crate is pinned to `=0.2.114` in `Cargo.toml`. The `wasm-bindgen` CLI used for the post-cargo step must match that version, or `wasm:check` will report drift.
+The `wasm-bindgen` crate is pinned to `=0.2.117` in `Cargo.toml`. The `wasm-bindgen` CLI used for the post-cargo step must match that version, or `wasm:check` will report drift.
 
 You normally do not rebuild WASM. Only touch it when something in `crates/` changes. Fresh clones already have a working `wasm/` — no Rust toolchain required for `bun run build`.
 
@@ -94,3 +94,17 @@ Plugin deploy copies `main.js` + `manifest.json` + `wasm/` to four locations. Se
 - Start with `/begin` which invokes `memory_session_start`
 - End with `/end` which closes the memory session
 - Current date convention in handoffs: absolute dates, not "tomorrow"
+
+## Coding-agent setup
+
+The repo ships with both Claude Code and pi-coding-agent harnesses:
+
+- `.claude/settings.json` — project-wide permissions + PostCompact/Stop hooks
+- `.claude/commands/` — slash commands (`/begin`, `/weiter`, `/end`, `/handoff`, `/check`, `/commit`, `/wasm`, `/audit`)
+- `.claude/rules/` — path-scoped rules for `crates/`, `wasm/`, `src/`, `gpt-audit/` (auto-loaded by Claude Code)
+- `.claude/agents/reviewer.md` — read-only Sonnet reviewer
+- `.pi/SYSTEM.md` + `.pi/settings.json` — pi-coding-agent entry point
+- `.pi/skills/` — `commit`, `check`, `wasm-rebuild`, `review`, `deploy`, `audit-cycle`
+- `.pi/extensions/pi-ultrathink.ts` — exposes the `verify_plugin` tool (wasm freshness, version sync, wasm-bindgen pin, emoji guard, `bun test` misuse guard)
+
+The `verify_plugin` tool is the invariant checker; call it after non-trivial changes and before `/commit`.
