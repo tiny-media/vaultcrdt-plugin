@@ -3628,7 +3628,12 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
   }
   const doc = await docs.getOrLoad(path);
   const hadPersistedState = doc.version() > 0;
-  deps.tracePath("overlap.doc-state", path, { hadPersistedState, version: doc.version() });
+  const editedDuringStartup = deps.wasEditedDuringStartup(path);
+  deps.tracePath("overlap.doc-state", path, {
+    hadPersistedState,
+    version: doc.version(),
+    editedDuringStartup
+  });
   if (!hadPersistedState) {
     const probe = await deps.requestSyncStart(path, null);
     if (probe && probe.delta.length > 0) {
@@ -3672,21 +3677,28 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
       tempDoc.import_snapshot(result.delta);
       const serverText = tempDoc.get_text();
       if (serverText.trim() !== "" && serverText !== localContent) {
-        deps.tracePath("overlap.concurrent-conflict", path, { serverLen: serverText.length, localLen: localContent.length });
-        const cPath = conflictPath(app, path);
-        warn(`${tag} concurrent external edit conflict`, { path, conflictPath: cPath });
-        await app.vault.create(cPath, localContent);
-        await docs.removeAndClean(path);
-        const freshDoc = await docs.getOrLoad(path);
-        const fullResult = await deps.requestSyncStart(path, null);
-        if (fullResult && fullResult.delta.length > 0) {
-          freshDoc.import_snapshot(fullResult.delta);
-          lastServerVV.set(path, fullResult.serverVV);
+        if (editedDuringStartup) {
+          deps.tracePath("overlap.concurrent-live-editor-merge", path, {
+            serverLen: serverText.length,
+            localLen: localContent.length
+          });
+        } else {
+          deps.tracePath("overlap.concurrent-conflict", path, { serverLen: serverText.length, localLen: localContent.length });
+          const cPath = conflictPath(app, path);
+          warn(`${tag} concurrent external edit conflict`, { path, conflictPath: cPath });
+          await app.vault.create(cPath, localContent);
+          await docs.removeAndClean(path);
+          const freshDoc = await docs.getOrLoad(path);
+          const fullResult = await deps.requestSyncStart(path, null);
+          if (fullResult && fullResult.delta.length > 0) {
+            freshDoc.import_snapshot(fullResult.delta);
+            lastServerVV.set(path, fullResult.serverVV);
+          }
+          deps.tracePath("overlap.concurrent-write-to-vault", path, { textLen: freshDoc.get_text().length });
+          await editor.writeToVault(path, freshDoc.get_text());
+          await docs.persist(path);
+          return;
         }
-        deps.tracePath("overlap.concurrent-write-to-vault", path, { textLen: freshDoc.get_text().length });
-        await editor.writeToVault(path, freshDoc.get_text());
-        await docs.persist(path);
-        return;
       }
     }
     if (result.delta.length > 0 && clientVV !== "{}" && !hasSharedHistory(clientVV, result.serverVV)) {
@@ -3882,6 +3894,8 @@ var SyncEngine = class {
     __publicField(this, "hasConnected", false);
     __publicField(this, "initialSyncRunning", false);
     __publicField(this, "queuedBroadcasts", []);
+    /** Paths that received a real editor-change during the current startup. */
+    __publicField(this, "startupEditedPaths", /* @__PURE__ */ new Set());
     /** Stores the server VV (JSON string) per doc after last successful sync. */
     __publicField(this, "lastServerVV", /* @__PURE__ */ new Map());
     /** Tracks docs currently doing a VV-gap catch-up to prevent duplicates. */
@@ -3924,6 +3938,7 @@ var SyncEngine = class {
   // ── Lifecycle ───────────────────────────────────────────────────────────────
   async start() {
     this.stopped = false;
+    this.startupEditedPaths.clear();
     this.trace.resetStartup({
       vaultId: this.settings.vaultId,
       deviceName: this.settings.deviceName,
@@ -3953,6 +3968,7 @@ var SyncEngine = class {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.push.stopAllTimers();
     this.lastRemoteWrite.clear();
+    this.startupEditedPaths.clear();
     this.trace.mark("stop.called");
     (_a = this.ws) == null ? void 0 : _a.close();
     this.ws = null;
@@ -3999,6 +4015,7 @@ var SyncEngine = class {
     this.lastRemoteWrite.clear();
     this.catchUpInProgress.clear();
     this.queuedBroadcasts = [];
+    this.startupEditedPaths.clear();
   }
   wsUrl() {
     return toWsBase(this.settings.serverUrl) + "/ws";
@@ -4082,7 +4099,8 @@ var SyncEngine = class {
           requestSyncStart: (uuid, vv) => this.requestSyncStart(uuid, vv),
           trace: (event, data) => this.trace.mark(event, data),
           tracePath: (event, path, data) => this.trace.markPath(event, path, data),
-          observePath: (path) => this.trace.observePath(path)
+          observePath: (path) => this.trace.observePath(path),
+          wasEditedDuringStartup: (path) => this.startupEditedPaths.has(path)
         },
         onProgress,
         mode
@@ -4100,6 +4118,7 @@ var SyncEngine = class {
       }
       this.queuedBroadcasts = [];
       this.trace.mark("initial-sync.end");
+      this.startupEditedPaths.clear();
       this.setStatus("connected");
     }
   }
@@ -4305,6 +4324,7 @@ var SyncEngine = class {
     this.trace.markPath("ui.editor-change", path, data);
   }
   onFileChanged(path) {
+    this.startupEditedPaths.add(path);
     this.trace.observePath(path);
     this.trace.markPath("editor-change.accepted", path, { initialSyncRunning: this.initialSyncRunning });
     this.push.onFileChanged(path);

@@ -1764,6 +1764,54 @@ describe('SyncEngine', () => {
       );
       expect(createCalls.length).toBe(1);
     });
+
+    it('startup editor typing merges instead of forking a conflict overwrite', async () => {
+      vi.useFakeTimers();
+      const leaf = makeStaleEditorLeaf('startup-merge.md', 'EDITOR fresh');
+      const app = makeApp([leaf]);
+      app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
+      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'startup-merge.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(false);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":5}');
+      mockDocInstance.get_text.mockReturnValue('EDITOR fresh remote');
+      mockDocInstance.import_and_diff.mockReturnValue('[{"retain":12},{"insert":" remote"}]');
+
+      await engine.start();
+      engine.onFileChanged('startup-merge.md');
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'startup-merge.md', updated_at: '2026-03-17T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":6}') }],
+        tombstones: [],
+      });
+
+      await flush(50);
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'startup-merge.md',
+        delta: new Uint8Array(22),
+        server_vv: new TextEncoder().encode('{"peer1":6}'),
+      });
+
+      await syncPromise;
+
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(0);
+      expect(leaf.view.editor.transaction).toHaveBeenCalled();
+      expect(mockVault.modify).not.toHaveBeenCalled();
+
+      vi.useRealTimers();
+    });
   });
 
   // ── echo guard ─────────────────────────────────────────────────────────────

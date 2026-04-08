@@ -61,6 +61,7 @@ export interface InitialSyncDeps {
   trace: (event: string, data?: Record<string, unknown>) => void;
   tracePath: (event: string, path: string, data?: Record<string, unknown>) => void;
   observePath: (path: string) => void;
+  wasEditedDuringStartup: (path: string) => boolean;
 }
 
 export async function runInitialSync(
@@ -390,7 +391,12 @@ async function syncOverlappingDoc(
 
   const doc = await docs.getOrLoad(path);
   const hadPersistedState = doc.version() > 0;
-  deps.tracePath('overlap.doc-state', path, { hadPersistedState, version: doc.version() });
+  const editedDuringStartup = deps.wasEditedDuringStartup(path);
+  deps.tracePath('overlap.doc-state', path, {
+    hadPersistedState,
+    version: doc.version(),
+    editedDuringStartup,
+  });
 
   // ── Phase 2: missing local CRDT state — adopt server, never merge ──────
   // Plaintext equality is NOT proof of causal equality. If the server has a
@@ -462,22 +468,29 @@ async function syncOverlappingDoc(
       const serverText = tempDoc.get_text();
 
       if (serverText.trim() !== '' && serverText !== localContent) {
-        deps.tracePath('overlap.concurrent-conflict', path, { serverLen: serverText.length, localLen: localContent.length });
-        const cPath = conflictPath(app, path);
-        warn(`${tag} concurrent external edit conflict`, { path, conflictPath: cPath });
-        await app.vault.create(cPath, localContent);
+        if (editedDuringStartup) {
+          deps.tracePath('overlap.concurrent-live-editor-merge', path, {
+            serverLen: serverText.length,
+            localLen: localContent.length,
+          });
+        } else {
+          deps.tracePath('overlap.concurrent-conflict', path, { serverLen: serverText.length, localLen: localContent.length });
+          const cPath = conflictPath(app, path);
+          warn(`${tag} concurrent external edit conflict`, { path, conflictPath: cPath });
+          await app.vault.create(cPath, localContent);
 
-        await docs.removeAndClean(path);
-        const freshDoc = await docs.getOrLoad(path);
-        const fullResult = await deps.requestSyncStart(path, null);
-        if (fullResult && fullResult.delta.length > 0) {
-          freshDoc.import_snapshot(fullResult.delta);
-          lastServerVV.set(path, fullResult.serverVV);
+          await docs.removeAndClean(path);
+          const freshDoc = await docs.getOrLoad(path);
+          const fullResult = await deps.requestSyncStart(path, null);
+          if (fullResult && fullResult.delta.length > 0) {
+            freshDoc.import_snapshot(fullResult.delta);
+            lastServerVV.set(path, fullResult.serverVV);
+          }
+          deps.tracePath('overlap.concurrent-write-to-vault', path, { textLen: freshDoc.get_text().length });
+          await editor.writeToVault(path, freshDoc.get_text());
+          await docs.persist(path);
+          return;
         }
-        deps.tracePath('overlap.concurrent-write-to-vault', path, { textLen: freshDoc.get_text().length });
-        await editor.writeToVault(path, freshDoc.get_text());
-        await docs.persist(path);
-        return;
       }
     }
 

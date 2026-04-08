@@ -44,6 +44,8 @@ export class SyncEngine {
   private hasConnected = false;
   private initialSyncRunning = false;
   private queuedBroadcasts: Record<string, unknown>[] = [];
+  /** Paths that received a real editor-change during the current startup. */
+  private startupEditedPaths = new Set<string>();
   /** Stores the server VV (JSON string) per doc after last successful sync. */
   private lastServerVV = new Map<string, string>();
   /** Tracks docs currently doing a VV-gap catch-up to prevent duplicates. */
@@ -94,6 +96,7 @@ export class SyncEngine {
 
   async start(): Promise<void> {
     this.stopped = false;
+    this.startupEditedPaths.clear();
     this.trace.resetStartup({
       vaultId: this.settings.vaultId,
       deviceName: this.settings.deviceName,
@@ -131,6 +134,7 @@ export class SyncEngine {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.push.stopAllTimers();
     this.lastRemoteWrite.clear();
+    this.startupEditedPaths.clear();
     this.trace.mark('stop.called');
     this.ws?.close();
     this.ws = null;
@@ -185,6 +189,7 @@ export class SyncEngine {
     this.lastRemoteWrite.clear();
     this.catchUpInProgress.clear();
     this.queuedBroadcasts = [];
+    this.startupEditedPaths.clear();
   }
 
   private wsUrl(): string {
@@ -282,6 +287,7 @@ export class SyncEngine {
           trace: (event, data) => this.trace.mark(event, data),
           tracePath: (event, path, data) => this.trace.markPath(event, path, data),
           observePath: (path) => this.trace.observePath(path),
+          wasEditedDuringStartup: (path) => this.startupEditedPaths.has(path),
         },
         onProgress,
         mode,
@@ -301,6 +307,7 @@ export class SyncEngine {
       this.queuedBroadcasts = [];
 
       this.trace.mark('initial-sync.end');
+      this.startupEditedPaths.clear();
       this.setStatus('connected');
     }
   }
@@ -534,6 +541,7 @@ export class SyncEngine {
   }
 
   onFileChanged(path: string): void {
+    this.startupEditedPaths.add(path);
     this.trace.observePath(path);
     this.trace.markPath('editor-change.accepted', path, { initialSyncRunning: this.initialSyncRunning });
     this.push.onFileChanged(path);
