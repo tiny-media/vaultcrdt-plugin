@@ -33,6 +33,10 @@ export class EditorIntegration {
     return content;
   }
 
+  hasOpenEditor(path: string): boolean {
+    return this.readCurrentContent(path) !== null;
+  }
+
   async writeToVault(filePath: string, content: string): Promise<void> {
     log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);

@@ -2990,6 +2990,9 @@ var EditorIntegration = class {
     });
     return content;
   }
+  hasOpenEditor(path) {
+    return this.readCurrentContent(path) !== null;
+  }
   async writeToVault(filePath, content) {
     log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);
@@ -3638,13 +3641,13 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
       await docs.persist(path);
       return;
     }
-    const isActiveEditorDoc = editor.getActiveEditorPath() === path;
-    if (isActiveEditorDoc && result && result.delta.length > 0) {
+    const hasOpenEditorDoc = editor.hasOpenEditor(path);
+    if (hasOpenEditorDoc && result && result.delta.length > 0) {
       await push.flushPendingEdits(path);
     }
     let diffJson = null;
     if (result.delta.length > 0) {
-      if (isActiveEditorDoc) {
+      if (hasOpenEditorDoc) {
         try {
           diffJson = doc.import_and_diff(result.delta);
         } catch (err) {
@@ -3657,7 +3660,7 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
     }
     lastServerVV.set(path, result.serverVV);
     const serverContent = doc.get_text();
-    if (localContent.trim() === "" && serverContent.trim() !== "" && !isActiveEditorDoc) {
+    if (localContent.trim() === "" && serverContent.trim() !== "" && !hasOpenEditorDoc) {
       log(`${tag} overlapping: empty local, adopting server`, { path });
       await editor.writeToVault(path, serverContent);
     } else {
@@ -3676,7 +3679,7 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
       } else {
         log(`${tag} overlapping match`, { path });
       }
-      if (isActiveEditorDoc) {
+      if (hasOpenEditorDoc) {
         if (diffJson) {
           let hasTextChanges = false;
           try {
@@ -4033,9 +4036,9 @@ var SyncEngine = class {
             await this.push.flushPendingEdits(docUuid);
             const result = await this.requestSyncStart(docUuid, localVVStr);
             if (result && result.delta.length > 0) {
-              const isActive = this.editor.getActiveEditorPath() === docUuid;
+              const hasOpenEditor = this.editor.hasOpenEditor(docUuid);
               let catchUpDiffJson = null;
-              if (isActive) {
+              if (hasOpenEditor) {
                 try {
                   catchUpDiffJson = doc.import_and_diff(result.delta);
                 } catch (e) {
@@ -4045,7 +4048,7 @@ var SyncEngine = class {
                 doc.import_snapshot(result.delta);
               }
               const catchUpText = doc.get_text();
-              if (isActive && catchUpDiffJson) {
+              if (hasOpenEditor && catchUpDiffJson) {
                 if (this.editor.applyDiffToEditor(docUuid, catchUpDiffJson, catchUpText, true)) {
                   const postContent = this.editor.readCurrentContent(docUuid);
                   if (postContent !== null && !doc.text_matches(postContent)) {

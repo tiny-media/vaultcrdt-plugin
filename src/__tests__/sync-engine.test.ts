@@ -1764,6 +1764,47 @@ describe('SyncEngine', () => {
       );
       expect(createCalls.length).toBe(1);
     });
+
+    it('open editor during initialSync uses surgical diff even when no active view is reported', async () => {
+      // Mobile startup can have a visible/open editor while getActiveViewOfType()
+      // still returns null. initialSync must still treat that doc as editor-backed
+      // and avoid a full setValue overwrite.
+      const leaf = makeStaleEditorLeaf('mobile-open.md', 'EDITOR fresh');
+      engine = new SyncEngine(makeApp([leaf]), makeSettings());
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'mobile-open.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":1}');
+      mockDocInstance.import_and_diff.mockReturnValue('[{"retain":6},{"insert":" remote"}]');
+      mockDocInstance.get_text.mockReturnValue('EDITOR fresh remote');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'mobile-open.md', updated_at: '2026-03-17T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":2}') }],
+        tombstones: [],
+      });
+
+      await flush(50);
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'mobile-open.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"peer1":2}'),
+      });
+
+      await syncPromise;
+
+      expect(leaf.view.editor.transaction).toHaveBeenCalled();
+      expect(leaf.view.editor.setValue).not.toHaveBeenCalled();
+      expect(mockVault.modify).not.toHaveBeenCalled();
+    });
   });
 
   // ── echo guard ─────────────────────────────────────────────────────────────

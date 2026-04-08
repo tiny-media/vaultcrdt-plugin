@@ -406,10 +406,10 @@ export class SyncEngine {
             await this.push.flushPendingEdits(docUuid);
             const result = await this.requestSyncStart(docUuid, localVVStr);
             if (result && result.delta.length > 0) {
-              // Use surgical diff for active editor doc to preserve typing
-              const isActive = this.editor.getActiveEditorPath() === docUuid;
+              // Use surgical diff for any open editor doc to preserve typing.
+              const hasOpenEditor = this.editor.hasOpenEditor(docUuid);
               let catchUpDiffJson: string | null = null;
-              if (isActive) {
+              if (hasOpenEditor) {
                 try {
                   catchUpDiffJson = doc.import_and_diff(result.delta);
                 } catch {
@@ -419,7 +419,7 @@ export class SyncEngine {
                 doc.import_snapshot(result.delta);
               }
               const catchUpText = doc.get_text();
-              if (isActive && catchUpDiffJson) {
+              if (hasOpenEditor && catchUpDiffJson) {
                 if (this.editor.applyDiffToEditor(docUuid, catchUpDiffJson, catchUpText, true)) {
                   const postContent = this.editor.readCurrentContent(docUuid);
                   if (postContent !== null && !doc.text_matches(postContent)) {
