@@ -43,8 +43,6 @@ export class SyncEngine {
   private hasConnected = false;
   private initialSyncRunning = false;
   private queuedBroadcasts: Record<string, unknown>[] = [];
-  /** Local edits typed during initialSync; flushed after the scan finishes. */
-  private deferredLocalEdits = new Map<string, string | undefined>();
   /** Stores the server VV (JSON string) per doc after last successful sync. */
   private lastServerVV = new Map<string, string>();
   /** Tracks docs currently doing a VV-gap catch-up to prevent duplicates. */
@@ -121,7 +119,6 @@ export class SyncEngine {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.push.stopAllTimers();
     this.lastRemoteWrite.clear();
-    this.deferredLocalEdits.clear();
     this.ws?.close();
     this.ws = null;
     await this.docs.persistAll();
@@ -175,7 +172,6 @@ export class SyncEngine {
     this.lastRemoteWrite.clear();
     this.catchUpInProgress.clear();
     this.queuedBroadcasts = [];
-    this.deferredLocalEdits.clear();
   }
 
   private wsUrl(): string {
@@ -273,17 +269,6 @@ export class SyncEngine {
     } finally {
       this.initialSyncRunning = false;
 
-      // If the user typed while initialSync was still walking the vault, do
-      // not let queued server broadcasts merge against stale pre-typing text.
-      // First seed the CRDT with the current visible editor content, then run
-      // the queued broadcasts, then push the final visible content to server.
-      const deferredEdits = new Map(this.deferredLocalEdits);
-      this.deferredLocalEdits.clear();
-
-      for (const [path, content] of deferredEdits) {
-        await this.push.syncVisibleContentIntoDoc(path, content);
-      }
-
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type as string;
         if (type === 'delta_broadcast') {
@@ -293,10 +278,6 @@ export class SyncEngine {
         }
       }
       this.queuedBroadcasts = [];
-
-      for (const [path, content] of deferredEdits) {
-        await this.push.pushVisibleContent(path, content);
-      }
 
       this.setStatus('connected');
     }
@@ -521,18 +502,10 @@ export class SyncEngine {
   // ── Public API (delegated to PushHandler) ──────────────────────────────────
 
   onFileChanged(path: string): void {
-    if (this.initialSyncRunning) {
-      this.deferredLocalEdits.set(path, undefined);
-      return;
-    }
     this.push.onFileChanged(path);
   }
 
   onFileChangedImmediate(path: string, content: string): void {
-    if (this.initialSyncRunning) {
-      this.deferredLocalEdits.set(path, content);
-      return;
-    }
     this.push.onFileChangedImmediate(path, content);
   }
 

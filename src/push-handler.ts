@@ -101,44 +101,29 @@ export class PushHandler {
     }
   }
 
-  /**
-   * Import the freshest visible local content into the CRDT without sending it.
-   * Used when a user typed during initialSync: we must merge queued server
-   * broadcasts against the user's current text before any network push happens.
-   */
-  async syncVisibleContentIntoDoc(path: string, fallbackContent?: string): Promise<boolean> {
-    const freshContent = this.editor.readCurrentContent(path) ?? fallbackContent ?? null;
-    if (freshContent === null) return false;
-    const doc = await this.docs.getOrLoad(path);
-    if (doc.text_matches(freshContent)) return false;
-    doc.sync_from_disk(freshContent);
-    return true;
-  }
-
   /** Flush pending debounce edits into CRDT before merging broadcast. */
   async flushPendingEdits(path: string): Promise<void> {
     const timer = this.pushDebounceTimers.get(path);
     if (!timer) return;
     clearTimeout(timer);
     this.pushDebounceTimers.delete(path);
-
     const freshContent = this.editor.readCurrentContent(path);
-    if (freshContent === null) return;
-
-    const doc = await this.docs.getOrLoad(path);
-    if (!doc.text_matches(freshContent)) {
-      const vvBefore = doc.export_vv_json();
-      doc.sync_from_disk(freshContent);
-      // Push flushed ops to server immediately — otherwise these local ops
-      // never reach the server, breaking the causal chain for subsequent deltas.
-      try {
-        const delta = doc.export_delta_since_vv_json(vvBefore);
-        if (delta.length > 0) {
-          this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
-          log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+    if (freshContent !== null) {
+      const doc = await this.docs.getOrLoad(path);
+      if (!doc.text_matches(freshContent)) {
+        const vvBefore = doc.export_vv_json();
+        doc.sync_from_disk(freshContent);
+        // Push flushed ops to server immediately — otherwise these local ops
+        // never reach the server, breaking the causal chain for subsequent deltas.
+        try {
+          const delta = doc.export_delta_since_vv_json(vvBefore);
+          if (delta.length > 0) {
+            this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
+            log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+          }
+        } catch (err) {
+          warn(`${this.tag} flush push failed`, { path, err });
         }
-      } catch (err) {
-        warn(`${this.tag} flush push failed`, { path, err });
       }
     }
   }
@@ -228,10 +213,6 @@ export class PushHandler {
   }
 
   // ── Private ──────────────────────────────────────────────────────────────────
-
-  pushVisibleContent(path: string, fallbackContent?: string): Promise<void> {
-    return this.pushFileDeltaAsync(path, fallbackContent ?? '');
-  }
 
   private pushFileDelta(path: string, content: string): void {
     void this.pushFileDeltaAsync(path, content);

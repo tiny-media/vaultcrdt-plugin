@@ -3195,20 +3195,6 @@ var PushHandler = class {
       warn(`${this.tag} delete journal persist failed`, { err });
     }
   }
-  /**
-   * Import the freshest visible local content into the CRDT without sending it.
-   * Used when a user typed during initialSync: we must merge queued server
-   * broadcasts against the user's current text before any network push happens.
-   */
-  async syncVisibleContentIntoDoc(path, fallbackContent) {
-    var _a, _b;
-    const freshContent = (_b = (_a = this.editor.readCurrentContent(path)) != null ? _a : fallbackContent) != null ? _b : null;
-    if (freshContent === null) return false;
-    const doc = await this.docs.getOrLoad(path);
-    if (doc.text_matches(freshContent)) return false;
-    doc.sync_from_disk(freshContent);
-    return true;
-  }
   /** Flush pending debounce edits into CRDT before merging broadcast. */
   async flushPendingEdits(path) {
     const timer = this.pushDebounceTimers.get(path);
@@ -3216,19 +3202,20 @@ var PushHandler = class {
     clearTimeout(timer);
     this.pushDebounceTimers.delete(path);
     const freshContent = this.editor.readCurrentContent(path);
-    if (freshContent === null) return;
-    const doc = await this.docs.getOrLoad(path);
-    if (!doc.text_matches(freshContent)) {
-      const vvBefore = doc.export_vv_json();
-      doc.sync_from_disk(freshContent);
-      try {
-        const delta = doc.export_delta_since_vv_json(vvBefore);
-        if (delta.length > 0) {
-          this.send({ type: "sync_push", doc_uuid: path, delta, peer_id: this.settings.peerId });
-          log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+    if (freshContent !== null) {
+      const doc = await this.docs.getOrLoad(path);
+      if (!doc.text_matches(freshContent)) {
+        const vvBefore = doc.export_vv_json();
+        doc.sync_from_disk(freshContent);
+        try {
+          const delta = doc.export_delta_since_vv_json(vvBefore);
+          if (delta.length > 0) {
+            this.send({ type: "sync_push", doc_uuid: path, delta, peer_id: this.settings.peerId });
+            log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+          }
+        } catch (err) {
+          warn(`${this.tag} flush push failed`, { path, err });
         }
-      } catch (err) {
-        warn(`${this.tag} flush push failed`, { path, err });
       }
     }
   }
@@ -3310,9 +3297,6 @@ var PushHandler = class {
     this.pushDebounceTimers.clear();
   }
   // ── Private ──────────────────────────────────────────────────────────────────
-  pushVisibleContent(path, fallbackContent) {
-    return this.pushFileDeltaAsync(path, fallbackContent != null ? fallbackContent : "");
-  }
   pushFileDelta(path, content) {
     void this.pushFileDeltaAsync(path, content);
   }
@@ -3747,8 +3731,6 @@ var SyncEngine = class {
     __publicField(this, "hasConnected", false);
     __publicField(this, "initialSyncRunning", false);
     __publicField(this, "queuedBroadcasts", []);
-    /** Local edits typed during initialSync; flushed after the scan finishes. */
-    __publicField(this, "deferredLocalEdits", /* @__PURE__ */ new Map());
     /** Stores the server VV (JSON string) per doc after last successful sync. */
     __publicField(this, "lastServerVV", /* @__PURE__ */ new Map());
     /** Tracks docs currently doing a VV-gap catch-up to prevent duplicates. */
@@ -3809,7 +3791,6 @@ var SyncEngine = class {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.push.stopAllTimers();
     this.lastRemoteWrite.clear();
-    this.deferredLocalEdits.clear();
     (_a = this.ws) == null ? void 0 : _a.close();
     this.ws = null;
     await this.docs.persistAll();
@@ -3855,7 +3836,6 @@ var SyncEngine = class {
     this.lastRemoteWrite.clear();
     this.catchUpInProgress.clear();
     this.queuedBroadcasts = [];
-    this.deferredLocalEdits.clear();
   }
   wsUrl() {
     return toWsBase(this.settings.serverUrl) + "/ws";
@@ -3939,11 +3919,6 @@ var SyncEngine = class {
       );
     } finally {
       this.initialSyncRunning = false;
-      const deferredEdits = new Map(this.deferredLocalEdits);
-      this.deferredLocalEdits.clear();
-      for (const [path, content] of deferredEdits) {
-        await this.push.syncVisibleContentIntoDoc(path, content);
-      }
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type;
         if (type === "delta_broadcast") {
@@ -3953,9 +3928,6 @@ var SyncEngine = class {
         }
       }
       this.queuedBroadcasts = [];
-      for (const [path, content] of deferredEdits) {
-        await this.push.pushVisibleContent(path, content);
-      }
       this.setStatus("connected");
     }
   }
@@ -4145,17 +4117,9 @@ var SyncEngine = class {
   }
   // ── Public API (delegated to PushHandler) ──────────────────────────────────
   onFileChanged(path) {
-    if (this.initialSyncRunning) {
-      this.deferredLocalEdits.set(path, void 0);
-      return;
-    }
     this.push.onFileChanged(path);
   }
   onFileChangedImmediate(path, content) {
-    if (this.initialSyncRunning) {
-      this.deferredLocalEdits.set(path, content);
-      return;
-    }
     this.push.onFileChangedImmediate(path, content);
   }
   onFileDeleted(path) {
