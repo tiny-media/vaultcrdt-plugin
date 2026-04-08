@@ -1,6 +1,6 @@
 {
   "name": "vaultcrdt-plugin",
-  "version": "0.2.27",
+  "version": "0.2.28",
   "description": "Obsidian plugin for VaultCRDT sync",
   "type": "module",
   "main": "main.js",

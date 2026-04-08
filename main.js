@@ -2996,7 +2996,17 @@ var EditorIntegration = class {
     const currentEditor = this.readCurrentContent(filePath);
     if (currentEditor === content) {
       this.lastRemoteWrite.set(filePath, content);
-      return;
+      if (existing instanceof import_obsidian3.TFile) {
+        const currentDisk = await this.app.vault.read(existing);
+        if (currentDisk === content) return;
+        this.writingFromRemote.add(filePath);
+        try {
+          await this.app.vault.modify(existing, content);
+        } finally {
+          setTimeout(() => this.writingFromRemote.delete(filePath), 500);
+        }
+        return;
+      }
     }
     if (existing instanceof import_obsidian3.TFile) {
       const current = await this.app.vault.read(existing);
@@ -3776,8 +3786,8 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
         const currentEditorContent = editor.readCurrentContent(path);
         const editorAlreadyMatches = currentEditorContent !== null && doc.text_matches(currentEditorContent);
         if (editorAlreadyMatches) {
-          deps.tracePath("overlap.active-noop", path, { textLen: serverContent.length });
-          lastRemoteWrite.set(path, currentEditorContent);
+          deps.tracePath("overlap.active-persist-disk", path, { textLen: serverContent.length });
+          await editor.writeToVault(path, serverContent);
         } else if (diffJson) {
           let hasTextChanges = false;
           try {
@@ -3800,7 +3810,8 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
               await editor.writeToVault(path, serverContent);
             }
           } else {
-            deps.tracePath("overlap.active-noop", path, { textLen: serverContent.length, reason: "empty-diff" });
+            deps.tracePath("overlap.active-persist-disk", path, { textLen: serverContent.length, reason: "empty-diff" });
+            await editor.writeToVault(path, serverContent);
           }
         } else if (result.delta.length > 0) {
           deps.tracePath("overlap.active-write-to-vault", path, { textLen: serverContent.length });

@@ -37,15 +37,27 @@ export class EditorIntegration {
     log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);
 
-    // If an open editor already shows the target content, do NOTHING.
-    // On mobile startup the on-disk snapshot may still be stale while the
-    // visible editor buffer already contains the merged text; calling
-    // setValue(content) again is redundant and can still clobber the user's
-    // in-flight composition/typing state.
+    // If an open editor already shows the target content, do NOT touch the
+    // editor again. On mobile startup the visible buffer may already be the
+    // merged truth while the on-disk snapshot is still stale; re-running
+    // setValue(content) is redundant and can clobber the user's composition
+    // state. We still need to persist the matching text to disk, though.
     const currentEditor = this.readCurrentContent(filePath);
     if (currentEditor === content) {
       this.lastRemoteWrite.set(filePath, content);
-      return;
+      if (existing instanceof TFile) {
+        const currentDisk = await this.app.vault.read(existing);
+        if (currentDisk === content) return;
+        this.writingFromRemote.add(filePath);
+        try {
+          await this.app.vault.modify(existing, content);
+        } finally {
+          setTimeout(() => this.writingFromRemote.delete(filePath), 500);
+        }
+        return;
+      }
+      // No existing file despite an open editor is unexpected, but fall back
+      // to the normal disk-create path below instead of returning early.
     }
 
     // Skip write if on-disk content is already identical

@@ -1813,13 +1813,9 @@ describe('SyncEngine', () => {
       vi.useRealTimers();
     });
 
-    it('active editor matching merged text is a no-op, not a rewrite', async () => {
+    it('active editor matching merged text completes without conflict fork', async () => {
       const mockEditor = {
-        getValue: vi.fn()
-          .mockReturnValueOnce('EDITOR fresh')
-          .mockReturnValueOnce('EDITOR fresh')
-          .mockReturnValueOnce('EDITOR fresh')
-          .mockReturnValue('STALE view'),
+        getValue: vi.fn().mockReturnValue('EDITOR fresh'),
         setValue: vi.fn(),
         getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
         setCursor: vi.fn(),
@@ -1868,8 +1864,10 @@ describe('SyncEngine', () => {
 
       await syncPromise;
 
-      expect(mockEditor.setValue).not.toHaveBeenCalled();
-      expect(mockVault.modify).not.toHaveBeenCalled();
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(0);
     });
   });
 
@@ -2040,7 +2038,7 @@ describe('SyncEngine', () => {
 
       expect(mockEditor.setValue).not.toHaveBeenCalled();
       expect(mockEditor.setCursor).not.toHaveBeenCalled();
-      expect(mockVault.modify).not.toHaveBeenCalled();
+      expect(mockVault.modify).toHaveBeenCalledWith(expect.anything(), 'remote content');
     });
 
     it('falls back to disk write when no editor is open', async () => {

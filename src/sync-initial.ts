@@ -593,8 +593,8 @@ async function syncOverlappingDoc(
           currentEditorContent !== null && doc.text_matches(currentEditorContent);
 
         if (editorAlreadyMatches) {
-          deps.tracePath('overlap.active-noop', path, { textLen: serverContent.length });
-          lastRemoteWrite.set(path, currentEditorContent);
+          deps.tracePath('overlap.active-persist-disk', path, { textLen: serverContent.length });
+          await editor.writeToVault(path, serverContent);
         } else if (diffJson) {
           let hasTextChanges = false;
           try {
@@ -617,7 +617,8 @@ async function syncOverlappingDoc(
               await editor.writeToVault(path, serverContent);
             }
           } else {
-            deps.tracePath('overlap.active-noop', path, { textLen: serverContent.length, reason: 'empty-diff' });
+            deps.tracePath('overlap.active-persist-disk', path, { textLen: serverContent.length, reason: 'empty-diff' });
+            await editor.writeToVault(path, serverContent);
           }
         } else if (result.delta.length > 0) {
           deps.tracePath('overlap.active-write-to-vault', path, { textLen: serverContent.length });
