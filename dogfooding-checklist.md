@@ -1,12 +1,21 @@
-# Dogfooding-Checkliste — v0.2.17
+# Dogfooding-Checkliste — v0.2.18
 
-Ziel: manuelles Ende-zu-Ende-Testing nach Conflict-Storm-Härtung (`f366dd8`),
-Delete-Ack-Härtung (`aa60d60`) und Dep-Updates.
-Setup: Desktop (Vault A ↔ Server) + Android parallel wo angegeben.
+Ziel: manuelles Ende-zu-Ende-Testing nach
+- Conflict-Storm-Härtung (`f366dd8`)
+- Delete-Ack-Härtung (`aa60d60`)
+- SetupModal Admin-Token + Reconfigure (`87a40f4`, v0.2.18)
 
-Wichtig: Vor Start den richardsachen-Vault + andere alte Vaults löschen (nicht
-in Prod). Der Fix heilt den bestehenden Schaden nicht, nur neue Vaults starten
-sauber.
+Setup: Desktop (Vault A ↔ Server `home` v0.2.6) + Android parallel wo
+angegeben. Server-DB wurde in Session 10 komplett gewiped (Baseline
+177 KB, Target Re-Check 2026-07-08) — Vaults werden über das Plugin
+neu angelegt, kein curl mehr nötig.
+
+Legende:
+- 🧑 = GUI/manueller Schritt (nur am Gerät prüfbar)
+- 🤖 = kann über pi-mono als Remote-Trigger laufen (siehe Sektion 11)
+
+**Sektionen 1–9 sind durchgehend 🧑** (Editor/Filesystem/Netz-Manipulation
+am Gerät). Sektion 10 mischt 🧑 + 🤖. Sektion 11 ist reine 🤖-Automatisierung.
 
 ---
 
@@ -97,11 +106,127 @@ sauber.
 
 ---
 
+## 10. Setup-Flow (v0.2.18, Kernfall für `87a40f4`)
+
+### 10a. Neuen Vault via Plugin anlegen
+
+- [ ] 🧑 BRAT auf Desktop auf v0.2.18 pullen, Plugin neu laden
+- [ ] 🧑 SetupModal öffnet sich automatisch (weil vaultId/Secret nach Wipe leer sind)
+- [ ] 🧑 Server-URL + neuer Vault-Name (z.B. `arbeitsnotizen`) + Passwort eintragen
+- [ ] 🧑 "Creating a new vault?" aufklappen, Admin-Token aus SOPS einfügen (Token-Quelle: `sops -d ~/fleet/hosts/home/stacks/vaultcrdt/secrets.sops.yaml`)
+- [ ] 🧑 Connect klicken → Modal schließt ohne Error, Plugin verbindet (sync ● in Statusbar)
+- [ ] 🤖 `/vault/peers` (siehe 11b) zeigt Desktop als neuen Peer
+- [ ] 🤖 `/debug/vault-stats` (siehe 11c) zeigt den neuen Vault mit `doc_count > 0` nach dem ersten Push
+- [ ] 🧑 Admin-Token wird **nicht** in `data.json` persistiert: `grep -i admin .obsidian/plugins/vaultcrdt/data.json` → kein Treffer
+- [ ] 🧑 Android-BRAT auf v0.2.18, Setup mit gleichem Vault-Name + Passwort, **ohne Admin-Token** → Connect funktioniert (existing vault path)
+
+### 10b. Reconfigure zu anderem Vault
+
+- [ ] 🧑 Settings öffnen → "Reconnect to a different vault" → Reconfigure
+- [ ] 🧑 Anderen Vault-Namen + Passwort + Admin-Token eintragen → Connect
+- [ ] 🧑 Nach Reconnect: sync ● in Statusbar, keine Ghost-Dateien aus dem alten Vault
+- [ ] 🧑 Filesystem-Check: `.obsidian/plugins/vaultcrdt/state/*.loro` enthält nur noch Keys zum neuen Vault
+- [ ] 🤖 `/debug/vault-stats` zeigt beide Vaults separat, alter Vault bleibt unverändert (kein versehentliches Überschreiben)
+
+### 10c. Reconfigure auf gleichen Vault (State-Erhalt)
+
+- [ ] 🧑 Reconfigure mit **identischem** vaultId, nur Server-URL ändern
+- [ ] 🧑 Lokale `.loro` State-Files bleiben erhalten (kein Wipe weil vaultId gleich)
+- [ ] 🧑 Nach Reconnect: sync läuft ohne Re-Download
+
+### 10d. 401-Hint-Messaging
+
+- [ ] 🧑 In SetupModal frischen Vault-Namen eintragen **ohne** Admin-Token
+- [ ] 🧑 Connect → Modal zeigt "Authentication failed … expand 'Creating a new vault?' and enter the admin token"
+- [ ] 🧑 Admin-Token nachtragen, erneut Connect → klappt
+
+---
+
+## 11. Automatisierung via pi-mono (Remote Triggers)
+
+Diese Checks brauchen **keine** GUI und können als scheduled triggers
+auf pi-mono laufen. Zweck: kontinuierliches Monitoring zwischen
+manuellen Dogfood-Runden; sie ersetzen den Dogfood nicht, sondern
+fangen Server-seitige Regressionen frühzeitig ab.
+
+Empfohlene Frequenz in Klammern; konkrete Cron-Strings entstehen beim
+Einrichten mit dem pi-mono `schedule` skill.
+
+### 11a. Health-Ping  (15 min)
+
+```bash
+curl -fsS https://<server>/health | jq '.version'
+```
+
+- Erwarte: HTTP 200, `.version == "0.2.6"`
+- Alert-Bedingung: HTTP ≠ 200 oder Version drift
+- Context: fleet-Host ist `home`, Stack `vaultcrdt`
+
+### 11b. Auth + Peer-Inventar  (daily)
+
+```bash
+TOKEN=$(sops -d ~/fleet/hosts/home/stacks/vaultcrdt/secrets.sops.yaml \
+  | awk -F'"' '/VAULTCRDT_ADMIN_TOKEN/{print $4}')
+JWT=$(curl -fsS -X POST https://<server>/auth/verify \
+  -H 'Content-Type: application/json' \
+  -d "{\"vault_id\":\"<vault>\",\"api_key\":\"<pw>\"}" | jq -r .token)
+curl -fsS https://<server>/vault/peers -H "Authorization: Bearer $JWT" | jq .
+```
+
+- Erwarte: JWT ≠ null; `peers[]` enthält Desktop + Android
+- Alert: einer der beiden `last_seen_at` älter als 7 Tage → verdächtig offline
+- Der `api_key` für den Dogfood-Vault liegt ebenfalls in SOPS (oder 1Password), **nicht** im Skript hardcoden
+
+### 11c. Baseline-Drift  (daily)
+
+```bash
+curl -fsS https://<server>/debug/vault-stats \
+  -H "Authorization: Bearer $JWT" | jq '{doc_count, total_snapshot_bytes, total_vv_bytes}'
+```
+
+- Baseline aus `project_server_baseline_2026-04-08` Memory:
+  DB ~177 KB, `doc_count` klein (wipe), NET-I/O ~0
+- Alert: `total_snapshot_bytes` > 500 MB (erwartetes 3-Monats-Wachstum)
+  oder DB-Explosion (> 10× Baseline) in < 24h
+- Target Re-Check: **2026-07-08** für 3-Monats-Delta (Memory-Reminder)
+
+### 11d. Server-Log-Scan  (daily)
+
+```bash
+ssh home 'docker logs --since 24h vaultcrdt-server 2>&1 \
+  | grep -E "\bERROR\b|\bWARN\b|panic|tombstone refused" \
+  | grep -v "known-noise-pattern"'
+```
+
+- Erwarte: leere Ausgabe
+- Alert: jede Zeile → Incident-Trigger
+- Noise-Filter kuratieren, damit echte Regressionen nicht in Rauschen untergehen
+
+### 11e. Release-Readiness (on tag push)
+
+Wenn ein `v*` Tag auf `vaultcrdt-plugin` oder `vaultcrdt-server` landet:
+
+- Plugin: GitHub-Release muss binnen 10 min erscheinen (Release-Workflow grün), `main.js` + `manifest.json` + `wasm/` als Assets
+- Server: Release-Workflow grün, Docker-Image-Tag `ghcr.io/tiny-media/vaultcrdt-server:<version>` pullbar
+- Alert: Workflow rot oder Asset fehlt
+
+### Was explizit NICHT automatisiert wird
+
+- Alles mit 🧑 in Sektionen 1–10 (Conflict-Fork, Editor-first, Delete-Races, Rename, Vault-Klon-Caveat) — braucht echte Obsidian-Instanzen auf Desktop+Android
+- Android-Flugmodus-Szenarien
+- Visuelle Conflict-File-Inspektion
+
+Das manuelle Dogfood bleibt **vor jedem Release** Pflicht. Die
+Automatisierung fängt nur Drift zwischen den Runden ab.
+
+---
+
 ## Ergebnis
 
 Datum: ___________
-Desktop-Version: 0.2.17
-Android-Version: 0.2.17
+Desktop-Version: 0.2.18
+Android-Version: 0.2.18
+Server-Version: 0.2.6
 
 - [ ] Alle Checks grün → bereit für weitere Nutzung
 - [ ] Gefundene Issues → unten notieren
