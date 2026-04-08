@@ -1,5 +1,5 @@
 import { Plugin, Platform, TFile, Notice } from 'obsidian';
-import { VaultCRDTSettings, VaultCRDTSettingsTab, DEFAULT_SETTINGS } from './settings';
+import { VaultCRDTSettings, VaultCRDTSettingsTab, DEFAULT_SETTINGS, ensureDeviceIdentity } from './settings';
 import { initWasm } from './wasm-bridge';
 import { SyncEngine } from './sync-engine';
 import type { SyncMode } from './sync-engine';
@@ -261,6 +261,15 @@ export default class VaultCRDTPlugin extends Plugin {
       delete data.registrationKey;
     }
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+
+    // Startup invariant: peerId and deviceName must exist BEFORE the
+    // SyncEngine is constructed, otherwise the Loro doc would be created
+    // with an unstable random PeerID and the WS handshake would send an
+    // empty peer_id. The SettingsTab used to lazily generate these on first
+    // open, which is too late — see gpt-audit/conflict-storm-plan.md §3B.
+    if (ensureDeviceIdentity(this.settings)) {
+      await this.saveSettings();
+    }
   }
 
   async saveSettings(): Promise<void> {

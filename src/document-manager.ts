@@ -7,7 +7,7 @@ export class DocumentManager {
   private documents = new Map<string, WasmSyncDocument>();
   private storage: StateStorage;
 
-  constructor(app: App) {
+  constructor(app: App, private peerId: string) {
     this.storage = new StateStorage(app);
   }
 
@@ -20,7 +20,11 @@ export class DocumentManager {
     const cached = this.documents.get(filePath);
     if (cached) return cached;
 
-    const doc = createDocument();
+    // Pass docUuid + stable peerId so the Loro doc commits its own ops on a
+    // single per-device VV line (see derive_peer_id in vaultcrdt-crdt). Tests
+    // mock createDocument and ignore the args, but production correctness
+    // depends on this.
+    const doc = createDocument(filePath, this.peerId);
     const saved = await this.storage.load(filePath);
     if (saved) {
       doc.import_snapshot(saved);

@@ -18,6 +18,29 @@ interface DocEntry {
 
 const PARALLEL_DOWNLOADS = 5;
 
+// Marker identifiers for throwaway probe documents used to inspect server
+// snapshots without polluting the device's stable peer-id space. The probe
+// doc's VV/peerId never escapes its enclosing function scope.
+const PROBE_DOC_UUID = '__probe__';
+const PROBE_PEER_ID = '__probe__';
+
+/**
+ * Return the freshest local text for a file: editor content if any leaf has
+ * the file open (covers active AND background editors via iterateAllLeaves),
+ * otherwise the on-disk content. Adopt-/conflict-decisions in the initial
+ * sync MUST use this — disk content alone can be stale relative to unsaved
+ * editor edits, which would lead to false adopts and lost work.
+ */
+async function readEffectiveLocalContent(
+  app: App,
+  editor: EditorIntegration,
+  file: TFile,
+): Promise<string> {
+  const fromEditor = editor.readCurrentContent(file.path);
+  if (fromEditor !== null) return fromEditor;
+  return await app.vault.read(file);
+}
+
 export interface InitialSyncDeps {
   app: App;
   docs: DocumentManager;
@@ -129,7 +152,7 @@ export async function runInitialSync(
   const activeDoc = editor.getActiveEditorPath();
   if (activeDoc && serverDocMap.has(activeDoc) && localFileMap.has(activeDoc)) {
     const file = localFileMap.get(activeDoc)!;
-    const localContent = await app.vault.read(file);
+    const localContent = await readEffectiveLocalContent(app, editor, file);
     contentHashes.set(activeDoc, fnv1aHash(localContent));
     await syncOverlappingDoc(deps, activeDoc, localContent, serverDocMap);
     syncedPaths.add(activeDoc);
@@ -206,27 +229,28 @@ export async function runInitialSync(
 
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
       // VV matches — but verify local content hasn't changed externally
-      // (git pull, Syncthing, manual edit while Obsidian was closed)
-      const diskContent = await app.vault.read(file);
-      const diskHash = fnv1aHash(diskContent);
-      contentHashes.set(file.path, diskHash);
+      // (git pull, Syncthing, manual edit while Obsidian was closed) OR
+      // in an open editor with unsaved keystrokes.
+      const effective = await readEffectiveLocalContent(app, editor, file);
+      const effectiveHash = fnv1aHash(effective);
+      contentHashes.set(file.path, effectiveHash);
 
-      if (diskHash === cached.contentHash) {
+      if (effectiveHash === cached.contentHash) {
         lastServerVV.set(file.path, currentServerVV);
         skippedVVMatch++;
         stepsDone++;
         onProgress?.(stepsDone, totalSteps, changed);
         continue;
       }
-      // Local content changed externally — fall through to full sync
-      await syncOverlappingDoc(deps, file.path, diskContent, serverDocMap);
+      // Local content changed (disk or editor) — fall through to full sync
+      await syncOverlappingDoc(deps, file.path, effective, serverDocMap);
       changed++;
       stepsDone++;
       onProgress?.(stepsDone, totalSteps, changed);
       continue;
     }
 
-    const localContent = await app.vault.read(file);
+    const localContent = await readEffectiveLocalContent(app, editor, file);
     contentHashes.set(file.path, fnv1aHash(localContent));
     await syncOverlappingDoc(deps, file.path, localContent, serverDocMap);
     stepsDone++;
@@ -238,7 +262,7 @@ export async function runInitialSync(
   // 3. Local-only docs — push full snapshot via doc_create (skip in pull mode)
   if (mode !== 'pull') {
     for (const file of localOnlyFiles) {
-      const content = await app.vault.read(file);
+      const content = await readEffectiveLocalContent(app, editor, file);
       contentHashes.set(file.path, fnv1aHash(content));
       log(`${tag} local-only push`, { path: file.path, contentLen: content.length });
       const doc = await docs.getOrLoad(file.path);
@@ -296,29 +320,64 @@ async function syncOverlappingDoc(
   serverDocMap: Map<string, DocEntry>,
 ): Promise<void> {
   const { app, docs, editor, push, lastServerVV, lastRemoteWrite, tag } = deps;
+
+  // Belt-and-suspenders: every caller is supposed to pass editor-aware
+  // content (see readEffectiveLocalContent), but defensively re-read from
+  // any open editor here too. Adopt-/conflict-decisions below MUST be made
+  // against the freshest local text — disk content can be stale relative to
+  // unsaved keystrokes in any open leaf.
+  const freshEditorContent = editor.readCurrentContent(path);
+  if (freshEditorContent !== null) {
+    localContent = freshEditorContent;
+  }
+
   const doc = await docs.getOrLoad(path);
   const hadPersistedState = doc.version() > 0;
 
-  // Concurrent-create conflict detection: file created offline without CRDT history
-  if (!hadPersistedState && localContent.trim() !== '') {
-    const result = await deps.requestSyncStart(path, null);
-    if (result && result.delta.length > 0) {
-      const tempDoc = createDocument();
-      tempDoc.import_snapshot(result.delta);
+  // ── Phase 2: missing local CRDT state — adopt server, never merge ──────
+  // Plaintext equality is NOT proof of causal equality. If the server has a
+  // doc for this path and we don't, we MUST NOT run sync_from_disk(local) on
+  // a fresh Loro doc — that synthesises a brand-new CRDT history that will
+  // collide with the server's existing history at the next merge and can
+  // double the document text. Instead: adopt the server snapshot wholesale.
+  // If the local text differs, preserve the local copy in a conflict file
+  // first (unless the local file is blank, in which case the server is
+  // unambiguously the canonical version).
+  if (!hadPersistedState) {
+    const probe = await deps.requestSyncStart(path, null);
+    if (probe && probe.delta.length > 0) {
+      const tempDoc = createDocument(PROBE_DOC_UUID, PROBE_PEER_ID);
+      tempDoc.import_snapshot(probe.delta);
       const serverText = tempDoc.get_text();
 
-      if (serverText.trim() !== '' && serverText !== localContent) {
-        const cPath = conflictPath(app, path);
-        warn(`${tag} concurrent create conflict`, { path, conflictPath: cPath });
-        await app.vault.create(cPath, localContent);
+      const localIsBlank = localContent.trim() === '';
+      const textsDiffer = serverText !== localContent;
 
-        doc.import_snapshot(result.delta);
-        lastServerVV.set(path, result.serverVV);
-        await editor.writeToVault(path, doc.get_text());
-        await docs.persist(path);
-        return;
+      if (textsDiffer && !localIsBlank) {
+        const cPath = conflictPath(app, path);
+        warn(`${tag} state-loss conflict (missing local CRDT)`, { path, conflictPath: cPath });
+        await app.vault.create(cPath, localContent);
+      } else if (textsDiffer) {
+        log(`${tag} state-loss adopt (empty local, server has content)`, { path });
+      } else {
+        log(`${tag} state-loss adopt (identical text)`, { path });
       }
+
+      doc.import_snapshot(probe.delta);
+      lastServerVV.set(path, probe.serverVV);
+      if (textsDiffer) {
+        await editor.writeToVault(path, serverText);
+      }
+      await docs.persist(path);
+      return;
     }
+    // Server has the path in doc_list but returned no delta (or doc_unknown).
+    // This means there is nothing to adopt: either the server stub is empty,
+    // or the path has just been deleted between doc_list and sync_start. The
+    // synthetic-history risk that Phase 2 was added to prevent only matters
+    // when the server has *real* CRDT content to clash with — an empty server
+    // stub is safe to push the local content into. Fall through to the
+    // normal local-create path (sync_from_disk + push delta).
   }
 
   // Detect external disk changes (edits outside Obsidian while it was closed).
@@ -336,7 +395,7 @@ async function syncOverlappingDoc(
     // Concurrent external-edit conflict detection
     if (result.delta.length > 0 && hadLocalDiskChange) {
       const persistedSnapshot = await docs.loadPersistedSnapshot(path);
-      const tempDoc = createDocument();
+      const tempDoc = createDocument(PROBE_DOC_UUID, PROBE_PEER_ID);
       if (persistedSnapshot) tempDoc.import_snapshot(persistedSnapshot);
       tempDoc.import_snapshot(result.delta);
       const serverText = tempDoc.get_text();
@@ -359,29 +418,46 @@ async function syncOverlappingDoc(
       }
     }
 
-    // Disjoint-VV conflict detection
+    // ── Phase 3: disjoint VV — adopt server, never merge ────────────────
+    // Plaintext equality may justify adoption, never causal merge. Two
+    // independent CRDT histories with the same end text MUST NOT be merged
+    // through Loro: Loro will treat the inserts as concurrent and concatenate
+    // them, doubling the document. The previous "no fork when disjoint VVs
+    // but same content" optimisation is the architectural root cause of the
+    // 805-conflict-file storm in the richardsachen vault — see
+    // gpt-audit/conflict-storm-plan.md.
     if (
       result.delta.length > 0 &&
       clientVV !== '{}' &&
       !hasSharedHistory(clientVV, result.serverVV)
     ) {
-      const tempDoc = createDocument();
+      const tempDoc = createDocument(PROBE_DOC_UUID, PROBE_PEER_ID);
       tempDoc.import_snapshot(result.delta);
       const serverText = tempDoc.get_text();
 
-      if (serverText.trim() !== '' && localContent.trim() !== '' && serverText !== localContent) {
+      const textsDiffer = serverText !== localContent;
+      if (textsDiffer && localContent.trim() !== '') {
         const cPath = conflictPath(app, path);
         warn(`${tag} disjoint VV conflict`, { path, conflictPath: cPath });
         await app.vault.create(cPath, localContent);
-
-        await docs.removeAndClean(path);
-        const freshDoc = await docs.getOrLoad(path);
-        freshDoc.import_snapshot(result.delta);
-        lastServerVV.set(path, result.serverVV);
-        await editor.writeToVault(path, freshDoc.get_text());
-        await docs.persist(path);
-        return;
+      } else if (textsDiffer) {
+        log(`${tag} disjoint VV adopt (blank local)`, { path });
+      } else {
+        log(`${tag} disjoint VV adopt (identical text)`, { path });
       }
+
+      // Discard the disjoint local CRDT history entirely and replace it with
+      // a fresh doc seeded from the server snapshot. removeAndClean drops
+      // both the in-memory doc and the persisted .loro file.
+      await docs.removeAndClean(path);
+      const freshDoc = await docs.getOrLoad(path);
+      freshDoc.import_snapshot(result.delta);
+      lastServerVV.set(path, result.serverVV);
+      if (textsDiffer) {
+        await editor.writeToVault(path, serverText);
+      }
+      await docs.persist(path);
+      return;
     }
 
     // For the active editor doc: flush pending keystrokes into the CRDT

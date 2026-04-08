@@ -11,21 +11,15 @@ pub struct WasmSyncDocument {
 impl WasmSyncDocument {
     #[wasm_bindgen(constructor)]
     pub fn new(doc_uuid: &str, peer_id: &str) -> Self {
-        Self {
-            inner: SyncDocument::new(doc_uuid, peer_id),
-        }
+        Self { inner: SyncDocument::new(doc_uuid, peer_id) }
     }
 
     pub fn insert_text(&self, pos: usize, text: &str) -> Result<(), JsValue> {
-        self.inner
-            .insert_text(pos, text)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        self.inner.insert_text(pos, text).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     pub fn delete_text(&self, pos: usize, len: usize) -> Result<(), JsValue> {
-        self.inner
-            .delete_text(pos, len)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        self.inner.delete_text(pos, len).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     pub fn get_text(&self) -> String {
@@ -43,16 +37,12 @@ impl WasmSyncDocument {
 
     /// Export a full snapshot (includes operation history for server-side merge).
     pub fn export_snapshot(&self) -> Result<Vec<u8>, JsValue> {
-        self.inner
-            .export_full_snapshot()
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        self.inner.export_full_snapshot().map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Import a snapshot (full or shallow) or delta into the document.
     pub fn import_snapshot(&self, snapshot: &[u8]) -> Result<(), JsValue> {
-        self.inner
-            .import_delta(snapshot)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        self.inner.import_delta(snapshot).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Export the version vector as a JSON string, e.g. `{"12345":47}`.
@@ -77,9 +67,7 @@ impl WasmSyncDocument {
     /// Import a delta and return a JSON string of text diff ops.
     /// Returns `[{"retain":5},{"insert":"xyz"},{"delete":2}]` or empty string if no change.
     pub fn import_and_diff(&self, delta: &[u8]) -> Result<String, JsValue> {
-        self.inner
-            .import_and_diff(delta)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        self.inner.import_and_diff(delta).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }
 
@@ -97,10 +85,7 @@ mod tests {
         doc.insert_text(0, "hello").unwrap();
         let vv_after: serde_json::Value =
             serde_json::from_str(&doc.export_vv_json()).expect("valid JSON");
-        assert!(
-            vv_after.as_object().unwrap().len() == 1,
-            "one peer after insert"
-        );
+        assert!(vv_after.as_object().unwrap().len() == 1, "one peer after insert");
 
         // VV must change after another insert
         doc.insert_text(5, " world").unwrap();

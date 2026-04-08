@@ -32,7 +32,7 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-function defaultDeviceName(): string {
+export function defaultDeviceName(): string {
   if (Platform.isDesktopApp) {
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -44,6 +44,31 @@ function defaultDeviceName(): string {
   }
   if (Platform.isMobileApp) return 'mobile';
   return 'device';
+}
+
+/**
+ * Startup invariant: ensure peerId and deviceName exist on the settings
+ * object before the SyncEngine is constructed. Returns true if any field
+ * was filled in (caller is then expected to persist).
+ *
+ * Pure helper — no I/O, no Plugin reference — so it can be unit-tested
+ * directly without mocking the full plugin lifecycle.
+ */
+export function ensureDeviceIdentity(
+  settings: VaultCRDTSettings,
+  genPeerId: () => string = () => crypto.randomUUID(),
+  genDeviceName: () => string = defaultDeviceName,
+): boolean {
+  let changed = false;
+  if (!settings.peerId) {
+    settings.peerId = genPeerId();
+    changed = true;
+  }
+  if (!settings.deviceName) {
+    settings.deviceName = genDeviceName();
+    changed = true;
+  }
+  return changed;
 }
 
 export class VaultCRDTSettingsTab extends PluginSettingTab {
@@ -66,17 +91,8 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    // Auto-generate IDs and device name if empty
-    let needsSave = false;
-    if (!this.plugin.settings.peerId) {
-      this.plugin.settings.peerId = crypto.randomUUID();
-      needsSave = true;
-    }
-    if (!this.plugin.settings.deviceName) {
-      this.plugin.settings.deviceName = defaultDeviceName();
-      needsSave = true;
-    }
-    if (needsSave) void this.plugin.saveSettings();
+    // Note: peerId and deviceName are guaranteed to exist by main.ts
+    // loadSettings() — this tab is view/edit only, never the source of truth.
 
     const pluginVersion: string = this.plugin.manifest.version;
 

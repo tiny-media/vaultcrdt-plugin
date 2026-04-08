@@ -389,8 +389,11 @@ describe('SyncEngine', () => {
       mockVault.read.mockResolvedValue('offline content');
       mockDocInstance.text_matches.mockReturnValue(true);
       mockDocInstance.version.mockReturnValue(5);
-      // Client has peer 999 ops that server doesn't know about
-      mockDocInstance.export_vv_json.mockReturnValue('{"999":5}');
+      // Client and server share the legacy peer "12345"; the client has its
+      // own additional peer "999" with offline edits. NOT disjoint — Phase 3
+      // of the conflict-storm fix only adopts when the peer sets are strict
+      // disjoint, so this case still goes through the normal merge+push path.
+      mockDocInstance.export_vv_json.mockReturnValue('{"999":5,"12345":3}');
       mockDocInstance.get_text.mockReturnValue('offline content');
       mockDocInstance.export_delta_since_vv_json.mockReturnValue(new Uint8Array(32));
 
@@ -491,6 +494,12 @@ describe('SyncEngine', () => {
 
       await flush();
 
+      // The Phase-2/3 hardening added several extra await hops between
+      // doc_list resolution and sync_start being encoded (loadVVCache,
+      // readEffectiveLocalContent, belt-and-suspenders editor read,
+      // storage.load, etc). The default flush(10) no longer drains far
+      // enough — bump locally so the sync_start has been sent.
+      await flush(50);
       const syncStartCalls = mockEncode.mock.calls.filter(
         (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'edited.md'
       );
@@ -534,7 +543,9 @@ describe('SyncEngine', () => {
 
       await flush();
 
-      // v1 cache has contentHash=0 (sentinel) → hash mismatch → full sync
+      // v1 cache has contentHash=0 (sentinel) → hash mismatch → full sync.
+      // Same flush-depth caveat as the test above — bump locally.
+      await flush(50);
       const syncStartCalls = mockEncode.mock.calls.filter(
         (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'old.md'
       );
@@ -1111,12 +1122,18 @@ describe('SyncEngine', () => {
       expect(conflictCreates[0][1]).toBe('Local offline edit');
     });
 
-    it('no fork when disjoint VVs but same content', async () => {
+    it('disjoint VV + same text → adopt server, no conflict, no merge', async () => {
+      // Regression test against the architectural bug fixed in
+      // gpt-audit/conflict-storm-plan.md: when local CRDT history and server
+      // history are disjoint but happen to render the same text, the OLD code
+      // ran a Loro merge anyway. Loro then treated the inserts as concurrent
+      // and concatenated them, doubling the document. The NEW behaviour is to
+      // adopt the server snapshot wholesale and never merge — even though no
+      // conflict file is needed (texts already agree).
       mockVault.getMarkdownFiles.mockReturnValue([{ path: 'same-text.md' }]);
       mockVault.read.mockResolvedValue('Identical content');
       mockDocInstance.version.mockReturnValue(3);
-      mockDocInstance.text_matches.mockReturnValue(false);
-      // Disjoint VVs but content is the same → no fork needed
+      mockDocInstance.text_matches.mockReturnValue(true);
       mockDocInstance.export_vv_json.mockReturnValue('{"peer-x":3}');
       mockDocInstance.get_text.mockReturnValue('Identical content');
       mockVault.getAbstractFileByPath.mockReturnValue(null);
@@ -1143,10 +1160,183 @@ describe('SyncEngine', () => {
 
       await syncPromise;
 
+      // No conflict file (texts already agree)
       const conflictCreates = mockVault.create.mock.calls.filter(
         (c: any[]) => (c[0] as string).includes('conflict')
       );
       expect(conflictCreates.length).toBe(0);
+
+      // Adopt path must call removeAndClean (drops persisted .loro)
+      // followed by import_snapshot on the fresh doc. We can't easily
+      // assert removeAndClean directly (DocumentManager is real), but we
+      // can assert that import_snapshot was called for the adopt step.
+      expect(mockDocInstance.import_snapshot).toHaveBeenCalled();
+    });
+
+    it('disjoint VV + same text must NOT call sync_from_disk to merge', async () => {
+      // Stronger version of the above: explicitly assert that the engine
+      // never falls into the synthesise-history-then-merge path that doubled
+      // text in the richardsachen vault.
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'never-merge.md' }]);
+      mockVault.read.mockResolvedValue('Same body');
+      mockDocInstance.version.mockReturnValue(7);
+      // text_matches=true: the persisted CRDT already renders 'Same body'
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"local-peer":7}');
+      mockDocInstance.get_text.mockReturnValue('Same body');
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'never-merge.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{"server-peer":4}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'never-merge.md',
+        delta: new Uint8Array(48),
+        server_vv: new TextEncoder().encode('{"server-peer":4}'),
+      });
+
+      await syncPromise;
+
+      // The disjoint-adopt path bypasses sync_from_disk entirely. text_matches
+      // is true so no pre-merge sync_from_disk should fire either.
+      expect(mockDocInstance.sync_from_disk).not.toHaveBeenCalled();
+    });
+
+    it('missing local CRDT + same text → adopt server, no conflict, no resync', async () => {
+      // Phase 2 regression: file exists locally with content but no .loro
+      // state (state-loss scenario). Server has a doc for the same path
+      // with identical text. The engine MUST adopt the server snapshot
+      // directly and never run sync_from_disk(localContent) on the fresh
+      // doc — that synthesises a new CRDT history that would later collide.
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'state-lost.md' }]);
+      mockVault.read.mockResolvedValue('Identical body');
+      mockDocInstance.version.mockReturnValue(0); // no persisted state
+      mockDocInstance.text_matches.mockReturnValue(false);
+      mockDocInstance.get_text.mockReturnValue('Identical body');
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'state-lost.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      // Phase 2 issues exactly ONE sync_start (the probe). The old code
+      // issued two — probe plus a follow-up clientVV-based merge call.
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'state-lost.md',
+        delta: new Uint8Array(96),
+        server_vv: new TextEncoder().encode('{"server":9}'),
+      });
+
+      await syncPromise;
+
+      // No conflict file
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(0);
+
+      // No synthesise-then-merge: sync_from_disk must never run on this path
+      expect(mockDocInstance.sync_from_disk).not.toHaveBeenCalled();
+
+      // Server snapshot was adopted
+      expect(mockDocInstance.import_snapshot).toHaveBeenCalled();
+
+      // Phase 2 must issue exactly ONE sync_start (the probe with null VV).
+      // The old code issued two — probe plus a follow-up clientVV-based merge
+      // call — which is what synthesised the colliding history.
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'state-lost.md'
+      );
+      expect(syncStartCalls.length).toBe(1);
+      expect(syncStartCalls[0][0].client_vv).toBeNull();
+    });
+
+    it('missing local CRDT + server stub empty → falls through to local create path', async () => {
+      // Phase 2 fall-through: server returned the path in doc_list but the
+      // probe sync_start delivers a zero-length delta (empty server stub or
+      // doc was just deleted between doc_list and sync_start). The Phase-2
+      // adopt-or-conflict guard does NOT apply here — there is no real CRDT
+      // history to clash with — so the engine must fall through to the
+      // normal sync_from_disk + sync_start(clientVV) path.
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'fall-through.md' }]);
+      mockVault.read.mockResolvedValue('fresh local');
+      mockDocInstance.version.mockReturnValue(0); // no persisted state
+      mockDocInstance.text_matches.mockReturnValue(false);
+      mockDocInstance.get_text.mockReturnValue('fresh local');
+      mockDocInstance.export_vv_json.mockReturnValue('{}');
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'fall-through.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      // Probe response — empty delta means "no real server content".
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'fall-through.md',
+        delta: new Uint8Array(0),
+        server_vv: new TextEncoder().encode('{}'),
+      });
+
+      await flush();
+
+      // Second sync_start (after fall-through) gets a follow-up sync_delta.
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'fall-through.md',
+        delta: new Uint8Array(0),
+        server_vv: new TextEncoder().encode('{}'),
+      });
+
+      await syncPromise;
+
+      // No conflict file — fall-through path is benign.
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(0);
+
+      // sync_from_disk SHOULD run in this special case — that's the whole
+      // point of the fall-through, since the empty stub is safe to overwrite.
+      expect(mockDocInstance.sync_from_disk).toHaveBeenCalledWith('fresh local');
+
+      // Two sync_start calls: probe (null VV) + follow-up (with real clientVV).
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'fall-through.md'
+      );
+      expect(syncStartCalls.length).toBe(2);
+      expect(syncStartCalls[0][0].client_vv).toBeNull();
+      expect(syncStartCalls[1][0].client_vv).not.toBeNull();
     });
 
     it('no fork when server text matches local', async () => {
@@ -1238,6 +1428,151 @@ describe('SyncEngine', () => {
       );
       expect(createCalls.length).toBe(1);
       expect(createCalls[0][0]).toMatch(/dup \(conflict \d{4}-\d{2}-\d{2} 2\)\.md/);
+    });
+
+    // ── stale-disk-vs-fresh-editor regression tests ────────────────────────
+    // These cover the bug where adopt/conflict decisions were made on stale
+    // disk content while an open editor had unsaved changes — leading to
+    // conflict files containing the WRONG (disk) text and silently losing
+    // the user's most recent keystrokes. Fix is in src/sync-initial.ts:
+    // readEffectiveLocalContent() + belt-and-suspenders in syncOverlappingDoc.
+
+    const makeStaleEditorLeaf = (path: string, editorContent: string) => {
+      const editor = {
+        getValue: vi.fn().mockReturnValue(editorContent),
+        setValue: vi.fn(),
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue(''),
+        offsetToPos: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        transaction: vi.fn(),
+      };
+      return {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path },
+          editor,
+        }),
+      };
+    };
+
+    it('disjoint VV + stale disk + fresh editor → conflict body is editor text', async () => {
+      // Phase 3 stale-editor regression. Disk has the old saved version,
+      // an open editor has unsaved keystrokes. The disjoint-VV adopt path
+      // creates a conflict file — its body MUST contain the editor's fresh
+      // text, not the stale disk text.
+      const leaf = makeStaleEditorLeaf('p3-stale.md', 'EDITOR fresh');
+      engine = new SyncEngine(makeApp([leaf]), makeSettings());
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'p3-stale.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer-x":5}');
+      // tempDoc.get_text() (the probe import) returns the server text
+      mockDocInstance.get_text.mockReturnValue('DISK stale');
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'p3-stale.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{"peer-y":3}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'p3-stale.md',
+        delta: new Uint8Array(64),
+        server_vv: new TextEncoder().encode('{"peer-y":3}'),
+      });
+
+      await syncPromise;
+
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(1);
+      expect(conflictCreates[0][1]).toBe('EDITOR fresh');
+    });
+
+    it('missing local CRDT + stale disk + fresh editor → conflict body is editor text', async () => {
+      // Phase 2 stale-editor regression. No persisted state, so the engine
+      // takes the Phase-2 adopt path. localContent must come from the open
+      // editor, not vault.read.
+      const leaf = makeStaleEditorLeaf('p2-stale.md', 'EDITOR fresh');
+      engine = new SyncEngine(makeApp([leaf]), makeSettings());
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'p2-stale.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(0); // no persisted state
+      mockDocInstance.text_matches.mockReturnValue(false);
+      mockDocInstance.get_text.mockReturnValue('DISK stale'); // server text after probe
+      mockVault.getAbstractFileByPath.mockReturnValue(null);
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'p2-stale.md', updated_at: '2026-03-17T00:00:00Z', vv_json: '{}' }],
+        tombstones: [],
+      });
+
+      await flush();
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'p2-stale.md',
+        delta: new Uint8Array(96),
+        server_vv: new TextEncoder().encode('{"server":9}'),
+      });
+
+      await syncPromise;
+
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(1);
+      expect(conflictCreates[0][1]).toBe('EDITOR fresh');
+    });
+
+    it('local-only doc_create uses editor content, not stale disk', async () => {
+      // Local-only path regression. A new file is open with unsaved edits;
+      // the disk snapshot is stale. doc_create must push the editor's text.
+      const leaf = makeStaleEditorLeaf('local-only.md', 'EDITOR fresh');
+      engine = new SyncEngine(makeApp([leaf]), makeSettings());
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'local-only.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+
+      // Server has no docs at all → local-only path
+      fireMessage({ type: 'doc_list', docs: [], tombstones: [] });
+
+      await syncPromise;
+
+      // sync_from_disk must be called with the EDITOR text, not the disk text
+      expect(mockDocInstance.sync_from_disk).toHaveBeenCalledWith('EDITOR fresh');
+      expect(mockDocInstance.sync_from_disk).not.toHaveBeenCalledWith('DISK stale');
+
+      // doc_create push happened
+      const createCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_create' && c[0]?.doc_uuid === 'local-only.md'
+      );
+      expect(createCalls.length).toBe(1);
     });
   });
 

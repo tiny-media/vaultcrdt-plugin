@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use loro::cursor::{CannotFindRelativePosition, Cursor, Side};
 use loro::event::Diff;
-use loro::{ExportMode, LoroDoc, VersionVector};
+use loro::{ExportMode, LoroDoc, PeerID, VersionVector};
 
 use crate::diffing::{content_hash, sync_from_disk};
 
@@ -14,13 +14,19 @@ pub struct SyncDocument {
 }
 
 impl SyncDocument {
-    pub fn new(_doc_uuid: impl Into<String>, _peer_id: impl Into<String>) -> Self {
+    /// Create a new document. The `peer_id` string is deterministically mapped
+    /// to a stable Loro `PeerID` so that successive sessions on the same device
+    /// keep editing on the same VV-line. See `derive_peer_id`.
+    pub fn new(_doc_uuid: impl Into<String>, peer_id: impl Into<String>) -> Self {
         let doc = LoroDoc::new();
+        let pid = derive_peer_id(&peer_id.into());
+        // set_peer_id only fails when there is uncommitted local state. We
+        // call it on a freshly-constructed doc, so this is structurally safe.
+        // If Loro ever changes that contract, surfacing the panic is correct:
+        // a doc with a wrong PeerID would corrupt the VV silently.
+        doc.set_peer_id(pid).expect("set_peer_id on fresh LoroDoc cannot fail");
         let last_export_vv = doc.oplog_vv();
-        Self {
-            doc,
-            last_export_vv,
-        }
+        Self { doc, last_export_vv }
     }
 
     /// Insert text at `pos` (unicode char position).
@@ -88,9 +94,7 @@ impl SyncDocument {
 
     /// Get a stable cursor at the given character position.
     pub fn get_cursor(&self, pos: usize) -> Option<Cursor> {
-        self.doc
-            .get_text("content")
-            .get_cursor(pos, Side::default())
+        self.doc.get_text("content").get_cursor(pos, Side::default())
     }
 
     /// Resolve a cursor to its current character position.
@@ -112,17 +116,13 @@ impl SyncDocument {
 
     /// Export ops since a given VV (provided as JSON string, e.g. `{"12345":47}`).
     pub fn export_updates_since_vv_json(&self, vv_json: &str) -> Result<Vec<u8>, DocumentError> {
-        let map: HashMap<u64, i32> =
-            serde_json::from_str(vv_json).map_err(|e| {
-                DocumentError::Loro(loro::LoroError::DecodeError(e.to_string().into()))
-            })?;
+        let map: HashMap<u64, i32> = serde_json::from_str(vv_json)
+            .map_err(|e| DocumentError::Loro(loro::LoroError::DecodeError(e.to_string().into())))?;
         let mut vv = VersionVector::new();
         for (peer, counter) in map {
             vv.insert(peer, counter);
         }
-        self.doc
-            .export(ExportMode::updates(&vv))
-            .map_err(DocumentError::Encode)
+        self.doc.export(ExportMode::updates(&vv)).map_err(DocumentError::Encode)
     }
 
     /// Check if the CRDT text equals the given string without a JS roundtrip.
@@ -150,18 +150,50 @@ impl SyncDocument {
             return Ok(String::new());
         }
 
-        let diff_batch = self.doc.diff(&frontiers_before, &frontiers_after)
-            .map_err(DocumentError::Loro)?;
+        let diff_batch =
+            self.doc.diff(&frontiers_before, &frontiers_after).map_err(DocumentError::Loro)?;
 
         for (_cid, diff) in diff_batch.iter() {
             if let Diff::Text(text_deltas) = diff {
-                let json = serde_json::to_string(text_deltas)
-                    .map_err(|e| DocumentError::Loro(loro::LoroError::DecodeError(e.to_string().into())))?;
+                let json = serde_json::to_string(text_deltas).map_err(|e| {
+                    DocumentError::Loro(loro::LoroError::DecodeError(e.to_string().into()))
+                })?;
                 return Ok(json);
             }
         }
 
         Ok(String::new())
+    }
+}
+
+/// Map an opaque peer string (typically a UUID from plugin settings) to a
+/// stable Loro `PeerID` (u64). Same input -> same output, different inputs
+/// -> different outputs (modulo BLAKE3 collisions, i.e. effectively never).
+///
+/// We avoid the two reserved-feeling sentinel values `0` and `u64::MAX` by
+/// folding any hash that lands on them to a neighbouring value. This is not a
+/// hard Loro requirement, but it sidesteps a class of test surprises where
+/// `0` is used as a default-uninitialised marker.
+///
+/// Empty strings are explicitly mapped to a fixed non-sentinel value so that
+/// the unfortunate "ran without peerId at all" case is at least deterministic
+/// rather than colliding with another caller's hash.
+pub fn derive_peer_id(peer_id: &str) -> PeerID {
+    if peer_id.is_empty() {
+        // Deterministic fallback for "missing peerId" — should not happen in
+        // production after the startup invariant in main.ts is in place, but
+        // this keeps the function total.
+        return 1;
+    }
+    let hash = blake3::hash(peer_id.as_bytes());
+    let bytes = hash.as_bytes();
+    let raw = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    match raw {
+        0 => 1,
+        u64::MAX => u64::MAX - 1,
+        n => n,
     }
 }
 
@@ -266,9 +298,7 @@ mod tests {
 
         // Third peer imports both at once via batch
         let peer_c = make_doc("peer-c");
-        peer_c
-            .import_deltas_batch(&[delta_a.clone(), delta_b.clone()])
-            .unwrap();
+        peer_c.import_deltas_batch(&[delta_a.clone(), delta_b.clone()]).unwrap();
 
         // Sequential import for comparison
         let peer_d = make_doc("peer-d");
@@ -555,6 +585,82 @@ mod tests {
         let snapshot = peer_a.export_snapshot().unwrap();
         let diff_json = peer_b.import_and_diff(&snapshot).unwrap();
         assert!(diff_json.is_empty(), "no-change should return empty string");
+    }
+
+    // ── Stable peer-id derivation (Phase 1.3 hardening) ──────────────────
+
+    #[test]
+    fn test_derive_peer_id_is_deterministic() {
+        let id_a = derive_peer_id("device-uuid-aaa");
+        let id_b = derive_peer_id("device-uuid-aaa");
+        assert_eq!(id_a, id_b, "same string must produce same peer id");
+    }
+
+    #[test]
+    fn test_derive_peer_id_distinguishes_inputs() {
+        let id_a = derive_peer_id("device-uuid-aaa");
+        let id_b = derive_peer_id("device-uuid-bbb");
+        assert_ne!(id_a, id_b, "different strings must produce different ids");
+    }
+
+    #[test]
+    fn test_derive_peer_id_avoids_sentinels() {
+        // Property: derived id is never 0 or u64::MAX, regardless of input.
+        for s in ["", "0", "x", "device", "uuid-1234"] {
+            let id = derive_peer_id(s);
+            assert_ne!(id, 0, "id for {s:?} must not be 0");
+            assert_ne!(id, u64::MAX, "id for {s:?} must not be u64::MAX");
+        }
+    }
+
+    #[test]
+    fn test_sync_document_uses_stable_peer_id_in_vv() {
+        // After an edit, the VV must contain exactly one peer entry whose key
+        // matches `derive_peer_id(<input>)`.
+        let doc = SyncDocument::new("doc-id", "device-uuid-fixed");
+        doc.insert_text(0, "hello").unwrap();
+        let vv = doc.export_vv();
+        assert_eq!(vv.len(), 1, "exactly one peer line after one edit");
+        let only_peer = *vv.keys().next().unwrap();
+        assert_eq!(
+            only_peer,
+            derive_peer_id("device-uuid-fixed"),
+            "VV peer must be the derived stable id"
+        );
+    }
+
+    #[test]
+    fn test_restart_keeps_same_peer_line() {
+        // Simulates the plugin restart case: write, snapshot, drop the doc,
+        // create a fresh SyncDocument with the SAME peer string, import the
+        // snapshot, edit again — the new edits must extend the same VV peer
+        // entry, not start a second one.
+        let doc1 = SyncDocument::new("doc-id", "device-uuid-fixed");
+        doc1.insert_text(0, "hello").unwrap();
+        let snapshot = doc1.export_full_snapshot().unwrap();
+        let vv1 = doc1.export_vv();
+        assert_eq!(vv1.len(), 1);
+
+        let doc2 = SyncDocument::new("doc-id", "device-uuid-fixed");
+        doc2.import_delta(&snapshot).unwrap();
+        doc2.insert_text(5, " world").unwrap();
+        let vv2 = doc2.export_vv();
+        assert_eq!(vv2.len(), 1, "restart must not introduce a second peer line");
+        let pid_1 = *vv1.keys().next().unwrap();
+        let pid_2 = *vv2.keys().next().unwrap();
+        assert_eq!(pid_1, pid_2, "peer line is preserved across restart");
+        assert!(vv2[&pid_2] > vv1[&pid_1], "counter advanced after second insert");
+    }
+
+    #[test]
+    fn test_two_devices_get_different_peer_lines() {
+        let doc_a = SyncDocument::new("shared-doc", "device-uuid-A");
+        let doc_b = SyncDocument::new("shared-doc", "device-uuid-B");
+        doc_a.insert_text(0, "from-a").unwrap();
+        doc_b.insert_text(0, "from-b").unwrap();
+        let pid_a = *doc_a.export_vv().keys().next().unwrap();
+        let pid_b = *doc_b.export_vv().keys().next().unwrap();
+        assert_ne!(pid_a, pid_b, "two devices must occupy two VV lines");
     }
 
     #[test]

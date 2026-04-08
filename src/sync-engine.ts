@@ -64,7 +64,10 @@ export class SyncEngine {
     private app: App,
     private settings: VaultCRDTSettings,
   ) {
-    this.docs = new DocumentManager(app);
+    // Startup-Invariante: peerId is guaranteed non-empty by main.ts
+    // (loadSettings() generates one before constructing SyncEngine). We pass
+    // it through so every CRDT doc commits ops on a stable per-device VV line.
+    this.docs = new DocumentManager(app, settings.peerId);
     this.editor = new EditorIntegration(app, this.writingFromRemote, this.lastRemoteWrite, this.tag);
     this.push = new PushHandler(
       this.docs,
