@@ -25,11 +25,28 @@ export default class VaultCRDTPlugin extends Plugin {
     this.syncEngine = new SyncEngine(this.app, this.settings);
     this.fileWatcher = new FileWatcher(this.app, this.syncEngine);
 
+    this.addCommand({
+      id: 'export-startup-trace',
+      name: 'Export last startup trace',
+      callback: () => void this.exportStartupTrace(),
+    });
+
     // React to editor keystrokes (debounced inside SyncEngine)
     this.registerEvent(
       this.app.workspace.on('editor-change', (editor, view) => {
         const file = view.file;
-        if (file && isSyncablePath(file.path) && !this.syncEngine.isWritingFromRemote(file.path) && !this.syncEngine.isUpdatingEditorFromRemote(file.path)) {
+        if (!file) return;
+        const syncable = isSyncablePath(file.path);
+        const writingFromRemote = this.syncEngine.isWritingFromRemote(file.path);
+        const updatingEditorFromRemote = this.syncEngine.isUpdatingEditorFromRemote(file.path);
+        const accepted = syncable && !writingFromRemote && !updatingEditorFromRemote;
+        this.syncEngine.traceEditorChange(file.path, {
+          accepted,
+          syncable,
+          writingFromRemote,
+          updatingEditorFromRemote,
+        });
+        if (accepted) {
           this.syncEngine.onFileChanged(file.path);
         }
       })
@@ -249,6 +266,28 @@ export default class VaultCRDTPlugin extends Plugin {
     dot.style.top = '0.05em';
     this.statusBarEl.setAttribute('aria-label', connected ? 'VaultCRDT: connected' : 'VaultCRDT: not connected');
     this.statusBarEl.style.color = connected ? 'var(--text-muted)' : 'var(--text-faint)';
+  }
+
+  private async exportStartupTrace(): Promise<void> {
+    const dir = 'VaultCRDT Debug';
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const path = `${dir}/startup-trace-${stamp}.md`;
+    await this.ensureDir(dir);
+    await this.app.vault.create(path, this.syncEngine.getStartupTraceReport());
+    new Notice(`VaultCRDT: trace exported to ${path}`, 8000);
+  }
+
+  private async ensureDir(dir: string): Promise<void> {
+    if (this.app.vault.getAbstractFileByPath(dir)) return;
+    const parent = dir.substring(0, dir.lastIndexOf('/'));
+    if (parent) {
+      await this.ensureDir(parent);
+    }
+    try {
+      await this.app.vault.createFolder(dir);
+    } catch {
+      // folder may have been created concurrently
+    }
   }
 
   async onunload(): Promise<void> {

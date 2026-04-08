@@ -33,24 +33,32 @@ export class PushHandler {
     private setStatus: (s: 'syncing') => void,
     private isWsOpen: () => boolean,
     private tag: string,
+    private tracePath: (event: string, path: string, data?: Record<string, unknown>) => void,
   ) {}
 
   onFileChanged(path: string): void {
     const existing = this.pushDebounceTimers.get(path);
     if (existing) clearTimeout(existing);
+    const delayMs = Math.max(this.settings.debounceMs, 300);
+    this.tracePath('push.debounce.schedule', path, { delayMs });
     this.pushDebounceTimers.set(
       path,
       setTimeout(() => {
         this.pushDebounceTimers.delete(path);
         const freshContent = this.editor.readCurrentContent(path);
+        this.tracePath('push.debounce.fire', path, {
+          hasEditorContent: freshContent !== null,
+          contentLen: freshContent?.length ?? 0,
+        });
         if (freshContent !== null) {
           this.pushFileDelta(path, freshContent);
         }
-      }, Math.max(this.settings.debounceMs, 300)),
+      }, delayMs),
     );
   }
 
   onFileChangedImmediate(path: string, content: string): void {
+    this.tracePath('push.immediate', path, { contentLen: content.length });
     this.pushFileDelta(path, content);
   }
 
@@ -108,6 +116,10 @@ export class PushHandler {
     clearTimeout(timer);
     this.pushDebounceTimers.delete(path);
     const freshContent = this.editor.readCurrentContent(path);
+    this.tracePath('push.flush.begin', path, {
+      hasEditorContent: freshContent !== null,
+      contentLen: freshContent?.length ?? 0,
+    });
     if (freshContent !== null) {
       const doc = await this.docs.getOrLoad(path);
       if (!doc.text_matches(freshContent)) {
@@ -119,11 +131,15 @@ export class PushHandler {
           const delta = doc.export_delta_since_vv_json(vvBefore);
           if (delta.length > 0) {
             this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
+            this.tracePath('push.flush.sent', path, { deltaLen: delta.length });
             log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
           }
         } catch (err) {
+          this.tracePath('push.flush.error', path, { message: err instanceof Error ? err.message : String(err) });
           warn(`${this.tag} flush push failed`, { path, err });
         }
+      } else {
+        this.tracePath('push.flush.skip-text-match', path);
       }
     }
   }
@@ -222,17 +238,25 @@ export class PushHandler {
     // Prefer fresh editor content over potentially stale disk content.
     const freshEditorContent = this.editor.readCurrentContent(path);
     if (freshEditorContent !== null) content = freshEditorContent;
+    this.tracePath('push.delta.begin', path, {
+      fromEditor: freshEditorContent !== null,
+      contentLen: content.length,
+    });
 
     // Suppress echo: if content matches what we just wrote from remote, skip
     const lastRemote = this.lastRemoteWrite.get(path);
     if (lastRemote !== undefined && lastRemote === content) {
       this.lastRemoteWrite.delete(path);
+      this.tracePath('push.delta.skip-echo', path, { contentLen: content.length });
       return;
     }
     this.lastRemoteWrite.delete(path);
 
     const doc = await this.docs.getOrLoad(path);
-    if (doc.text_matches(content)) return;
+    if (doc.text_matches(content)) {
+      this.tracePath('push.delta.skip-text-match', path, { contentLen: content.length });
+      return;
+    }
 
     // Capture VV before applying disk change
     const vvBefore = doc.export_vv_json();
@@ -242,6 +266,7 @@ export class PushHandler {
     // Export delta since the VV before this edit
     try {
       const delta = doc.export_delta_since_vv_json(vvBefore);
+      this.tracePath('push.delta.sent', path, { deltaLen: delta.length });
       log(`${this.tag} sync_push`, { path, version: doc.version(), deltaLen: delta.length });
       this.send({
         type: 'sync_push',
@@ -250,6 +275,7 @@ export class PushHandler {
         peer_id: this.settings.peerId,
       });
     } catch (err) {
+      this.tracePath('push.delta.error', path, { message: err instanceof Error ? err.message : String(err) });
       error(`${this.tag} export_delta failed, falling back to doc_create:`, path, err);
       this.pushDocCreate(path, doc);
     }

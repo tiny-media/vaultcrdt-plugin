@@ -11,6 +11,7 @@ import { log, warn, error } from './logger';
 import { isSyncablePath } from './path-policy';
 import { validateServerUrl, toHttpBase, toWsBase } from './url-policy';
 import { runInitialSync, type SyncMode } from './sync-initial';
+import { SyncTrace } from './sync-trace';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
 export { type SyncMode } from './sync-initial';
@@ -53,6 +54,7 @@ export class SyncEngine {
   private broadcastQueue: Promise<void> = Promise.resolve();
   /** Set to true after stop() — prevents reconnect after intentional close. */
   private stopped = false;
+  private trace = new SyncTrace();
   /**
    * One-shot admin token sent with the next /auth/verify call to register
    * a new vault. Cleared after the first successful auth. Never persisted.
@@ -84,6 +86,7 @@ export class SyncEngine {
       (s) => this.setStatus(s),
       () => this.ws?.readyState === WebSocket.OPEN,
       this.tag,
+      (event, path, data) => this.trace.markPath(event, path, data),
     );
   }
 
@@ -91,6 +94,12 @@ export class SyncEngine {
 
   async start(): Promise<void> {
     this.stopped = false;
+    this.trace.resetStartup({
+      vaultId: this.settings.vaultId,
+      deviceName: this.settings.deviceName,
+      peerId: this.settings.peerId,
+    });
+    this.trace.mark('start.begin');
     // Last line of defence: refuse to start if the saved server URL is not
     // acceptable to the central policy (plain http/ws outside localhost/LAN,
     // malformed, wrong scheme). This catches any bypass that may have slipped
@@ -104,8 +113,11 @@ export class SyncEngine {
     // reconnect, so initialSync can skip redownloading paths that were
     // deleted while offline.
     await this.push.loadPendingDeletesFromJournal();
+    this.trace.mark('start.pending-deletes-loaded');
     await this.auth();
+    this.trace.mark('start.auth-ok');
     this.connect();
+    this.trace.mark('start.connect-called');
   }
 
   async restart(): Promise<void> {
@@ -119,6 +131,7 @@ export class SyncEngine {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.push.stopAllTimers();
     this.lastRemoteWrite.clear();
+    this.trace.mark('stop.called');
     this.ws?.close();
     this.ws = null;
     await this.docs.persistAll();
@@ -187,6 +200,7 @@ export class SyncEngine {
     this.ws = ws;
 
     ws.onopen = () => {
+      this.trace.mark('ws.open');
       this.backoffMs = 1_000;
       this.startHeartbeat();
       this.hasConnected = true;
@@ -204,6 +218,7 @@ export class SyncEngine {
     };
 
     ws.onclose = () => {
+      this.trace.mark('ws.close');
       this.setStatus('offline');
       this.stopHeartbeat();
       this.promises.rejectAll('WebSocket closed', this.tag);
@@ -211,6 +226,7 @@ export class SyncEngine {
     };
 
     ws.onerror = () => {
+      this.trace.mark('ws.error');
       this.setStatus('error');
     };
   }
@@ -242,6 +258,7 @@ export class SyncEngine {
   // ── Initial sync ───────────────────────────────────────────────────────────
 
   async initialSync(onProgress?: (done: number, total: number, changed: number) => void, mode: SyncMode = 'merge'): Promise<void> {
+    this.trace.mark('initial-sync.begin', { mode });
     this.setStatus('syncing');
     this.initialSyncRunning = true;
     this.queuedBroadcasts = [];
@@ -262,12 +279,16 @@ export class SyncEngine {
           send: (msg) => this.send(msg),
           requestDocList: () => this.requestDocList(),
           requestSyncStart: (uuid, vv) => this.requestSyncStart(uuid, vv),
+          trace: (event, data) => this.trace.mark(event, data),
+          tracePath: (event, path, data) => this.trace.markPath(event, path, data),
+          observePath: (path) => this.trace.observePath(path),
         },
         onProgress,
         mode,
       );
     } finally {
       this.initialSyncRunning = false;
+      this.trace.mark('initial-sync.queue-flush', { queued: this.queuedBroadcasts.length });
 
       for (const queued of this.queuedBroadcasts) {
         const type = queued.type as string;
@@ -279,6 +300,7 @@ export class SyncEngine {
       }
       this.queuedBroadcasts = [];
 
+      this.trace.mark('initial-sync.end');
       this.setStatus('connected');
     }
   }
@@ -299,6 +321,9 @@ export class SyncEngine {
         break;
 
       case 'sync_delta':
+        this.trace.markPath('ws.sync-delta', msg.doc_uuid as string, {
+          deltaLen: (msg.delta as Uint8Array).length,
+        });
         this.promises.resolve(`sync_delta:${msg.doc_uuid as string}`, {
           delta: msg.delta as Uint8Array,
           serverVV: new TextDecoder().decode(msg.server_vv as Uint8Array),
@@ -311,9 +336,16 @@ export class SyncEngine {
 
       case 'delta_broadcast':
         if (this.initialSyncRunning) {
+          this.trace.markPath('ws.broadcast-queued', msg.doc_uuid as string, {
+            queueSizeBefore: this.queuedBroadcasts.length,
+            deltaLen: (msg.delta as Uint8Array).length,
+          });
           log(`${this.tag} broadcast queued (initialSync running)`, { doc: msg.doc_uuid });
           this.queuedBroadcasts.push(msg);
         } else {
+          this.trace.markPath('ws.broadcast-live', msg.doc_uuid as string, {
+            deltaLen: (msg.delta as Uint8Array).length,
+          });
           this.enqueueBroadcast(msg);
         }
         break;
@@ -354,6 +386,10 @@ export class SyncEngine {
 
   private async onDeltaBroadcast(msg: Record<string, unknown>): Promise<void> {
     const docUuid = msg.doc_uuid as string;
+    this.trace.markPath('broadcast.begin', docUuid, {
+      deltaLen: (msg.delta as Uint8Array).length,
+      initialSyncRunning: this.initialSyncRunning,
+    });
     if (!isSyncablePath(docUuid)) {
       warn(`${this.tag} rejected broadcast for invalid path`, { docUuid });
       return;
@@ -361,6 +397,7 @@ export class SyncEngine {
     const delta = msg.delta as Uint8Array;
 
     await this.push.flushPendingEdits(docUuid);
+    this.trace.markPath('broadcast.after-flush', docUuid);
 
     const doc = await this.docs.getOrLoad(docUuid);
     const textBefore = doc.get_text();
@@ -369,6 +406,9 @@ export class SyncEngine {
     try {
       diffJson = doc.import_and_diff(delta);
     } catch (err) {
+      this.trace.markPath('broadcast.import-and-diff-error', docUuid, {
+        message: err instanceof Error ? err.message : String(err),
+      });
       warn(`${this.tag} import_and_diff failed, falling back to import_snapshot`, { docUuid, err });
       try {
         doc.import_snapshot(delta);
@@ -398,6 +438,7 @@ export class SyncEngine {
       const localVVStr = doc.export_vv_json();
 
       if (!vvCovers(localVVStr, serverVVStr)) {
+        this.trace.markPath('broadcast.vv-gap', docUuid);
         warn(`${this.tag} VV gap detected after broadcast`, { docUuid, localVV: localVVStr, serverVV: serverVVStr });
 
         if (!this.catchUpInProgress.has(docUuid)) {
@@ -421,15 +462,18 @@ export class SyncEngine {
               const catchUpText = doc.get_text();
               if (isActive && catchUpDiffJson) {
                 if (this.editor.applyDiffToEditor(docUuid, catchUpDiffJson, catchUpText, true)) {
+                  this.trace.markPath('broadcast.catch-up-apply-diff', docUuid, { textLen: catchUpText.length });
                   const postContent = this.editor.readCurrentContent(docUuid);
                   if (postContent !== null && !doc.text_matches(postContent)) {
                     doc.sync_from_disk(postContent);
                   }
                   this.lastRemoteWrite.set(docUuid, postContent ?? catchUpText);
                 } else {
+                  this.trace.markPath('broadcast.catch-up-write-to-vault', docUuid, { textLen: catchUpText.length });
                   await this.editor.writeToVault(docUuid, catchUpText);
                 }
               } else {
+                this.trace.markPath('broadcast.catch-up-write-to-vault', docUuid, { textLen: catchUpText.length });
                 await this.editor.writeToVault(docUuid, catchUpText);
               }
             }
@@ -447,14 +491,19 @@ export class SyncEngine {
     // Try surgical editor update via diff; fall back to full writeToVault
     try {
       if (diffJson && this.editor.applyDiffToEditor(docUuid, diffJson, doc.get_text())) {
+        this.trace.markPath('broadcast.apply-diff', docUuid, { textLen: doc.get_text().length });
         this.lastRemoteWrite.set(docUuid, doc.get_text());
         await this.docs.persist(docUuid);
         return;
       }
     } catch (err) {
+      this.trace.markPath('broadcast.apply-diff-error', docUuid, {
+        message: err instanceof Error ? err.message : String(err),
+      });
       warn(`${this.tag} applyDiffToEditor failed, falling back to writeToVault`, { docUuid, err });
     }
 
+    this.trace.markPath('broadcast.write-to-vault', docUuid, { textLen: textAfter.length });
     await this.editor.writeToVault(docUuid, textAfter);
     await this.docs.persist(docUuid);
   }
@@ -479,11 +528,23 @@ export class SyncEngine {
 
   // ── Public API (delegated to PushHandler) ──────────────────────────────────
 
+  traceEditorChange(path: string, data: Record<string, unknown>): void {
+    this.trace.observePath(path);
+    this.trace.markPath('ui.editor-change', path, data);
+  }
+
   onFileChanged(path: string): void {
+    this.trace.observePath(path);
+    this.trace.markPath('editor-change.accepted', path, { initialSyncRunning: this.initialSyncRunning });
     this.push.onFileChanged(path);
   }
 
   onFileChangedImmediate(path: string, content: string): void {
+    this.trace.observePath(path);
+    this.trace.markPath('vault-change.accepted', path, {
+      initialSyncRunning: this.initialSyncRunning,
+      contentLen: content.length,
+    });
     this.push.onFileChangedImmediate(path, content);
   }
 
@@ -518,6 +579,10 @@ export class SyncEngine {
     return this.editor.readCurrentContent(path);
   }
 
+  getStartupTraceReport(): string {
+    return this.trace.report();
+  }
+
   getDocument(filePath: string): WasmSyncDocument | undefined {
     return this.docs.get(filePath);
   }
@@ -540,15 +605,28 @@ export class SyncEngine {
     }
   }
 
-  requestDocList(): Promise<{ docs: DocEntry[]; tombstones: string[] }> {
+  async requestDocList(): Promise<{ docs: DocEntry[]; tombstones: string[] }> {
+    this.trace.mark('ws.request-doc-list');
     this.send({ type: 'request_doc_list' });
-    return this.promises.waitFor('doc_list');
+    const result = await this.promises.waitFor('doc_list') as {
+      docs: DocEntry[];
+      tombstones: string[];
+    };
+    this.trace.mark('ws.doc-list', {
+      docs: result.docs.length,
+      tombstones: result.tombstones.length,
+    });
+    return result;
   }
 
   private requestSyncStart(
     docUuid: string,
     clientVV: string | null,
   ): Promise<{ delta: Uint8Array; serverVV: string } | null> {
+    this.trace.markPath('ws.sync-start', docUuid, {
+      hasClientVV: clientVV !== null,
+      clientVVLen: clientVV?.length ?? 0,
+    });
     const clientVVBytes = clientVV !== null
       ? new TextEncoder().encode(clientVV)
       : null;
