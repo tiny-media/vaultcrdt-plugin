@@ -972,6 +972,63 @@ describe('SyncEngine', () => {
 
       vi.useRealTimers();
     });
+
+    it('defers editor-change pushes until initialSync has finished', async () => {
+      const deferredEditor = {
+        getValue: vi.fn().mockReturnValue('typed during sync'),
+        setValue: vi.fn(),
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue('typed during sync'),
+        offsetToPos: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        transaction: vi.fn(),
+      };
+      const leaf = {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'typed.md' },
+          editor: deferredEditor,
+        }),
+      };
+
+      engine = new SyncEngine(makeApp([leaf]), makeSettings());
+      mockVault.getMarkdownFiles.mockReturnValue([]);
+      mockDocInstance.version.mockReturnValue(0);
+      mockDocInstance.get_text.mockReturnValue('remote content');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'remote.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":1}') }],
+        tombstones: [],
+      });
+
+      await flush();
+      engine.onFileChanged('typed.md');
+      await flush();
+
+      let pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'typed.md'
+      );
+      expect(pushCalls.length).toBe(0);
+
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'remote.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"peer1":1}'),
+      });
+
+      await syncPromise;
+
+      pushCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_push' && c[0]?.doc_uuid === 'typed.md'
+      );
+      expect(pushCalls.length).toBe(1);
+    });
   });
 
   // ── delta_broadcast ────────────────────────────────────────────────────────
