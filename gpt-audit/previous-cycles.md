@@ -4,6 +4,34 @@ One paragraph per closed cycle. Newest on top. Links point into the dated archiv
 
 ---
 
+## 2026-04-07/08 — conflict-storm regression + editor-staleness follow-up (closed 2026-04-08)
+
+**Not a GPT-audit cycle** — out-of-band bug-chase triggered by the `richardsachen` vault producing 805 conflict files. Archived under `archive-2026-04-07-conflict-storm/` (three working docs: `conflict-storm-plan.md`, `conflict-storm-follow-up-plan.md`, `conflict-storm-follow-up-runsheet.md`).
+
+**Root causes (three-layer):**
+
+1. Loro PeerIDs were random per process, so every restart spawned a new per-device VV line. Two devices that "shared" a doc ended up with causally disjoint histories, which Loro then merged as concurrent inserts — doubling the document text on every reconnect.
+2. The disjoint-VV merge path called `sync_from_disk(localContent)` on a freshly-created Loro doc when no persisted CRDT state existed. That synthesised a brand-new history that collided with the server's existing history at the next merge.
+3. Adopt/conflict decisions in the initial sync read content from `app.vault.read(file)`, which can return stale disk content while an open editor has unsaved keystrokes. Conflict files silently captured the wrong text.
+
+**Outcome:** Fixed in plugin commits `3276d16` (vendor `.claude/`/`.pi/` tooling, align `wasm-bindgen` pin) and `f366dd8` (`derive_peer_id` via BLAKE3 + `set_peer_id()`, adopt-not-merge for Phase 2/3, `readEffectiveLocalContent` editor-first helper, `ensureDeviceIdentity` extract, `PROBE_DOC_UUID`/`PROBE_PEER_ID` constants, five Rust tests + `settings-identity.test.ts` + stale-disk-vs-fresh-editor regression tests). Post-fix CI slip in `071360e` (test file missed the `DocumentManager(app, peerId)` signature change) led to the rule hardening in `589e837` (`.claude/rules/*` now require `bunx tsc --noEmit` before commit).
+
+**No server change needed.** Released as `v0.2.17`.
+
+**Context for the next audit:** the `peerId` lives vault-local in `data.json`, so vault-clone scenarios still inherit duplicate Loro PeerIDs — tracked as pre-community-release work in `memory/project_peerid_clone_caveat.md`.
+
+---
+
+## 2026-04-07 — delete-ack hardening (closed 2026-04-07)
+
+**Not a GPT-audit cycle** — follow-up to the delete-ack gap flagged at the tail of Zyklus 2 ("delete journal is send-based, not ack-based"). Archived under `archive-2026-04-07-delete-ack/` (two working docs: `delete-ack-plan.md`, `delete-ack-second-opinion.md`).
+
+**Problem:** `pendingDeletes` was cleared right after `send()`, so a WS death between send and server commit could drop a delete. On reconnect the path would come back in `doc_list` and be re-downloaded, resurrecting the file.
+
+**Outcome:** Fixed in plugin commit `aa60d60` — the journal is now reconciled against `doc_list` on reconnect (Option B from the plan, no new protocol frame). Entries are only cleared when the server confirms the path as tombstoned (or unknown entirely); still-active paths stay pending for the next retry. No server change needed.
+
+---
+
 ## 2026-04-07 — second external audit (closed 2026-04-07)
 
 **Source:** `archive-2026-04-07/audit-2026-04-07.md` (GPT, 6 findings on the newly consolidated two-repo layout: delete races, path-policy gaps, URL/TLS validation, compose secrets, stale READMEs).
