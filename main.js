@@ -2993,6 +2993,11 @@ var EditorIntegration = class {
   async writeToVault(filePath, content) {
     log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);
+    const currentEditor = this.readCurrentContent(filePath);
+    if (currentEditor === content) {
+      this.lastRemoteWrite.set(filePath, content);
+      return;
+    }
     if (existing instanceof import_obsidian3.TFile) {
       const current = await this.app.vault.read(existing);
       if (current === content) return;

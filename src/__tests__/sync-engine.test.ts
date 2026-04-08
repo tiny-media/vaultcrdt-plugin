@@ -1909,6 +1909,7 @@ describe('SyncEngine', () => {
   describe('editor-level sync', () => {
     it('applies remote content directly to open editor instead of disk', async () => {
       const mockEditor = {
+        getValue: vi.fn().mockReturnValue('local content'),
         getCursor: vi.fn().mockReturnValue({ line: 0, ch: 5 }),
         setValue: vi.fn(),
         setCursor: vi.fn(),
@@ -1946,6 +1947,43 @@ describe('SyncEngine', () => {
       expect(mockVault.modify).not.toHaveBeenCalled();
     });
 
+    it('does not rewrite an open editor when it already shows the target content', async () => {
+      const mockEditor = {
+        getValue: vi.fn().mockReturnValue('remote content'),
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 5 }),
+        setValue: vi.fn(),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue('remote content'),
+      };
+      const mockLeaf = {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'editor.md' },
+          editor: mockEditor,
+        }),
+      };
+
+      engine = new SyncEngine(makeApp([mockLeaf]), makeSettings());
+      await engine.start();
+
+      mockDocInstance.get_text.mockReturnValue('remote content');
+      mockVault.getAbstractFileByPath.mockReturnValue(Object.create(TFile.prototype));
+      mockVault.read.mockResolvedValue('old content');
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'editor.md',
+        delta: new Uint8Array(32),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      expect(mockEditor.setValue).not.toHaveBeenCalled();
+      expect(mockEditor.setCursor).not.toHaveBeenCalled();
+      expect(mockVault.modify).not.toHaveBeenCalled();
+    });
+
     it('falls back to disk write when no editor is open', async () => {
       // No leaves → applyToEditor returns false → disk fallback
       engine = new SyncEngine(makeApp([]), makeSettings());
@@ -1971,6 +2009,7 @@ describe('SyncEngine', () => {
 
     it('updates all editors in split view', async () => {
       const mockEditor1 = {
+        getValue: vi.fn().mockReturnValue('local 1'),
         getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
         setValue: vi.fn(),
         setCursor: vi.fn(),
@@ -1978,6 +2017,7 @@ describe('SyncEngine', () => {
         getLine: vi.fn().mockReturnValue('split content'),
       };
       const mockEditor2 = {
+        getValue: vi.fn().mockReturnValue('local 2'),
         getCursor: vi.fn().mockReturnValue({ line: 1, ch: 3 }),
         setValue: vi.fn(),
         setCursor: vi.fn(),
@@ -2015,6 +2055,7 @@ describe('SyncEngine', () => {
 
     it('clamps cursor to valid range after content change', async () => {
       const mockEditor = {
+        getValue: vi.fn().mockReturnValue('old'),
         getCursor: vi.fn().mockReturnValue({ line: 10, ch: 50 }),
         setValue: vi.fn(),
         setCursor: vi.fn(),
@@ -2080,6 +2121,7 @@ describe('SyncEngine', () => {
     it('isUpdatingEditorFromRemote guard prevents echo', async () => {
       const editorChangeGuardChecks: boolean[] = [];
       const mockEditor = {
+        getValue: vi.fn().mockReturnValue('old local'),
         getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
         setValue: vi.fn().mockImplementation(() => {
           // Simulate: during setValue, check if guard is active
