@@ -28,7 +28,12 @@ globs: crates/**, Cargo.toml, Cargo.lock, rust-toolchain.toml, rustfmt.toml, .ca
 3. `bun run wasm` um `wasm/` neu zu bauen (es wird sonst driften)
 4. `bun run wasm:check` zur Verifikation
 5. `bun run test` — Plugin-Tests laufen gegen die neuen WASM-Artefakte
-6. Commit mit **beiden** Aenderungen (Rust + wasm/) im selben Commit oder direkt nacheinander
+6. **`bunx tsc --noEmit`** — Pflicht, weil Aenderungen an `crates/vaultcrdt-wasm`
+   (z.B. Signaturen wie `createDocument(doc_uuid, peer_id)`) TypeScript-consumer
+   brechen koennen, und Vitest-Mocks argc-Mismatches nicht fangen. Genau so ist
+   die Signatur in `071360e` durchgerutscht.
+7. `bun run build`
+8. Commit mit **beiden** Aenderungen (Rust + wasm/) im selben Commit oder direkt nacheinander
 
 ## Was NICHT tun
 

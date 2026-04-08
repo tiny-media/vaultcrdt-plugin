@@ -28,7 +28,13 @@ globs: src/**, esbuild.config.mjs, tsconfig.json, vitest.config.mts, package.jso
 
 ```bash
 bun run test
+bunx tsc --noEmit
 bun run build
 ```
 
-Beides muss gruen sein.
+Alle drei muessen gruen sein. **`bunx tsc --noEmit` ist Pflicht**, nicht optional:
+CI laeuft ihn zusaetzlich zu den Tests, und Vitest-Mocks fangen
+Argument-Count-Mismatches nicht ab (gemockte Constructors ignorieren args).
+Genau so ist die `DocumentManager`-Signatur-Aenderung in `071360e`
+durchgerutscht — die 168 Vitest-Tests waren gruen, erst der tsc im CI hat
+sie gefangen.
