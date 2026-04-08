@@ -3773,7 +3773,12 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
         log(`${tag} overlapping match`, { path });
       }
       if (isActiveEditorDoc) {
-        if (diffJson) {
+        const currentEditorContent = editor.readCurrentContent(path);
+        const editorAlreadyMatches = currentEditorContent !== null && doc.text_matches(currentEditorContent);
+        if (editorAlreadyMatches) {
+          deps.tracePath("overlap.active-noop", path, { textLen: serverContent.length });
+          lastRemoteWrite.set(path, currentEditorContent);
+        } else if (diffJson) {
           let hasTextChanges = false;
           try {
             const ops = JSON.parse(diffJson);
@@ -3794,6 +3799,8 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
               deps.tracePath("overlap.apply-diff-fallback-write", path, { textLen: serverContent.length });
               await editor.writeToVault(path, serverContent);
             }
+          } else {
+            deps.tracePath("overlap.active-noop", path, { textLen: serverContent.length, reason: "empty-diff" });
           }
         } else if (result.delta.length > 0) {
           deps.tracePath("overlap.active-write-to-vault", path, { textLen: serverContent.length });

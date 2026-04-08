@@ -1812,6 +1812,65 @@ describe('SyncEngine', () => {
 
       vi.useRealTimers();
     });
+
+    it('active editor matching merged text is a no-op, not a rewrite', async () => {
+      const mockEditor = {
+        getValue: vi.fn()
+          .mockReturnValueOnce('EDITOR fresh')
+          .mockReturnValueOnce('EDITOR fresh')
+          .mockReturnValueOnce('EDITOR fresh')
+          .mockReturnValue('STALE view'),
+        setValue: vi.fn(),
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue(''),
+        offsetToPos: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        transaction: vi.fn(),
+      };
+      const leaf = {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'active-noop.md' },
+          editor: mockEditor,
+        }),
+      };
+      const app = makeApp([leaf]);
+      app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
+      engine = new SyncEngine(app, makeSettings());
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'active-noop.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches
+        .mockImplementationOnce(() => false)
+        .mockImplementation(() => true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":5}');
+      mockDocInstance.get_text.mockReturnValue('EDITOR fresh');
+      mockDocInstance.import_and_diff.mockReturnValue('');
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'active-noop.md', updated_at: '2026-03-17T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":6}') }],
+        tombstones: [],
+      });
+
+      await flush(50);
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'active-noop.md',
+        delta: new Uint8Array(22),
+        server_vv: new TextEncoder().encode('{"peer1":6}'),
+      });
+
+      await syncPromise;
+
+      expect(mockEditor.setValue).not.toHaveBeenCalled();
+      expect(mockVault.modify).not.toHaveBeenCalled();
+    });
   });
 
   // ── echo guard ─────────────────────────────────────────────────────────────
