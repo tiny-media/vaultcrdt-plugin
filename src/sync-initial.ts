@@ -147,14 +147,24 @@ export async function runInitialSync(
   const contentHashes = new Map<string, number>();
   const syncedPaths = new Set<string>();
 
+  // The VV cache is only a valid fast-path if its hash reflects the FINAL
+  // local content after download/merge/adopt. Pre-sync local text is often
+  // stale on the exact runs we care about here (fresh pull, remote catch-up,
+  // active-editor merge), so callers must refresh the hash after every full
+  // sync path before we persist vv-cache.json.
+  const rememberCurrentDocHash = async (path: string): Promise<void> => {
+    const doc = await docs.getOrLoad(path);
+    contentHashes.set(path, fnv1aHash(doc.get_text()));
+  };
+
   // Priority sync: sync the currently active editor doc FIRST so the user
   // can start typing immediately.
   const activeDoc = editor.getActiveEditorPath();
   if (activeDoc && serverDocMap.has(activeDoc) && localFileMap.has(activeDoc)) {
     const file = localFileMap.get(activeDoc)!;
     const localContent = await readEffectiveLocalContent(app, editor, file);
-    contentHashes.set(activeDoc, fnv1aHash(localContent));
     await syncOverlappingDoc(deps, activeDoc, localContent, serverDocMap);
+    await rememberCurrentDocHash(activeDoc);
     syncedPaths.add(activeDoc);
     stepsDone++;
     changed++;
@@ -182,7 +192,9 @@ export async function runInitialSync(
           const doc = await docs.getOrLoad(uuid);
           doc.import_snapshot(result.delta);
           lastServerVV.set(uuid, result.serverVV);
-          await editor.writeToVault(uuid, doc.get_text());
+          const serverText = doc.get_text();
+          contentHashes.set(uuid, fnv1aHash(serverText));
+          await editor.writeToVault(uuid, serverText);
           await docs.persist(uuid);
           downloadOk++;
           changed++;
@@ -244,6 +256,7 @@ export async function runInitialSync(
       }
       // Local content changed (disk or editor) — fall through to full sync
       await syncOverlappingDoc(deps, file.path, effective, serverDocMap);
+      await rememberCurrentDocHash(file.path);
       changed++;
       stepsDone++;
       onProgress?.(stepsDone, totalSteps, changed);
@@ -251,8 +264,8 @@ export async function runInitialSync(
     }
 
     const localContent = await readEffectiveLocalContent(app, editor, file);
-    contentHashes.set(file.path, fnv1aHash(localContent));
     await syncOverlappingDoc(deps, file.path, localContent, serverDocMap);
+    await rememberCurrentDocHash(file.path);
     stepsDone++;
     onProgress?.(stepsDone, totalSteps, changed);
   }

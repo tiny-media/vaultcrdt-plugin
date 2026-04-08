@@ -3402,12 +3402,16 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   let changed = 0;
   const contentHashes = /* @__PURE__ */ new Map();
   const syncedPaths = /* @__PURE__ */ new Set();
+  const rememberCurrentDocHash = async (path) => {
+    const doc = await docs.getOrLoad(path);
+    contentHashes.set(path, fnv1aHash(doc.get_text()));
+  };
   const activeDoc = editor.getActiveEditorPath();
   if (activeDoc && serverDocMap.has(activeDoc) && localFileMap.has(activeDoc)) {
     const file = localFileMap.get(activeDoc);
     const localContent = await readEffectiveLocalContent(app, editor, file);
-    contentHashes.set(activeDoc, fnv1aHash(localContent));
     await syncOverlappingDoc(deps, activeDoc, localContent, serverDocMap);
+    await rememberCurrentDocHash(activeDoc);
     syncedPaths.add(activeDoc);
     stepsDone++;
     changed++;
@@ -3433,7 +3437,9 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
           const doc = await docs.getOrLoad(uuid);
           doc.import_snapshot(result.delta);
           lastServerVV.set(uuid, result.serverVV);
-          await editor.writeToVault(uuid, doc.get_text());
+          const serverText = doc.get_text();
+          contentHashes.set(uuid, fnv1aHash(serverText));
+          await editor.writeToVault(uuid, serverText);
           await docs.persist(uuid);
           downloadOk++;
           changed++;
@@ -3490,14 +3496,15 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
         continue;
       }
       await syncOverlappingDoc(deps, file.path, effective, serverDocMap);
+      await rememberCurrentDocHash(file.path);
       changed++;
       stepsDone++;
       onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
       continue;
     }
     const localContent = await readEffectiveLocalContent(app, editor, file);
-    contentHashes.set(file.path, fnv1aHash(localContent));
     await syncOverlappingDoc(deps, file.path, localContent, serverDocMap);
+    await rememberCurrentDocHash(file.path);
     stepsDone++;
     onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
   }

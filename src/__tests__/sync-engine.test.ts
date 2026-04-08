@@ -158,6 +158,38 @@ const fireMessage = (decoded: unknown) => {
   mockWsInstance.onmessage!({ data: new ArrayBuffer(4) } as MessageEvent);
 };
 
+/** Minimal in-memory adapter store for tests that need persisted vv-cache state. */
+const installVirtualStateStore = () => {
+  const textFiles = new Map<string, string>();
+  const binaryFiles = new Map<string, ArrayBuffer>();
+
+  mockAdapter.exists.mockImplementation(async (path: string) => {
+    return (
+      path === '.obsidian/plugins/vaultcrdt/state' ||
+      textFiles.has(path) ||
+      binaryFiles.has(path)
+    );
+  });
+  mockAdapter.read.mockImplementation(async (path: string) => {
+    return textFiles.get(path) ?? '';
+  });
+  mockAdapter.write.mockImplementation(async (path: string, content: string) => {
+    textFiles.set(path, content);
+  });
+  mockAdapter.readBinary.mockImplementation(async (path: string) => {
+    return binaryFiles.get(path) ?? new ArrayBuffer(0);
+  });
+  mockAdapter.writeBinary.mockImplementation(async (path: string, content: ArrayBuffer) => {
+    binaryFiles.set(path, content);
+  });
+  mockAdapter.list.mockImplementation(async (dir: string) => ({
+    files: [...textFiles.keys(), ...binaryFiles.keys()].filter((path) => path.startsWith(`${dir}/`)),
+    folders: [],
+  }));
+
+  return { textFiles, binaryFiles };
+};
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('SyncEngine', () => {
@@ -593,6 +625,131 @@ describe('SyncEngine', () => {
       });
 
       await syncPromise;
+    });
+
+    it('persists the downloaded server text hash so the next sync can skip server-only docs', async () => {
+      const { textFiles } = installVirtualStateStore();
+      mockDocInstance.version.mockReturnValue(0);
+      mockDocInstance.get_text.mockReturnValue('server content');
+
+      await engine.start();
+      const firstSync = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'remote.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":1}') }],
+        tombstones: [],
+      });
+
+      await flush();
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'remote.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"peer1":1}'),
+      });
+
+      await firstSync;
+
+      const { fnv1aHash } = await import('../conflict-utils');
+      const vvCacheRaw = textFiles.get('.obsidian/plugins/vaultcrdt/state/vv-cache.json');
+      expect(vvCacheRaw).toBeTruthy();
+      const vvCache = JSON.parse(vvCacheRaw!);
+      expect(vvCache['remote.md']).toEqual({
+        vv: '{"peer1":1}',
+        contentHash: fnv1aHash('server content'),
+      });
+
+      const localFile = Object.create(TFile.prototype);
+      localFile.path = 'remote.md';
+      mockVault.getMarkdownFiles.mockReturnValue([localFile]);
+      mockVault.read.mockResolvedValue('server content');
+
+      const syncStartsBefore = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'remote.md'
+      ).length;
+
+      const secondSync = engine.initialSync();
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'remote.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":1}') }],
+        tombstones: [],
+      });
+
+      await secondSync;
+
+      const syncStartsAfter = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'remote.md'
+      ).length;
+      expect(syncStartsAfter).toBe(syncStartsBefore);
+    });
+
+    it('persists the final merged text hash instead of the stale pre-sync local text', async () => {
+      const { textFiles } = installVirtualStateStore();
+      const tfile = Object.create(TFile.prototype);
+      tfile.path = 'overlap.md';
+      mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+      mockVault.read
+        .mockResolvedValueOnce('local baseline')
+        .mockResolvedValue('server merged');
+      mockDocInstance.version.mockReturnValue(1);
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":1}');
+      mockDocInstance.get_text.mockReturnValue('server merged');
+
+      await engine.start();
+      const firstSync = engine.initialSync();
+
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'overlap.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":2}') }],
+        tombstones: [],
+      });
+
+      await flush(50);
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'overlap.md',
+        delta: new Uint8Array(32),
+        server_vv: new TextEncoder().encode('{"peer1":2}'),
+      });
+
+      await firstSync;
+
+      const { fnv1aHash } = await import('../conflict-utils');
+      const vvCacheRaw = textFiles.get('.obsidian/plugins/vaultcrdt/state/vv-cache.json');
+      expect(vvCacheRaw).toBeTruthy();
+      const vvCache = JSON.parse(vvCacheRaw!);
+      expect(vvCache['overlap.md']).toEqual({
+        vv: '{"peer1":2}',
+        contentHash: fnv1aHash('server merged'),
+      });
+
+      const syncStartsBefore = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'overlap.md'
+      ).length;
+
+      const secondSync = engine.initialSync();
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'overlap.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":2}') }],
+        tombstones: [],
+      });
+
+      await secondSync;
+
+      const syncStartsAfter = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'overlap.md'
+      ).length;
+      expect(syncStartsAfter).toBe(syncStartsBefore);
     });
   });
 

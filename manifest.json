@@ -1,7 +1,7 @@
 {
   "id": "vaultcrdt",
   "name": "VaultCRDT",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "minAppVersion": "1.12.0",
   "description": "Synchronises Obsidian vault notes via a self-hosted CRDT server.",
   "author": "tiny-media",
