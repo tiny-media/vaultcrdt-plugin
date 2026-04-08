@@ -1092,6 +1092,50 @@ describe('SyncEngine', () => {
       expect(mockEditor.offsetToPos).toHaveBeenCalledWith(1);
       expect(mockEditor.offsetToPos).toHaveBeenCalledWith(3);
     });
+
+    it('preserves concurrent typing instead of falling back to full setValue overwrite', async () => {
+      const mockEditor = {
+        offsetToPos: vi.fn().mockImplementation((offset: number) => ({ line: 0, ch: offset })),
+        transaction: vi.fn(),
+        getValue: vi.fn().mockReturnValue('Hello LOCAL'),
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 11 }),
+        setValue: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue('Hello LOCAL'),
+        setCursor: vi.fn(),
+      };
+
+      const mockView = new MockMarkdownView();
+      mockView.file = { path: 'test.md' };
+      mockView.editor = mockEditor;
+
+      engine = new SyncEngine(makeApp([{ view: mockView }]), makeSettings());
+
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('Hello');
+      mockDocInstance.get_text
+        .mockReturnValueOnce('Hello')
+        .mockReturnValue('Hello World');
+      mockDocInstance.import_and_diff.mockReturnValue('[{"retain":5},{"insert":" World"}]');
+      mockDocInstance.text_matches.mockReturnValue(false);
+
+      await engine.start();
+
+      fireMessage({
+        type: 'delta_broadcast',
+        doc_uuid: 'test.md',
+        delta: new Uint8Array(64),
+        peer_id: 'other-peer',
+      });
+
+      await flush();
+
+      expect(mockEditor.transaction).toHaveBeenCalled();
+      expect(mockEditor.setValue).not.toHaveBeenCalled();
+      expect(mockDocInstance.sync_from_disk).toHaveBeenCalledWith('Hello LOCAL');
+      expect(mockVault.modify).not.toHaveBeenCalled();
+    });
   });
 
   // ── onFileDeleted ─────────────────────────────────────────────────────────
@@ -1902,6 +1946,7 @@ describe('SyncEngine', () => {
   describe('editor-level sync', () => {
     it('applies remote content directly to open editor instead of disk', async () => {
       const mockEditor = {
+        getValue: vi.fn().mockReturnValue('remote content'),
         getCursor: vi.fn().mockReturnValue({ line: 0, ch: 5 }),
         setValue: vi.fn(),
         setCursor: vi.fn(),
@@ -1964,6 +2009,7 @@ describe('SyncEngine', () => {
 
     it('updates all editors in split view', async () => {
       const mockEditor1 = {
+        getValue: vi.fn().mockReturnValue('split content'),
         getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
         setValue: vi.fn(),
         setCursor: vi.fn(),
@@ -1971,6 +2017,7 @@ describe('SyncEngine', () => {
         getLine: vi.fn().mockReturnValue('split content'),
       };
       const mockEditor2 = {
+        getValue: vi.fn().mockReturnValue('split content'),
         getCursor: vi.fn().mockReturnValue({ line: 1, ch: 3 }),
         setValue: vi.fn(),
         setCursor: vi.fn(),
@@ -2008,6 +2055,7 @@ describe('SyncEngine', () => {
 
     it('clamps cursor to valid range after content change', async () => {
       const mockEditor = {
+        getValue: vi.fn().mockReturnValue('short\ntext\nend'),
         getCursor: vi.fn().mockReturnValue({ line: 10, ch: 50 }),
         setValue: vi.fn(),
         setCursor: vi.fn(),
@@ -2073,6 +2121,7 @@ describe('SyncEngine', () => {
     it('isUpdatingEditorFromRemote guard prevents echo', async () => {
       const editorChangeGuardChecks: boolean[] = [];
       const mockEditor = {
+        getValue: vi.fn().mockReturnValue('guarded'),
         getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
         setValue: vi.fn().mockImplementation(() => {
           // Simulate: during setValue, check if guard is active
