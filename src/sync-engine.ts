@@ -53,6 +53,11 @@ export class SyncEngine {
   private broadcastQueue: Promise<void> = Promise.resolve();
   /** Set to true after stop() — prevents reconnect after intentional close. */
   private stopped = false;
+  /**
+   * One-shot admin token sent with the next /auth/verify call to register
+   * a new vault. Cleared after the first successful auth. Never persisted.
+   */
+  private oneShotAdminToken: string | null = null;
 
   statusCallback: ((s: SyncStatus) => void) | null = null;
   /** Fires on every message received from the server (pong, ack, delta, etc.). */
@@ -125,17 +130,48 @@ export class SyncEngine {
     return toHttpBase(this.settings.serverUrl);
   }
 
+  /**
+   * Arm a one-shot admin token for the next /auth/verify call. Used by
+   * main.ts and the settings Reconfigure flow to register a brand-new
+   * vault without persisting the token to disk.
+   */
+  setOneShotAdminToken(token: string): void {
+    this.oneShotAdminToken = token;
+  }
+
   private async auth(): Promise<void> {
+    const body: Record<string, string> = {
+      vault_id: this.settings.vaultId,
+      api_key: this.settings.vaultSecret,
+    };
+    if (this.oneShotAdminToken) {
+      body.admin_token = this.oneShotAdminToken;
+    }
     const resp = await requestUrl({
       url: `${this.httpBase()}/auth/verify`,
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        vault_id: this.settings.vaultId,
-        api_key: this.settings.vaultSecret,
-      }),
+      body: JSON.stringify(body),
     });
     this.token = resp.json.token as string;
+    // Clear only after a successful call so a transient failure lets a
+    // retry (e.g. scheduleReconnect) re-send the token. Plugin reload
+    // still drops it because it only lives in RAM.
+    this.oneShotAdminToken = null;
+  }
+
+  /**
+   * Drop all in-memory CRDT state and persisted .loro/vv-cache/delete-journal
+   * files. Used by the settings Reconfigure flow when the user points the
+   * plugin at a different vault, so the new vault starts from a clean state
+   * instead of inheriting stale snapshots keyed only by file path.
+   */
+  async wipeLocalState(): Promise<void> {
+    await this.docs.clearAll();
+    this.lastServerVV.clear();
+    this.lastRemoteWrite.clear();
+    this.catchUpInProgress.clear();
+    this.queuedBroadcasts = [];
   }
 
   private wsUrl(): string {

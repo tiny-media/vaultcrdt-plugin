@@ -6,6 +6,13 @@ export interface SetupResult {
   serverUrl: string;
   vaultId: string;
   vaultSecret: string;
+  /**
+   * Optional one-shot admin token. Only sent with the very first
+   * /auth/verify call to register a brand-new vault on the server.
+   * NEVER persisted — caller is expected to hand it off to SyncEngine
+   * via setOneShotAdminToken() and drop it after the first auth.
+   */
+  adminToken?: string;
 }
 
 const VAULT_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
@@ -15,6 +22,7 @@ export class SetupModal extends Modal {
   private serverUrl: string;
   private vaultId: string;
   private vaultSecret: string;
+  private adminToken = '';
   private errorEl: HTMLElement | null = null;
 
   constructor(app: App, settings: VaultCRDTSettings) {
@@ -73,6 +81,23 @@ export class SetupModal extends Modal {
           .setPlaceholder('vault password')
           .setValue(this.vaultSecret)
           .onChange((v) => { this.vaultSecret = v; });
+        text.inputEl.type = 'password';
+        return text;
+      });
+
+    // Creating a new vault? — collapsible, default-collapsed so existing
+    // users are never confronted with the admin token field unless they
+    // actively opt in to registering a new vault.
+    const advanced = contentEl.createEl('details');
+    advanced.createEl('summary', { text: 'Creating a new vault?' });
+    new Setting(advanced)
+      .setName('Admin Token')
+      .setDesc('Only needed once, when registering a new vault on the server. Ask your server admin.')
+      .addText((text) => {
+        text
+          .setPlaceholder('admin token')
+          .setValue('')
+          .onChange((v) => { this.adminToken = v.trim(); });
         text.inputEl.type = 'password';
         return text;
       });
@@ -140,23 +165,31 @@ export class SetupModal extends Modal {
       .replace(/^ws:\/\//, 'http://')
       .replace(/^wss:\/\//, 'https://');
 
+    // Build body — admin_token is only attached when the user has actually
+    // entered one via the collapsible "Creating a new vault?" section.
+    // Existing vault logins (the common case) never send the field.
+    const body: Record<string, string> = {
+      vault_id: this.vaultId,
+      api_key: this.vaultSecret,
+    };
+    if (this.adminToken) body.admin_token = this.adminToken;
+
     try {
       const resp = await requestUrl({
         url: `${httpBase}/auth/verify`,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          vault_id: this.vaultId,
-          api_key: this.vaultSecret,
-        }),
+        body: JSON.stringify(body),
       });
 
       if (resp.json?.token) {
-        this.resolve?.({
+        const result: SetupResult = {
           serverUrl: this.serverUrl,
           vaultId: this.vaultId,
           vaultSecret: this.vaultSecret,
-        });
+        };
+        if (this.adminToken) result.adminToken = this.adminToken;
+        this.resolve?.(result);
         this.resolve = null;
         this.close();
         return;
@@ -167,7 +200,10 @@ export class SetupModal extends Modal {
       // requestUrl throws on non-2xx status codes — extract status from error
       const status = (e as { status?: number })?.status;
       if (status === 401) {
-        this.showError('Authentication failed. Check vault name and password.');
+        this.showError(
+          'Authentication failed. Check vault name and password. ' +
+          'If you are registering a NEW vault, expand "Creating a new vault?" and enter the admin token.'
+        );
       } else if (status) {
         this.showError(`Server returned status ${status}. Check the server URL.`);
       } else {

@@ -1,6 +1,7 @@
 import { App, Platform, PluginSettingTab, Setting, requestUrl, Notice } from 'obsidian';
 import type VaultCRDTPlugin from './main';
 import { validateServerUrl, toHttpBase } from './url-policy';
+import { SetupModal } from './setup-modal';
 
 export interface VaultCRDTSettings {
   serverUrl: string;
@@ -85,6 +86,44 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
     this.reconnectTimer = setTimeout(() => {
       void this.plugin.syncEngine.restart();
     }, 1500);
+  }
+
+  /**
+   * Open the SetupModal pre-filled with the current settings, then
+   * re-wire the SyncEngine. When the user picks a *different* vault
+   * we also wipe the local CRDT state, because StateStorage keys only
+   * by file path and would otherwise leak the old vault's snapshots.
+   */
+  private async runReconfigure(): Promise<void> {
+    const oldVaultId = this.plugin.settings.vaultId;
+    const result = await new SetupModal(this.app, this.plugin.settings).prompt();
+    if (!result) return;
+
+    await this.plugin.syncEngine.stop();
+
+    if (result.vaultId !== oldVaultId) {
+      await this.plugin.syncEngine.wipeLocalState();
+    }
+
+    this.plugin.settings.serverUrl = result.serverUrl;
+    this.plugin.settings.vaultId = result.vaultId;
+    this.plugin.settings.vaultSecret = result.vaultSecret;
+    // Re-run the pull/push/merge auto-detection on next start.
+    this.plugin.settings.onboardingComplete = false;
+    await this.plugin.saveSettings();
+
+    if (result.adminToken) {
+      this.plugin.syncEngine.setOneShotAdminToken(result.adminToken);
+    }
+
+    try {
+      await this.plugin.syncEngine.start();
+      new Notice('VaultCRDT: reconnected', 3000);
+    } catch (err) {
+      new Notice(`VaultCRDT: reconnect failed — ${(err as Error).message}`, 8000);
+    }
+
+    this.display();
   }
 
   display(): void {
@@ -175,6 +214,15 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
             this.plugin.settings.deviceName = value;
             await this.plugin.saveSettings();
           })
+      );
+
+    new Setting(containerEl)
+      .setName('Reconnect to a different vault')
+      .setDesc('Run setup again — useful when switching to a new vault or registering one with an admin token.')
+      .addButton((btn) =>
+        btn.setButtonText('Reconfigure').onClick(async () => {
+          await this.runReconfigure();
+        })
       );
 
     // ── Synced Devices ────────────────────────────────────────────────────

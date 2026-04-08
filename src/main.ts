@@ -124,8 +124,16 @@ export default class VaultCRDTPlugin extends Plugin {
     if (needsSetup) {
       const result = await new SetupModal(this.app, this.settings).prompt();
       if (result) {
-        Object.assign(this.settings, result);
+        // Persist only the durable credentials. The optional adminToken
+        // is a one-shot used for the very first auth and must never
+        // touch disk.
+        this.settings.serverUrl = result.serverUrl;
+        this.settings.vaultId = result.vaultId;
+        this.settings.vaultSecret = result.vaultSecret;
         await this.saveSettings();
+        if (result.adminToken) {
+          this.syncEngine.setOneShotAdminToken(result.adminToken);
+        }
       } else {
         new Notice('VaultCRDT: open Settings to configure sync', 5000);
         return;

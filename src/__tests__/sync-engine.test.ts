@@ -218,6 +218,39 @@ describe('SyncEngine', () => {
       const wsUrl = (MockWebSocket as any).mock.calls[0][0] as string;
       expect(wsUrl).toMatch(/^wss:\/\//);
     });
+
+    it('includes admin_token in the auth body when one-shot is armed', async () => {
+      engine.setOneShotAdminToken('secret-admin');
+      await engine.start();
+
+      const authCall = mockRequestUrl.mock.calls.find(
+        (c: any[]) => typeof c[0]?.url === 'string' && c[0].url.includes('/auth/verify'),
+      );
+      expect(authCall).toBeDefined();
+      const body = JSON.parse(authCall![0].body as string) as Record<string, unknown>;
+      expect(body).toEqual({
+        vault_id: 'vault-abc',
+        api_key: 'test-api-key',
+        admin_token: 'secret-admin',
+      });
+    });
+
+    it('clears the one-shot admin_token after a successful auth', async () => {
+      engine.setOneShotAdminToken('secret-admin');
+      await engine.start();
+
+      // Simulate a reconnect by calling auth() again via the private path.
+      // A second auth round must NOT include admin_token anymore.
+      mockRequestUrl.mockClear();
+      await (engine as any).auth();
+
+      const body = JSON.parse(mockRequestUrl.mock.calls[0][0].body as string) as Record<string, unknown>;
+      expect(body).toEqual({
+        vault_id: 'vault-abc',
+        api_key: 'test-api-key',
+      });
+      expect(body.admin_token).toBeUndefined();
+    });
   });
 
   // ── initialSync — server-only doc ─────────────────────────────────────────

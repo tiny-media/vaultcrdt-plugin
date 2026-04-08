@@ -58,6 +58,18 @@ export class DocumentManager {
     await this.storage.remove(filePath);
   }
 
+  /**
+   * Drop all in-memory docs and wipe every persisted .loro file plus
+   * the vv-cache and delete-journal. Used only by the settings Reconfigure
+   * flow when switching to a different vault — StateStorage is keyed by
+   * file path alone, not by vault-id, so a plain restart would otherwise
+   * leak the old vault's snapshots into the new session.
+   */
+  async clearAll(): Promise<void> {
+    this.documents.clear();
+    await this.storage.clear();
+  }
+
   has(filePath: string): boolean {
     return this.documents.has(filePath);
   }

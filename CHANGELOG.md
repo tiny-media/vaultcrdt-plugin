@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.18] - 2026-04-08
+
+### Added
+- Setup modal now has a collapsible "Creating a new vault?" section with an Admin Token field. Entering the token lets the plugin register a brand-new vault on the server in a single step — no more out-of-band `curl`.
+- Settings → "Reconnect to a different vault" button. Re-runs the setup, re-arms the one-shot admin token if provided, and wipes the local CRDT state when switching to a different vault.
+
+### Changed
+- `/auth/verify` 401 error message now points to the admin-token field for users who are trying to register a new vault.
+- Admin token is a one-shot credential: held only in RAM, sent with the first `/auth/verify` call, cleared after success, never persisted to disk.
+
 ## [0.2.15] - 2026-03-26
 
 ### Changed
