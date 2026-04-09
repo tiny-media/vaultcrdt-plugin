@@ -12,6 +12,7 @@ import { isSyncablePath } from './path-policy';
 import { validateServerUrl, toHttpBase, toWsBase } from './url-policy';
 import { runInitialSync, type SyncMode } from './sync-initial';
 import { SyncTrace } from './sync-trace';
+import type { VVCacheEntry } from './state-storage';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
 export { type SyncMode } from './sync-initial';
@@ -54,6 +55,10 @@ export class SyncEngine {
   private lastRemoteWrite = new Map<string, string>();
   /** Serialized broadcast processing queue — prevents concurrent CRDT mutations. */
   private broadcastQueue: Promise<void> = Promise.resolve();
+  /** Startup sync index: last VV/hash plus persisted dirty bit per path. */
+  private startupSyncIndex = new Map<string, VVCacheEntry>();
+  /** Serializes writes to the persisted startup sync index file. */
+  private startupSyncIndexPersist: Promise<void> = Promise.resolve();
   /** Set to true after stop() — prevents reconnect after intentional close. */
   private stopped = false;
   private trace = new SyncTrace();
@@ -117,6 +122,25 @@ export class SyncEngine {
     // deleted while offline.
     await this.push.loadPendingDeletesFromJournal();
     this.trace.mark('start.pending-deletes-loaded');
+
+    // Load the persisted startup sync index before any initial-sync work.
+    // It is updated live during the session when local paths become dirty.
+    const loadedSyncIndex = await this.docs.loadVVCache() ?? new Map();
+    for (const [path, entry] of this.startupSyncIndex) {
+      if (!entry.dirty) continue;
+      const existing = loadedSyncIndex.get(path);
+      loadedSyncIndex.set(path, {
+        vv: existing?.vv ?? entry.vv,
+        contentHash: existing?.contentHash ?? entry.contentHash,
+        dirty: true,
+      });
+    }
+    this.startupSyncIndex = loadedSyncIndex;
+    this.trace.mark('start.sync-index-loaded', {
+      entries: this.startupSyncIndex.size,
+      dirty: [...this.startupSyncIndex.values()].filter((entry) => entry.dirty).length,
+    });
+
     await this.auth();
     this.trace.mark('start.auth-ok');
     this.connect();
@@ -139,6 +163,7 @@ export class SyncEngine {
     this.ws?.close();
     this.ws = null;
     await this.docs.persistAll();
+    await this.startupSyncIndexPersist.catch(() => {});
   }
 
   // ── Server communication ────────────────────────────────────────────────────
@@ -190,6 +215,8 @@ export class SyncEngine {
     this.catchUpInProgress.clear();
     this.queuedBroadcasts = [];
     this.startupEditedPaths.clear();
+    this.startupSyncIndex.clear();
+    this.startupSyncIndexPersist = Promise.resolve();
   }
 
   private wsUrl(): string {
@@ -284,6 +311,8 @@ export class SyncEngine {
           send: (msg) => this.send(msg),
           requestDocList: () => this.requestDocList(),
           requestSyncStart: (uuid, vv) => this.requestSyncStart(uuid, vv),
+          cachedVVs: new Map(this.startupSyncIndex),
+          saveSyncIndex: (map) => this.replaceStartupSyncIndex(map),
           trace: (event, data) => this.trace.mark(event, data),
           tracePath: (event, path, data) => this.trace.markPath(event, path, data),
           observePath: (path) => this.trace.observePath(path),
@@ -520,6 +549,7 @@ export class SyncEngine {
       warn(`${this.tag} rejected delete for invalid path`, { docUuid });
       return;
     }
+    this.forgetStartupSyncPath(docUuid);
     await this.docs.removeAndClean(docUuid);
     this.lastServerVV.delete(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
@@ -542,12 +572,14 @@ export class SyncEngine {
 
   onFileChanged(path: string): void {
     this.startupEditedPaths.add(path);
+    this.markStartupSyncPathDirty(path);
     this.trace.observePath(path);
     this.trace.markPath('editor-change.accepted', path, { initialSyncRunning: this.initialSyncRunning });
     this.push.onFileChanged(path);
   }
 
   onFileChangedImmediate(path: string, content: string): void {
+    this.markStartupSyncPathDirty(path);
     this.trace.observePath(path);
     this.trace.markPath('vault-change.accepted', path, {
       initialSyncRunning: this.initialSyncRunning,
@@ -557,10 +589,13 @@ export class SyncEngine {
   }
 
   onFileDeleted(path: string): void {
+    this.forgetStartupSyncPath(path);
     this.push.onFileDeleted(path);
   }
 
   onFileRenamed(oldPath: string, newPath: string, content: string): void {
+    this.forgetStartupSyncPath(oldPath);
+    this.markStartupSyncPathDirty(newPath);
     this.push.onFileRenamed(oldPath, newPath, content);
   }
 
@@ -570,6 +605,7 @@ export class SyncEngine {
    * so nothing is pushed for it.
    */
   onFileDeletedOnly(path: string): void {
+    this.forgetStartupSyncPath(path);
     this.push.deleteOnly(path);
   }
 
@@ -606,6 +642,38 @@ export class SyncEngine {
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
+
+  private markStartupSyncPathDirty(path: string): void {
+    const existing = this.startupSyncIndex.get(path);
+    if (existing?.dirty) return;
+    this.startupSyncIndex.set(path, {
+      vv: existing?.vv ?? '',
+      contentHash: existing?.contentHash ?? 0,
+      dirty: true,
+    });
+    this.queueStartupSyncIndexPersist();
+  }
+
+  private forgetStartupSyncPath(path: string): void {
+    if (!this.startupSyncIndex.delete(path)) return;
+    this.queueStartupSyncIndexPersist();
+  }
+
+  private replaceStartupSyncIndex(map: Map<string, VVCacheEntry>): Promise<void> {
+    this.startupSyncIndex = new Map(map);
+    return this.queueStartupSyncIndexPersist();
+  }
+
+  private queueStartupSyncIndexPersist(): Promise<void> {
+    const snapshot = new Map(this.startupSyncIndex);
+    this.startupSyncIndexPersist = this.startupSyncIndexPersist
+      .catch(() => {})
+      .then(() => this.docs.saveVVCache(snapshot))
+      .catch((err) => {
+        warn(`${this.tag} startup sync index persist failed`, { err });
+      });
+    return this.startupSyncIndexPersist;
+  }
 
   private send(msg: object): void {
     if (this.ws?.readyState === WebSocket.OPEN) {

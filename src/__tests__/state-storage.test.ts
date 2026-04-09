@@ -3,30 +3,46 @@ import { StateStorage } from '../state-storage';
 
 // ── Mock Obsidian adapter ─────────────────────────────────────────────────────
 
-const makeAdapter = (initialFiles: Map<string, ArrayBuffer> = new Map()) => {
-  const files = new Map(initialFiles);
+const makeAdapter = (
+  initialBinaryFiles: Map<string, ArrayBuffer> = new Map(),
+  initialTextFiles: Map<string, string> = new Map(),
+) => {
+  const binaryFiles = new Map(initialBinaryFiles);
+  const textFiles = new Map(initialTextFiles);
   return {
     // Returns true for files AND for directories (any stored path starts with dir/)
     exists: vi.fn(async (path: string) =>
-      files.has(path) || [...files.keys()].some((k) => k.startsWith(path + '/'))
+      binaryFiles.has(path) ||
+      textFiles.has(path) ||
+      [...binaryFiles.keys(), ...textFiles.keys()].some((k) => k.startsWith(path + '/'))
     ),
+    read: vi.fn(async (path: string) => {
+      const text = textFiles.get(path);
+      if (text === undefined) throw new Error(`not found: ${path}`);
+      return text;
+    }),
+    write: vi.fn(async (path: string, content: string) => {
+      textFiles.set(path, content);
+    }),
     readBinary: vi.fn(async (path: string) => {
-      const buf = files.get(path);
+      const buf = binaryFiles.get(path);
       if (!buf) throw new Error(`not found: ${path}`);
       return buf;
     }),
     writeBinary: vi.fn(async (path: string, buf: ArrayBuffer) => {
-      files.set(path, buf);
+      binaryFiles.set(path, buf);
     }),
     mkdir: vi.fn(async () => {}),
     remove: vi.fn(async (path: string) => {
-      files.delete(path);
+      binaryFiles.delete(path);
+      textFiles.delete(path);
     }),
     list: vi.fn(async (dir: string) => ({
-      files: [...files.keys()].filter((k) => k.startsWith(dir + '/')),
+      files: [...binaryFiles.keys(), ...textFiles.keys()].filter((k) => k.startsWith(dir + '/')),
       folders: [],
     })),
-    _files: files,
+    _binaryFiles: binaryFiles,
+    _textFiles: textFiles,
   };
 };
 
@@ -101,5 +117,28 @@ describe('StateStorage', () => {
     expect(storage.stateKey('a/b.md')).not.toBe(
       storage.stateKey('a__b.md')
     );
+  });
+
+  it('loadVVCache ignores legacy schemas during dev resets', async () => {
+    adapter.read.mockResolvedValueOnce(JSON.stringify({
+      _version: 3,
+      'note.md': { vv: '{"p":1}', contentHash: 123 },
+    }));
+    adapter.exists.mockResolvedValueOnce(true);
+
+    const cache = await storage.loadVVCache();
+    expect(cache).toBeNull();
+  });
+
+  it('saveVVCache writes v4 entries with dirty bit', async () => {
+    await storage.saveVVCache(new Map([
+      ['note.md', { vv: '{"p":2}', contentHash: 456, dirty: false }],
+    ]));
+
+    const raw = await adapter.read('.obsidian/plugins/vaultcrdt/state/vv-cache.json');
+    expect(JSON.parse(raw)).toEqual({
+      _version: 4,
+      'note.md': { vv: '{"p":2}', contentHash: 456, dirty: false },
+    });
   });
 });

@@ -6,6 +6,8 @@ export interface VVCacheEntry {
   vv: string;
   /** FNV-1a hash of file content at last sync. Used for fast skip. */
   contentHash: number;
+  /** Local edits happened after the index entry was written. */
+  dirty: boolean;
 }
 
 /**
@@ -133,15 +135,23 @@ export class StateStorage {
 
   private vvCachePath = `${STATE_DIR}/vv-cache.json`;
 
-  /** Persist VV cache with content hashes for fast skip on next startup. */
+  /**
+   * Persist the startup sync index used by initialSync fast-path decisions.
+   * Historical file name stays `vv-cache.json`; current schema is v4.
+   */
   async saveVVCache(map: Map<string, VVCacheEntry>): Promise<void> {
     const adapter = this.app.vault.adapter;
-    const obj: Record<string, VVCacheEntry | number> = { _version: 3 };
+    const obj: Record<string, VVCacheEntry | number> = { _version: 4 };
     for (const [k, v] of map) obj[k] = v;
     await adapter.write(this.vvCachePath, JSON.stringify(obj));
   }
 
-  /** Load persisted VV cache. Migrates old formats (v1/v2) to sentinel entries. */
+  /**
+   * Load the persisted startup sync index.
+   *
+   * Dev-phase rule: only the current schema (v4) is supported. Older cache
+   * files are ignored and effectively treated as a local reset.
+   */
   async loadVVCache(): Promise<Map<string, VVCacheEntry> | null> {
     const adapter = this.app.vault.adapter;
     try {
@@ -149,27 +159,17 @@ export class StateStorage {
       if (!exists) return null;
       const raw = await adapter.read(this.vvCachePath);
       const obj = JSON.parse(raw) as Record<string, unknown>;
+      if (obj._version !== 4) return null;
 
       const result = new Map<string, VVCacheEntry>();
-
-      if (obj._version === 3) {
-        // Current format: entries have { vv, contentHash }
-        for (const [k, v] of Object.entries(obj)) {
-          if (k === '_version') continue;
-          result.set(k, v as VVCacheEntry);
-        }
-      } else if (obj._version === 2) {
-        // v2 format had mtime/size → extract vv, use sentinel hash
-        for (const [k, v] of Object.entries(obj)) {
-          if (k === '_version') continue;
-          const entry = v as { vv: string };
-          result.set(k, { vv: entry.vv, contentHash: 0 });
-        }
-      } else {
-        // v1 format: values are plain VV strings
-        for (const [k, v] of Object.entries(obj)) {
-          result.set(k, { vv: v as string, contentHash: 0 });
-        }
+      for (const [k, v] of Object.entries(obj)) {
+        if (k === '_version') continue;
+        const entry = v as Partial<VVCacheEntry>;
+        result.set(k, {
+          vv: typeof entry.vv === 'string' ? entry.vv : '',
+          contentHash: typeof entry.contentHash === 'number' ? entry.contentHash : 0,
+          dirty: entry.dirty === true,
+        });
       }
       return result;
     } catch {

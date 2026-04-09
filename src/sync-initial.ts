@@ -59,6 +59,8 @@ export interface InitialSyncDeps {
     docUuid: string,
     clientVV: string | null,
   ) => Promise<{ delta: Uint8Array; serverVV: string } | null>;
+  cachedVVs: ReadonlyMap<string, VVCacheEntry> | null;
+  saveSyncIndex: (map: Map<string, VVCacheEntry>) => Promise<void>;
   trace: (event: string, data?: Record<string, unknown>) => void;
   tracePath: (event: string, path: string, data?: Record<string, unknown>) => void;
   observePath: (path: string) => void;
@@ -115,8 +117,10 @@ export async function runInitialSync(
     }
   }
 
-  // Load cached VVs from last successful sync
-  const cachedVVs = await docs.loadVVCache();
+  // Snapshot the startup sync index loaded by SyncEngine before initialSync.
+  // It carries the last known server VV, content hash, and a persisted dirty
+  // flag per path.
+  const cachedVVs = deps.cachedVVs;
 
   deps.trace('initial-sync.start', {
     serverDocs: serverDocs.length,
@@ -265,20 +269,29 @@ export async function runInitialSync(
   console.info(`${tag} downloads done (${(performance.now() - t0).toFixed(0)}ms): ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
   const downloadsMs = performance.now() - tPhase;
 
-  // 2. Overlapping docs — two-tier skip: VV+hash → full sync
-  //    File reads are batched in parallel (PARALLEL_OVERLAPPING) to reduce I/O
-  //    latency on mobile. Full syncs (syncOverlappingDoc) stay serial because
+  // 2. Overlapping docs — three-tier skip: clean VV match (no read) →
+  //    dirty VV match + hash check → full sync. File reads are batched in
+  //    parallel to reduce Android SAF latency. Full syncs stay serial because
   //    they involve WS round-trips.
   tPhase = performance.now();
-  let skippedVVMatch = 0;
+  let skippedClean = 0;
+  let skippedHashMatch = 0;
   let overlappingProcessed = 0;
   deps.trace('initial-sync.overlapping.begin', { overlapping: overlappingFiles.length });
 
-  // Pre-read all effective content in parallel batches — the read is the
-  // bottleneck on Android (~10ms per file via SAF). Processing stays serial.
+  const needsRead = (path: string): boolean => {
+    if (syncedPaths.has(path)) return false;
+    const currentServerVV = serverVVStrings.get(path);
+    const cached = cachedVVs?.get(path);
+    return !(cached && currentServerVV && vvEquals(currentServerVV, cached.vv) && !cached.dirty);
+  };
+
+  // Pre-read only the files that are not already proven clean by the sync
+  // index. This is the main Android startup win: VV-stable + clean paths skip
+  // the disk entirely.
   const effectiveContents = new Map<string, string>();
   {
-    const filesToRead = overlappingFiles.filter(f => !syncedPaths.has(f.path));
+    const filesToRead = overlappingFiles.filter((f) => needsRead(f.path));
     for (let i = 0; i < filesToRead.length; i += PARALLEL_OVERLAPPING) {
       const batch = filesToRead.slice(i, i + PARALLEL_OVERLAPPING);
       const results = await Promise.all(batch.map(async (file) => {
@@ -309,13 +322,31 @@ export async function runInitialSync(
   }
 
   // Process overlapping files serially — same structure as before, but reads
-  // come from the pre-fetched map instead of individual awaits.
+  // come from the pre-fetched map and clean VV matches skip the read entirely.
   for (const file of overlappingFiles) {
-    if (syncedPaths.has(file.path)) { stepsDone++; onProgress?.(stepsDone, totalSteps, changed); overlappingProcessed++; continue; }
+    if (syncedPaths.has(file.path)) {
+      stepsDone++;
+      onProgress?.(stepsDone, totalSteps, changed);
+      overlappingProcessed++;
+      continue;
+    }
     const currentServerVV = serverVVStrings.get(file.path);
     const cached = cachedVVs?.get(file.path);
 
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
+      if (!cached.dirty) {
+        deps.tracePath('initial-sync.vv-clean-skip', file.path, {
+          contentHash: cached.contentHash,
+        });
+        contentHashes.set(file.path, cached.contentHash);
+        lastServerVV.set(file.path, currentServerVV);
+        skippedClean++;
+        stepsDone++;
+        onProgress?.(stepsDone, totalSteps, changed);
+        overlappingProcessed++;
+        continue;
+      }
+
       const effective = effectiveContents.get(file.path)!;
       const tHash = performance.now();
       const effectiveHash = fnv1aHash(effective);
@@ -331,7 +362,7 @@ export async function runInitialSync(
       if (effectiveHash === cached.contentHash) {
         deps.tracePath('initial-sync.vv-hash-skip', file.path, { effectiveHash });
         lastServerVV.set(file.path, currentServerVV);
-        skippedVVMatch++;
+        skippedHashMatch++;
         stepsDone++;
         onProgress?.(stepsDone, totalSteps, changed);
         overlappingProcessed++;
@@ -365,11 +396,14 @@ export async function runInitialSync(
 
   const overlappingMs = performance.now() - tPhase;
   deps.trace('initial-sync.overlapping.done', {
-    skippedVVMatch,
-    synced: overlappingFiles.length - skippedVVMatch,
+    skippedClean,
+    skippedHashMatch,
+    synced: overlappingFiles.length - skippedClean - skippedHashMatch,
     elapsedMs: Number(overlappingMs.toFixed(0)),
   });
-  console.info(`${tag} overlapping done (${overlappingMs.toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
+  console.info(
+    `${tag} overlapping done (${overlappingMs.toFixed(0)}ms): ${skippedClean} clean skipped, ${skippedHashMatch} dirty/hash skipped, ${overlappingFiles.length - skippedClean - skippedHashMatch} synced`,
+  );
 
   // 3. Local-only docs — push full snapshot via doc_create (skip in pull mode)
   tPhase = performance.now();
@@ -413,13 +447,17 @@ export async function runInitialSync(
 
   const tombstonesMs = performance.now() - tPhase;
 
-  // 6. Persist VV cache with content hashes for next startup
+  // 6. Persist the startup sync index for next startup.
   tPhase = performance.now();
   const vvCacheEntries = new Map<string, VVCacheEntry>();
   for (const [path, vv] of lastServerVV) {
-    vvCacheEntries.set(path, { vv, contentHash: contentHashes.get(path) ?? 0 });
+    vvCacheEntries.set(path, {
+      vv,
+      contentHash: contentHashes.get(path) ?? 0,
+      dirty: false,
+    });
   }
-  await docs.saveVVCache(vvCacheEntries);
+  await deps.saveSyncIndex(vvCacheEntries);
 
   const vvCacheSaveMs = performance.now() - tPhase;
 

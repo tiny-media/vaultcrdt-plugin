@@ -2674,14 +2674,22 @@ var StateStorage = class {
     }
     return removed;
   }
-  /** Persist VV cache with content hashes for fast skip on next startup. */
+  /**
+   * Persist the startup sync index used by initialSync fast-path decisions.
+   * Historical file name stays `vv-cache.json`; current schema is v4.
+   */
   async saveVVCache(map) {
     const adapter = this.app.vault.adapter;
-    const obj = { _version: 3 };
+    const obj = { _version: 4 };
     for (const [k, v] of map) obj[k] = v;
     await adapter.write(this.vvCachePath, JSON.stringify(obj));
   }
-  /** Load persisted VV cache. Migrates old formats (v1/v2) to sentinel entries. */
+  /**
+   * Load the persisted startup sync index.
+   *
+   * Dev-phase rule: only the current schema (v4) is supported. Older cache
+   * files are ignored and effectively treated as a local reset.
+   */
   async loadVVCache() {
     const adapter = this.app.vault.adapter;
     try {
@@ -2689,22 +2697,16 @@ var StateStorage = class {
       if (!exists) return null;
       const raw = await adapter.read(this.vvCachePath);
       const obj = JSON.parse(raw);
+      if (obj._version !== 4) return null;
       const result = /* @__PURE__ */ new Map();
-      if (obj._version === 3) {
-        for (const [k, v] of Object.entries(obj)) {
-          if (k === "_version") continue;
-          result.set(k, v);
-        }
-      } else if (obj._version === 2) {
-        for (const [k, v] of Object.entries(obj)) {
-          if (k === "_version") continue;
-          const entry = v;
-          result.set(k, { vv: entry.vv, contentHash: 0 });
-        }
-      } else {
-        for (const [k, v] of Object.entries(obj)) {
-          result.set(k, { vv: v, contentHash: 0 });
-        }
+      for (const [k, v] of Object.entries(obj)) {
+        if (k === "_version") continue;
+        const entry = v;
+        result.set(k, {
+          vv: typeof entry.vv === "string" ? entry.vv : "",
+          contentHash: typeof entry.contentHash === "number" ? entry.contentHash : 0,
+          dirty: entry.dirty === true
+        });
       }
       return result;
     } catch (e) {
@@ -3427,7 +3429,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
       serverVVStrings.set(d.doc_uuid, new TextDecoder().decode(d.server_vv));
     }
   }
-  const cachedVVs = await docs.loadVVCache();
+  const cachedVVs = deps.cachedVVs;
   deps.trace("initial-sync.start", {
     serverDocs: serverDocs.length,
     localFiles: localFiles.length,
@@ -3548,12 +3550,19 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   console.info(`${tag} downloads done (${(performance.now() - t0).toFixed(0)}ms): ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
   const downloadsMs = performance.now() - tPhase;
   tPhase = performance.now();
-  let skippedVVMatch = 0;
+  let skippedClean = 0;
+  let skippedHashMatch = 0;
   let overlappingProcessed = 0;
   deps.trace("initial-sync.overlapping.begin", { overlapping: overlappingFiles.length });
+  const needsRead = (path) => {
+    if (syncedPaths.has(path)) return false;
+    const currentServerVV = serverVVStrings.get(path);
+    const cached = cachedVVs == null ? void 0 : cachedVVs.get(path);
+    return !(cached && currentServerVV && vvEquals(currentServerVV, cached.vv) && !cached.dirty);
+  };
   const effectiveContents = /* @__PURE__ */ new Map();
   {
-    const filesToRead = overlappingFiles.filter((f) => !syncedPaths.has(f.path));
+    const filesToRead = overlappingFiles.filter((f) => needsRead(f.path));
     for (let i = 0; i < filesToRead.length; i += PARALLEL_OVERLAPPING) {
       const batch = filesToRead.slice(i, i + PARALLEL_OVERLAPPING);
       const results = await Promise.all(batch.map(async (file) => {
@@ -3591,6 +3600,18 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     const currentServerVV = serverVVStrings.get(file.path);
     const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
+      if (!cached.dirty) {
+        deps.tracePath("initial-sync.vv-clean-skip", file.path, {
+          contentHash: cached.contentHash
+        });
+        contentHashes.set(file.path, cached.contentHash);
+        lastServerVV.set(file.path, currentServerVV);
+        skippedClean++;
+        stepsDone++;
+        onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+        overlappingProcessed++;
+        continue;
+      }
       const effective = effectiveContents.get(file.path);
       const tHash = performance.now();
       const effectiveHash = fnv1aHash(effective);
@@ -3605,7 +3626,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
       if (effectiveHash === cached.contentHash) {
         deps.tracePath("initial-sync.vv-hash-skip", file.path, { effectiveHash });
         lastServerVV.set(file.path, currentServerVV);
-        skippedVVMatch++;
+        skippedHashMatch++;
         stepsDone++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
         overlappingProcessed++;
@@ -3637,11 +3658,14 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   }
   const overlappingMs = performance.now() - tPhase;
   deps.trace("initial-sync.overlapping.done", {
-    skippedVVMatch,
-    synced: overlappingFiles.length - skippedVVMatch,
+    skippedClean,
+    skippedHashMatch,
+    synced: overlappingFiles.length - skippedClean - skippedHashMatch,
     elapsedMs: Number(overlappingMs.toFixed(0))
   });
-  console.info(`${tag} overlapping done (${overlappingMs.toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
+  console.info(
+    `${tag} overlapping done (${overlappingMs.toFixed(0)}ms): ${skippedClean} clean skipped, ${skippedHashMatch} dirty/hash skipped, ${overlappingFiles.length - skippedClean - skippedHashMatch} synced`
+  );
   tPhase = performance.now();
   if (mode !== "pull") {
     for (const file of localOnlyFiles) {
@@ -3679,9 +3703,13 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   tPhase = performance.now();
   const vvCacheEntries = /* @__PURE__ */ new Map();
   for (const [path, vv] of lastServerVV) {
-    vvCacheEntries.set(path, { vv, contentHash: (_a = contentHashes.get(path)) != null ? _a : 0 });
+    vvCacheEntries.set(path, {
+      vv,
+      contentHash: (_a = contentHashes.get(path)) != null ? _a : 0,
+      dirty: false
+    });
   }
-  await docs.saveVVCache(vvCacheEntries);
+  await deps.saveSyncIndex(vvCacheEntries);
   const vvCacheSaveMs = performance.now() - tPhase;
   tPhase = performance.now();
   const validPaths = /* @__PURE__ */ new Set([...localPathSet, ...serverDocMap.keys()]);
@@ -4002,6 +4030,10 @@ var SyncEngine = class {
     __publicField(this, "lastRemoteWrite", /* @__PURE__ */ new Map());
     /** Serialized broadcast processing queue — prevents concurrent CRDT mutations. */
     __publicField(this, "broadcastQueue", Promise.resolve());
+    /** Startup sync index: last VV/hash plus persisted dirty bit per path. */
+    __publicField(this, "startupSyncIndex", /* @__PURE__ */ new Map());
+    /** Serializes writes to the persisted startup sync index file. */
+    __publicField(this, "startupSyncIndexPersist", Promise.resolve());
     /** Set to true after stop() — prevents reconnect after intentional close. */
     __publicField(this, "stopped", false);
     __publicField(this, "trace", new SyncTrace());
@@ -4035,6 +4067,7 @@ var SyncEngine = class {
   }
   // ── Lifecycle ───────────────────────────────────────────────────────────────
   async start() {
+    var _a, _b, _c;
     this.stopped = false;
     this.startupEditedPaths.clear();
     this.trace.resetStartup({
@@ -4050,6 +4083,21 @@ var SyncEngine = class {
     }
     await this.push.loadPendingDeletesFromJournal();
     this.trace.mark("start.pending-deletes-loaded");
+    const loadedSyncIndex = (_a = await this.docs.loadVVCache()) != null ? _a : /* @__PURE__ */ new Map();
+    for (const [path, entry] of this.startupSyncIndex) {
+      if (!entry.dirty) continue;
+      const existing = loadedSyncIndex.get(path);
+      loadedSyncIndex.set(path, {
+        vv: (_b = existing == null ? void 0 : existing.vv) != null ? _b : entry.vv,
+        contentHash: (_c = existing == null ? void 0 : existing.contentHash) != null ? _c : entry.contentHash,
+        dirty: true
+      });
+    }
+    this.startupSyncIndex = loadedSyncIndex;
+    this.trace.mark("start.sync-index-loaded", {
+      entries: this.startupSyncIndex.size,
+      dirty: [...this.startupSyncIndex.values()].filter((entry) => entry.dirty).length
+    });
     await this.auth();
     this.trace.mark("start.auth-ok");
     this.connect();
@@ -4071,6 +4119,8 @@ var SyncEngine = class {
     (_a = this.ws) == null ? void 0 : _a.close();
     this.ws = null;
     await this.docs.persistAll();
+    await this.startupSyncIndexPersist.catch(() => {
+    });
   }
   // ── Server communication ────────────────────────────────────────────────────
   httpBase() {
@@ -4114,6 +4164,8 @@ var SyncEngine = class {
     this.catchUpInProgress.clear();
     this.queuedBroadcasts = [];
     this.startupEditedPaths.clear();
+    this.startupSyncIndex.clear();
+    this.startupSyncIndexPersist = Promise.resolve();
   }
   wsUrl() {
     return toWsBase(this.settings.serverUrl) + "/ws";
@@ -4195,6 +4247,8 @@ var SyncEngine = class {
           send: (msg) => this.send(msg),
           requestDocList: () => this.requestDocList(),
           requestSyncStart: (uuid, vv) => this.requestSyncStart(uuid, vv),
+          cachedVVs: new Map(this.startupSyncIndex),
+          saveSyncIndex: (map) => this.replaceStartupSyncIndex(map),
           trace: (event, data) => this.trace.mark(event, data),
           tracePath: (event, path, data) => this.trace.markPath(event, path, data),
           observePath: (path) => this.trace.observePath(path),
@@ -4404,6 +4458,7 @@ var SyncEngine = class {
       warn(`${this.tag} rejected delete for invalid path`, { docUuid });
       return;
     }
+    this.forgetStartupSyncPath(docUuid);
     await this.docs.removeAndClean(docUuid);
     this.lastServerVV.delete(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
@@ -4423,11 +4478,13 @@ var SyncEngine = class {
   }
   onFileChanged(path) {
     this.startupEditedPaths.add(path);
+    this.markStartupSyncPathDirty(path);
     this.trace.observePath(path);
     this.trace.markPath("editor-change.accepted", path, { initialSyncRunning: this.initialSyncRunning });
     this.push.onFileChanged(path);
   }
   onFileChangedImmediate(path, content) {
+    this.markStartupSyncPathDirty(path);
     this.trace.observePath(path);
     this.trace.markPath("vault-change.accepted", path, {
       initialSyncRunning: this.initialSyncRunning,
@@ -4436,9 +4493,12 @@ var SyncEngine = class {
     this.push.onFileChangedImmediate(path, content);
   }
   onFileDeleted(path) {
+    this.forgetStartupSyncPath(path);
     this.push.onFileDeleted(path);
   }
   onFileRenamed(oldPath, newPath, content) {
+    this.forgetStartupSyncPath(oldPath);
+    this.markStartupSyncPathDirty(newPath);
     this.push.onFileRenamed(oldPath, newPath, content);
   }
   /**
@@ -4447,6 +4507,7 @@ var SyncEngine = class {
    * so nothing is pushed for it.
    */
   onFileDeletedOnly(path) {
+    this.forgetStartupSyncPath(path);
     this.push.deleteOnly(path);
   }
   // ── Guards ──────────────────────────────────────────────────────────────────
@@ -4472,6 +4533,33 @@ var SyncEngine = class {
     };
   }
   // ── Private helpers ─────────────────────────────────────────────────────────
+  markStartupSyncPathDirty(path) {
+    var _a, _b;
+    const existing = this.startupSyncIndex.get(path);
+    if (existing == null ? void 0 : existing.dirty) return;
+    this.startupSyncIndex.set(path, {
+      vv: (_a = existing == null ? void 0 : existing.vv) != null ? _a : "",
+      contentHash: (_b = existing == null ? void 0 : existing.contentHash) != null ? _b : 0,
+      dirty: true
+    });
+    this.queueStartupSyncIndexPersist();
+  }
+  forgetStartupSyncPath(path) {
+    if (!this.startupSyncIndex.delete(path)) return;
+    this.queueStartupSyncIndexPersist();
+  }
+  replaceStartupSyncIndex(map) {
+    this.startupSyncIndex = new Map(map);
+    return this.queueStartupSyncIndexPersist();
+  }
+  queueStartupSyncIndexPersist() {
+    const snapshot = new Map(this.startupSyncIndex);
+    this.startupSyncIndexPersist = this.startupSyncIndexPersist.catch(() => {
+    }).then(() => this.docs.saveVVCache(snapshot)).catch((err) => {
+      warn(`${this.tag} startup sync index persist failed`, { err });
+    });
+    return this.startupSyncIndexPersist;
+  }
   send(msg) {
     var _a;
     if (((_a = this.ws) == null ? void 0 : _a.readyState) === WebSocket.OPEN) {
