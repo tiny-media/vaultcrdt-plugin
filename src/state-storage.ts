@@ -6,8 +6,6 @@ export interface VVCacheEntry {
   vv: string;
   /** FNV-1a hash of file content at last sync. Used for fast skip. */
   contentHash: number;
-  /** Local edits happened after the index entry was written. */
-  dirty: boolean;
 }
 
 /**
@@ -136,21 +134,22 @@ export class StateStorage {
   private vvCachePath = `${STATE_DIR}/vv-cache.json`;
 
   /**
-   * Persist the startup sync index used by initialSync fast-path decisions.
-   * Historical file name stays `vv-cache.json`; current schema is v4.
+   * Persist the shared VV/content-hash cache used by initialSync fast-path
+   * decisions. Device-local dirty state is stored separately.
    */
   async saveVVCache(map: Map<string, VVCacheEntry>): Promise<void> {
     const adapter = this.app.vault.adapter;
-    const obj: Record<string, VVCacheEntry | number> = { _version: 4 };
+    const obj: Record<string, VVCacheEntry | number> = { _version: 3 };
     for (const [k, v] of map) obj[k] = v;
     await adapter.write(this.vvCachePath, JSON.stringify(obj));
   }
 
   /**
-   * Load the persisted startup sync index.
+   * Load the shared VV/content-hash cache.
    *
-   * Dev-phase rule: only the current schema (v4) is supported. Older cache
-   * files are ignored and effectively treated as a local reset.
+   * Accepts v3 (current) and the short-lived v4 dogfood format from 0.2.31,
+   * ignoring any old persisted dirty bit because that state is now device-local.
+   * Older legacy schemas are treated as reset/null in dev.
    */
   async loadVVCache(): Promise<Map<string, VVCacheEntry> | null> {
     const adapter = this.app.vault.adapter;
@@ -159,16 +158,15 @@ export class StateStorage {
       if (!exists) return null;
       const raw = await adapter.read(this.vvCachePath);
       const obj = JSON.parse(raw) as Record<string, unknown>;
-      if (obj._version !== 4) return null;
+      if (obj._version !== 3 && obj._version !== 4) return null;
 
       const result = new Map<string, VVCacheEntry>();
       for (const [k, v] of Object.entries(obj)) {
         if (k === '_version') continue;
-        const entry = v as Partial<VVCacheEntry>;
+        const entry = v as Partial<VVCacheEntry> & { dirty?: boolean };
         result.set(k, {
           vv: typeof entry.vv === 'string' ? entry.vv : '',
           contentHash: typeof entry.contentHash === 'number' ? entry.contentHash : 0,
-          dirty: entry.dirty === true,
         });
       }
       return result;

@@ -130,9 +130,15 @@ export class PushHandler {
         try {
           const delta = doc.export_delta_since_vv_json(vvBefore);
           if (delta.length > 0) {
-            this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
-            this.tracePath('push.flush.sent', path, { deltaLen: delta.length });
-            log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+            const wsOpen = this.isWsOpen();
+            if (wsOpen) {
+              this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
+              this.tracePath('push.flush.sent', path, { deltaLen: delta.length });
+              log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+            } else {
+              this.tracePath('push.flush.deferred-offline', path, { deltaLen: delta.length });
+              log(`${this.tag} flushed pending edits locally (WS closed)`, { path, deltaLen: delta.length });
+            }
           }
         } catch (err) {
           this.tracePath('push.flush.error', path, { message: err instanceof Error ? err.message : String(err) });
@@ -266,14 +272,24 @@ export class PushHandler {
     // Export delta since the VV before this edit
     try {
       const delta = doc.export_delta_since_vv_json(vvBefore);
-      this.tracePath('push.delta.sent', path, { deltaLen: delta.length });
-      log(`${this.tag} sync_push`, { path, version: doc.version(), deltaLen: delta.length });
-      this.send({
-        type: 'sync_push',
-        doc_uuid: path,
-        delta,
-        peer_id: this.settings.peerId,
-      });
+      const wsOpen = this.isWsOpen();
+      if (wsOpen) {
+        this.tracePath('push.delta.sent', path, { deltaLen: delta.length });
+        log(`${this.tag} sync_push`, { path, version: doc.version(), deltaLen: delta.length });
+        this.send({
+          type: 'sync_push',
+          doc_uuid: path,
+          delta,
+          peer_id: this.settings.peerId,
+        });
+      } else {
+        this.tracePath('push.delta.deferred-offline', path, { deltaLen: delta.length });
+        log(`${this.tag} local delta queued implicitly via CRDT state (WS closed)`, {
+          path,
+          version: doc.version(),
+          deltaLen: delta.length,
+        });
+      }
     } catch (err) {
       this.tracePath('push.delta.error', path, { message: err instanceof Error ? err.message : String(err) });
       error(`${this.tag} export_delta failed, falling back to doc_create:`, path, err);

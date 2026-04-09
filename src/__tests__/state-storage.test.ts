@@ -119,7 +119,7 @@ describe('StateStorage', () => {
     );
   });
 
-  it('loadVVCache ignores legacy schemas during dev resets', async () => {
+  it('loadVVCache reads current v3 schema', async () => {
     adapter.read.mockResolvedValueOnce(JSON.stringify({
       _version: 3,
       'note.md': { vv: '{"p":1}', contentHash: 123 },
@@ -127,18 +127,29 @@ describe('StateStorage', () => {
     adapter.exists.mockResolvedValueOnce(true);
 
     const cache = await storage.loadVVCache();
-    expect(cache).toBeNull();
+    expect(cache?.get('note.md')).toEqual({ vv: '{"p":1}', contentHash: 123 });
   });
 
-  it('saveVVCache writes v4 entries with dirty bit', async () => {
+  it('loadVVCache tolerates short-lived v4 dirty entries by ignoring the dirty bit', async () => {
+    adapter.read.mockResolvedValueOnce(JSON.stringify({
+      _version: 4,
+      'note.md': { vv: '{"p":1}', contentHash: 123, dirty: true },
+    }));
+    adapter.exists.mockResolvedValueOnce(true);
+
+    const cache = await storage.loadVVCache();
+    expect(cache?.get('note.md')).toEqual({ vv: '{"p":1}', contentHash: 123 });
+  });
+
+  it('saveVVCache writes shared v3 entries without dirty bit', async () => {
     await storage.saveVVCache(new Map([
-      ['note.md', { vv: '{"p":2}', contentHash: 456, dirty: false }],
+      ['note.md', { vv: '{"p":2}', contentHash: 456 }],
     ]));
 
     const raw = await adapter.read('.obsidian/plugins/vaultcrdt/state/vv-cache.json');
     expect(JSON.parse(raw)).toEqual({
-      _version: 4,
-      'note.md': { vv: '{"p":2}', contentHash: 456, dirty: false },
+      _version: 3,
+      'note.md': { vv: '{"p":2}', contentHash: 456 },
     });
   });
 });

@@ -2675,20 +2675,21 @@ var StateStorage = class {
     return removed;
   }
   /**
-   * Persist the startup sync index used by initialSync fast-path decisions.
-   * Historical file name stays `vv-cache.json`; current schema is v4.
+   * Persist the shared VV/content-hash cache used by initialSync fast-path
+   * decisions. Device-local dirty state is stored separately.
    */
   async saveVVCache(map) {
     const adapter = this.app.vault.adapter;
-    const obj = { _version: 4 };
+    const obj = { _version: 3 };
     for (const [k, v] of map) obj[k] = v;
     await adapter.write(this.vvCachePath, JSON.stringify(obj));
   }
   /**
-   * Load the persisted startup sync index.
+   * Load the shared VV/content-hash cache.
    *
-   * Dev-phase rule: only the current schema (v4) is supported. Older cache
-   * files are ignored and effectively treated as a local reset.
+   * Accepts v3 (current) and the short-lived v4 dogfood format from 0.2.31,
+   * ignoring any old persisted dirty bit because that state is now device-local.
+   * Older legacy schemas are treated as reset/null in dev.
    */
   async loadVVCache() {
     const adapter = this.app.vault.adapter;
@@ -2697,15 +2698,14 @@ var StateStorage = class {
       if (!exists) return null;
       const raw = await adapter.read(this.vvCachePath);
       const obj = JSON.parse(raw);
-      if (obj._version !== 4) return null;
+      if (obj._version !== 3 && obj._version !== 4) return null;
       const result = /* @__PURE__ */ new Map();
       for (const [k, v] of Object.entries(obj)) {
         if (k === "_version") continue;
         const entry = v;
         result.set(k, {
           vv: typeof entry.vv === "string" ? entry.vv : "",
-          contentHash: typeof entry.contentHash === "number" ? entry.contentHash : 0,
-          dirty: entry.dirty === true
+          contentHash: typeof entry.contentHash === "number" ? entry.contentHash : 0
         });
       }
       return result;
@@ -3238,9 +3238,15 @@ var PushHandler = class {
         try {
           const delta = doc.export_delta_since_vv_json(vvBefore);
           if (delta.length > 0) {
-            this.send({ type: "sync_push", doc_uuid: path, delta, peer_id: this.settings.peerId });
-            this.tracePath("push.flush.sent", path, { deltaLen: delta.length });
-            log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+            const wsOpen = this.isWsOpen();
+            if (wsOpen) {
+              this.send({ type: "sync_push", doc_uuid: path, delta, peer_id: this.settings.peerId });
+              this.tracePath("push.flush.sent", path, { deltaLen: delta.length });
+              log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+            } else {
+              this.tracePath("push.flush.deferred-offline", path, { deltaLen: delta.length });
+              log(`${this.tag} flushed pending edits locally (WS closed)`, { path, deltaLen: delta.length });
+            }
           }
         } catch (err) {
           this.tracePath("push.flush.error", path, { message: err instanceof Error ? err.message : String(err) });
@@ -3356,14 +3362,24 @@ var PushHandler = class {
     this.setStatus("syncing");
     try {
       const delta = doc.export_delta_since_vv_json(vvBefore);
-      this.tracePath("push.delta.sent", path, { deltaLen: delta.length });
-      log(`${this.tag} sync_push`, { path, version: doc.version(), deltaLen: delta.length });
-      this.send({
-        type: "sync_push",
-        doc_uuid: path,
-        delta,
-        peer_id: this.settings.peerId
-      });
+      const wsOpen = this.isWsOpen();
+      if (wsOpen) {
+        this.tracePath("push.delta.sent", path, { deltaLen: delta.length });
+        log(`${this.tag} sync_push`, { path, version: doc.version(), deltaLen: delta.length });
+        this.send({
+          type: "sync_push",
+          doc_uuid: path,
+          delta,
+          peer_id: this.settings.peerId
+        });
+      } else {
+        this.tracePath("push.delta.deferred-offline", path, { deltaLen: delta.length });
+        log(`${this.tag} local delta queued implicitly via CRDT state (WS closed)`, {
+          path,
+          version: doc.version(),
+          deltaLen: delta.length
+        });
+      }
     } catch (err) {
       this.tracePath("push.delta.error", path, { message: err instanceof Error ? err.message : String(err) });
       error(`${this.tag} export_delta failed, falling back to doc_create:`, path, err);
@@ -3430,6 +3446,13 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     }
   }
   const cachedVVs = deps.cachedVVs;
+  const dirtyPaths = new Set(deps.dirtyPaths);
+  const clearDirty = (path) => {
+    dirtyPaths.delete(path);
+  };
+  const keepDirty = (path) => {
+    dirtyPaths.add(path);
+  };
   deps.trace("initial-sync.start", {
     serverDocs: serverDocs.length,
     localFiles: localFiles.length,
@@ -3472,8 +3495,10 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     const file = localFileMap.get(activeDoc);
     deps.tracePath("initial-sync.priority.begin", activeDoc);
     const localContent = await readEffectiveLocalContent(app, editor, file);
-    await syncOverlappingDoc(deps, activeDoc, localContent, serverDocMap);
+    const outcome = await syncOverlappingDoc(deps, activeDoc, localContent, serverDocMap);
     await rememberCurrentDocHash(activeDoc);
+    if (outcome.keepDirty) keepDirty(activeDoc);
+    else clearDirty(activeDoc);
     syncedPaths.add(activeDoc);
     stepsDone++;
     changed++;
@@ -3508,6 +3533,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
           contentHashes.set(uuid, fnv1aHash(serverText));
           await editor.writeToVault(uuid, serverText);
           await docs.persist(uuid);
+          clearDirty(uuid);
           downloadOk++;
           changed++;
         }
@@ -3558,36 +3584,40 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     if (syncedPaths.has(path)) return false;
     const currentServerVV = serverVVStrings.get(path);
     const cached = cachedVVs == null ? void 0 : cachedVVs.get(path);
-    return !(cached && currentServerVV && vvEquals(currentServerVV, cached.vv) && !cached.dirty);
+    return !(cached && currentServerVV && vvEquals(currentServerVV, cached.vv) && !dirtyPaths.has(path));
   };
   const effectiveContents = /* @__PURE__ */ new Map();
-  {
-    const filesToRead = overlappingFiles.filter((f) => needsRead(f.path));
-    for (let i = 0; i < filesToRead.length; i += PARALLEL_OVERLAPPING) {
-      const batch = filesToRead.slice(i, i + PARALLEL_OVERLAPPING);
-      const results = await Promise.all(batch.map(async (file) => {
-        const tRead = performance.now();
-        const content = await readEffectiveLocalContent(app, editor, file);
-        const readMs = performance.now() - tRead;
-        if (readMs > 30) {
-          deps.tracePath("initial-sync.read.slow", file.path, {
-            readMs: Number(readMs.toFixed(0)),
-            bytes: content.length
-          });
-        }
-        return { path: file.path, content };
-      }));
-      for (const { path: p, content: c } of results) {
-        effectiveContents.set(p, c);
-      }
-      const done = Math.min(i + PARALLEL_OVERLAPPING, filesToRead.length);
-      if (done % 100 < PARALLEL_OVERLAPPING || done === filesToRead.length) {
-        deps.trace("initial-sync.overlapping.progress", {
-          done,
-          total: filesToRead.length,
-          elapsedMs: Number((performance.now() - tPhase).toFixed(0))
+  const filesToRead = overlappingFiles.filter((f) => needsRead(f.path));
+  deps.trace("initial-sync.overlapping.plan", {
+    total: overlappingFiles.length,
+    readsPlanned: filesToRead.length,
+    cleanSkipsPlanned: overlappingFiles.length - filesToRead.length - syncedPaths.size,
+    localDirty: dirtyPaths.size
+  });
+  for (let i = 0; i < filesToRead.length; i += PARALLEL_OVERLAPPING) {
+    const batch = filesToRead.slice(i, i + PARALLEL_OVERLAPPING);
+    const results = await Promise.all(batch.map(async (file) => {
+      const tRead = performance.now();
+      const content = await readEffectiveLocalContent(app, editor, file);
+      const readMs = performance.now() - tRead;
+      if (readMs > 30) {
+        deps.tracePath("initial-sync.read.slow", file.path, {
+          readMs: Number(readMs.toFixed(0)),
+          bytes: content.length
         });
       }
+      return { path: file.path, content };
+    }));
+    for (const { path: p, content: c } of results) {
+      effectiveContents.set(p, c);
+    }
+    const done = Math.min(i + PARALLEL_OVERLAPPING, filesToRead.length);
+    if (done % 100 < PARALLEL_OVERLAPPING || done === filesToRead.length) {
+      deps.trace("initial-sync.overlapping.progress", {
+        done,
+        total: filesToRead.length,
+        elapsedMs: Number((performance.now() - tPhase).toFixed(0))
+      });
     }
   }
   for (const file of overlappingFiles) {
@@ -3600,7 +3630,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     const currentServerVV = serverVVStrings.get(file.path);
     const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-      if (!cached.dirty) {
+      if (!dirtyPaths.has(file.path)) {
         deps.tracePath("initial-sync.vv-clean-skip", file.path, {
           contentHash: cached.contentHash
         });
@@ -3626,6 +3656,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
       if (effectiveHash === cached.contentHash) {
         deps.tracePath("initial-sync.vv-hash-skip", file.path, { effectiveHash });
         lastServerVV.set(file.path, currentServerVV);
+        clearDirty(file.path);
         skippedHashMatch++;
         stepsDone++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
@@ -3637,8 +3668,10 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
         effectiveHash,
         cachedHash: cached.contentHash
       });
-      await syncOverlappingDoc(deps, file.path, effective, serverDocMap);
+      const outcome2 = await syncOverlappingDoc(deps, file.path, effective, serverDocMap);
       await rememberCurrentDocHash(file.path);
+      if (outcome2.keepDirty) keepDirty(file.path);
+      else clearDirty(file.path);
       changed++;
       stepsDone++;
       onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
@@ -3650,8 +3683,10 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
       reason: cached ? "vv-mismatch" : "no-cache",
       localLen: localContent.length
     });
-    await syncOverlappingDoc(deps, file.path, localContent, serverDocMap);
+    const outcome = await syncOverlappingDoc(deps, file.path, localContent, serverDocMap);
     await rememberCurrentDocHash(file.path);
+    if (outcome.keepDirty) keepDirty(file.path);
+    else clearDirty(file.path);
     stepsDone++;
     onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
     overlappingProcessed++;
@@ -3660,7 +3695,9 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   deps.trace("initial-sync.overlapping.done", {
     skippedClean,
     skippedHashMatch,
+    reads: filesToRead.length,
     synced: overlappingFiles.length - skippedClean - skippedHashMatch,
+    dirtyRemaining: dirtyPaths.size,
     elapsedMs: Number(overlappingMs.toFixed(0))
   });
   console.info(
@@ -3676,6 +3713,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
       doc.sync_from_disk(content);
       push.pushDocCreate(file.path, doc);
       await docs.persist(file.path);
+      clearDirty(file.path);
       changed++;
       stepsDone++;
       onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
@@ -3705,11 +3743,11 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   for (const [path, vv] of lastServerVV) {
     vvCacheEntries.set(path, {
       vv,
-      contentHash: (_a = contentHashes.get(path)) != null ? _a : 0,
-      dirty: false
+      contentHash: (_a = contentHashes.get(path)) != null ? _a : 0
     });
   }
-  await deps.saveSyncIndex(vvCacheEntries);
+  await deps.saveVVCache(vvCacheEntries);
+  deps.saveDirtyPaths(dirtyPaths);
   const vvCacheSaveMs = performance.now() - tPhase;
   tPhase = performance.now();
   const validPaths = /* @__PURE__ */ new Set([...localPathSet, ...serverDocMap.keys()]);
@@ -3736,6 +3774,8 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
 async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
   const { app, docs, editor, push, lastServerVV, lastRemoteWrite, tag } = deps;
   deps.tracePath("overlap.begin", path, { localLen: localContent.length });
+  let keepDirty = false;
+  let wroteToVault = false;
   const freshEditorContent = editor.readCurrentContent(path);
   if (freshEditorContent !== null) {
     localContent = freshEditorContent;
@@ -3770,10 +3810,11 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
       lastServerVV.set(path, probe.serverVV);
       if (textsDiffer) {
         deps.tracePath("overlap.phase2-write-to-vault", path, { textLen: serverText.length });
+        wroteToVault = true;
         await editor.writeToVault(path, serverText);
       }
       await docs.persist(path);
-      return;
+      return { keepDirty };
     }
   }
   const hadLocalDiskChange = !doc.text_matches(localContent) && localContent.trim() !== "";
@@ -3809,9 +3850,10 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
             lastServerVV.set(path, fullResult.serverVV);
           }
           deps.tracePath("overlap.concurrent-write-to-vault", path, { textLen: freshDoc.get_text().length });
+          wroteToVault = true;
           await editor.writeToVault(path, freshDoc.get_text());
           await docs.persist(path);
-          return;
+          return { keepDirty };
         }
       }
     }
@@ -3836,14 +3878,15 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
       lastServerVV.set(path, result.serverVV);
       if (textsDiffer) {
         deps.tracePath("overlap.phase3-write-to-vault", path, { textLen: serverText.length });
+        wroteToVault = true;
         await editor.writeToVault(path, serverText);
       }
       await docs.persist(path);
-      return;
+      return { keepDirty };
     }
     const isActiveEditorDoc = editor.getActiveEditorPath() === path;
     deps.tracePath("overlap.editor-mode", path, { isActiveEditorDoc });
-    if (isActiveEditorDoc && result && result.delta.length > 0) {
+    if (isActiveEditorDoc && result.delta.length > 0) {
       await push.flushPendingEdits(path);
     }
     let diffJson = null;
@@ -3864,6 +3907,7 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
     if (localContent.trim() === "" && serverContent.trim() !== "" && !isActiveEditorDoc) {
       deps.tracePath("overlap.empty-local-write-to-vault", path, { textLen: serverContent.length });
       log(`${tag} overlapping: empty local, adopting server`, { path });
+      wroteToVault = true;
       await editor.writeToVault(path, serverContent);
     } else {
       const clientVVAfterMerge = doc.export_vv_json();
@@ -3887,8 +3931,10 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
         if (editorAlreadyMatches) {
           if (editedDuringStartup) {
             deps.tracePath("overlap.active-skip-disk-persist", path, { textLen: serverContent.length });
+            keepDirty = true;
           } else {
             deps.tracePath("overlap.active-persist-disk", path, { textLen: serverContent.length });
+            wroteToVault = true;
             await editor.writeToVault(path, serverContent);
           }
         } else if (diffJson) {
@@ -3908,25 +3954,32 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
                 doc.sync_from_disk(postApplyContent);
               }
               lastRemoteWrite.set(path, postApplyContent != null ? postApplyContent : serverContent);
+              keepDirty = true;
             } else {
               deps.tracePath("overlap.apply-diff-fallback-write", path, { textLen: serverContent.length });
+              wroteToVault = true;
               await editor.writeToVault(path, serverContent);
             }
           } else {
             deps.tracePath("overlap.active-persist-disk", path, { textLen: serverContent.length, reason: "empty-diff" });
+            wroteToVault = true;
             await editor.writeToVault(path, serverContent);
           }
         } else if (result.delta.length > 0) {
           deps.tracePath("overlap.active-write-to-vault", path, { textLen: serverContent.length });
+          wroteToVault = true;
           await editor.writeToVault(path, serverContent);
         }
       } else if (localContent !== serverContent) {
         deps.tracePath("overlap.write-to-vault", path, { textLen: serverContent.length });
+        wroteToVault = true;
         await editor.writeToVault(path, serverContent);
       }
     }
   }
   await docs.persist(path);
+  deps.tracePath("overlap.result", path, { keepDirty, wroteToVault });
+  return { keepDirty };
 }
 
 // src/sync-trace.ts
@@ -4000,6 +4053,92 @@ var SyncTrace = class {
   }
 };
 
+// src/startup-dirty-tracker.ts
+var STORAGE_PREFIX = "vaultcrdt:startup-dirty:v1:";
+function getBrowserStorage() {
+  try {
+    if (typeof globalThis.localStorage === "undefined") return null;
+    return globalThis.localStorage;
+  } catch (e) {
+    return null;
+  }
+}
+var StartupDirtyTracker = class {
+  constructor(vaultId, peerId, storage = getBrowserStorage()) {
+    __publicField(this, "storage");
+    __publicField(this, "paths", /* @__PURE__ */ new Set());
+    __publicField(this, "key");
+    this.storage = storage;
+    this.key = `${STORAGE_PREFIX}${encodeURIComponent(vaultId)}:${encodeURIComponent(peerId)}`;
+    this.reload();
+  }
+  reload() {
+    if (!this.storage) {
+      this.paths.clear();
+      return;
+    }
+    try {
+      const raw = this.storage.getItem(this.key);
+      if (!raw) {
+        this.paths.clear();
+        return;
+      }
+      const obj = JSON.parse(raw);
+      if (obj._version !== 1 || !Array.isArray(obj.paths)) {
+        this.paths.clear();
+        return;
+      }
+      this.paths = new Set(obj.paths.filter((p) => typeof p === "string"));
+    } catch (e) {
+      this.paths.clear();
+    }
+  }
+  snapshot() {
+    return new Set(this.paths);
+  }
+  size() {
+    return this.paths.size;
+  }
+  has(path) {
+    return this.paths.has(path);
+  }
+  markDirty(path) {
+    if (this.paths.has(path)) return;
+    this.paths.add(path);
+    this.persist();
+  }
+  clear(path) {
+    if (!this.paths.delete(path)) return;
+    this.persist();
+  }
+  replace(paths) {
+    this.paths = new Set(paths);
+    this.persist();
+  }
+  clearAll() {
+    this.paths.clear();
+    if (!this.storage) return;
+    try {
+      this.storage.removeItem(this.key);
+    } catch (e) {
+    }
+  }
+  persist() {
+    if (!this.storage) return;
+    try {
+      if (this.paths.size === 0) {
+        this.storage.removeItem(this.key);
+        return;
+      }
+      this.storage.setItem(this.key, JSON.stringify({
+        _version: 1,
+        paths: [...this.paths].sort()
+      }));
+    } catch (e) {
+    }
+  }
+};
+
 // src/sync-engine.ts
 var HEARTBEAT_MS = 3e4;
 var MAX_BACKOFF_MS = 3e4;
@@ -4030,10 +4169,10 @@ var SyncEngine = class {
     __publicField(this, "lastRemoteWrite", /* @__PURE__ */ new Map());
     /** Serialized broadcast processing queue — prevents concurrent CRDT mutations. */
     __publicField(this, "broadcastQueue", Promise.resolve());
-    /** Startup sync index: last VV/hash plus persisted dirty bit per path. */
-    __publicField(this, "startupSyncIndex", /* @__PURE__ */ new Map());
-    /** Serializes writes to the persisted startup sync index file. */
-    __publicField(this, "startupSyncIndexPersist", Promise.resolve());
+    /** Shared VV/content-hash cache from vv-cache.json. */
+    __publicField(this, "vvCache", /* @__PURE__ */ new Map());
+    /** Device-local dirty tracker for startup verification. */
+    __publicField(this, "startupDirty");
     /** Set to true after stop() — prevents reconnect after intentional close. */
     __publicField(this, "stopped", false);
     __publicField(this, "trace", new SyncTrace());
@@ -4048,6 +4187,7 @@ var SyncEngine = class {
     /** Called on WS open — main.ts auto-detects sync mode and runs initialSync. */
     __publicField(this, "onInitialSync", null);
     this.docs = new DocumentManager(app, settings.peerId);
+    this.startupDirty = new StartupDirtyTracker(settings.vaultId, settings.peerId);
     this.editor = new EditorIntegration(app, this.writingFromRemote, this.lastRemoteWrite, this.tag);
     this.push = new PushHandler(
       this.docs,
@@ -4067,7 +4207,7 @@ var SyncEngine = class {
   }
   // ── Lifecycle ───────────────────────────────────────────────────────────────
   async start() {
-    var _a, _b, _c;
+    var _a;
     this.stopped = false;
     this.startupEditedPaths.clear();
     this.trace.resetStartup({
@@ -4083,20 +4223,11 @@ var SyncEngine = class {
     }
     await this.push.loadPendingDeletesFromJournal();
     this.trace.mark("start.pending-deletes-loaded");
-    const loadedSyncIndex = (_a = await this.docs.loadVVCache()) != null ? _a : /* @__PURE__ */ new Map();
-    for (const [path, entry] of this.startupSyncIndex) {
-      if (!entry.dirty) continue;
-      const existing = loadedSyncIndex.get(path);
-      loadedSyncIndex.set(path, {
-        vv: (_b = existing == null ? void 0 : existing.vv) != null ? _b : entry.vv,
-        contentHash: (_c = existing == null ? void 0 : existing.contentHash) != null ? _c : entry.contentHash,
-        dirty: true
-      });
-    }
-    this.startupSyncIndex = loadedSyncIndex;
-    this.trace.mark("start.sync-index-loaded", {
-      entries: this.startupSyncIndex.size,
-      dirty: [...this.startupSyncIndex.values()].filter((entry) => entry.dirty).length
+    this.vvCache = (_a = await this.docs.loadVVCache()) != null ? _a : /* @__PURE__ */ new Map();
+    this.startupDirty.reload();
+    this.trace.mark("start.startup-state-loaded", {
+      cacheEntries: this.vvCache.size,
+      localDirty: this.startupDirty.size()
     });
     await this.auth();
     this.trace.mark("start.auth-ok");
@@ -4119,8 +4250,6 @@ var SyncEngine = class {
     (_a = this.ws) == null ? void 0 : _a.close();
     this.ws = null;
     await this.docs.persistAll();
-    await this.startupSyncIndexPersist.catch(() => {
-    });
   }
   // ── Server communication ────────────────────────────────────────────────────
   httpBase() {
@@ -4164,8 +4293,8 @@ var SyncEngine = class {
     this.catchUpInProgress.clear();
     this.queuedBroadcasts = [];
     this.startupEditedPaths.clear();
-    this.startupSyncIndex.clear();
-    this.startupSyncIndexPersist = Promise.resolve();
+    this.vvCache.clear();
+    this.startupDirty.clearAll();
   }
   wsUrl() {
     return toWsBase(this.settings.serverUrl) + "/ws";
@@ -4247,8 +4376,10 @@ var SyncEngine = class {
           send: (msg) => this.send(msg),
           requestDocList: () => this.requestDocList(),
           requestSyncStart: (uuid, vv) => this.requestSyncStart(uuid, vv),
-          cachedVVs: new Map(this.startupSyncIndex),
-          saveSyncIndex: (map) => this.replaceStartupSyncIndex(map),
+          cachedVVs: new Map(this.vvCache),
+          saveVVCache: (map) => this.replaceVVCache(map),
+          dirtyPaths: this.startupDirty.snapshot(),
+          saveDirtyPaths: (paths) => this.replaceDirtyPaths(paths),
           trace: (event, data) => this.trace.mark(event, data),
           tracePath: (event, path, data) => this.trace.markPath(event, path, data),
           observePath: (path) => this.trace.observePath(path),
@@ -4458,7 +4589,7 @@ var SyncEngine = class {
       warn(`${this.tag} rejected delete for invalid path`, { docUuid });
       return;
     }
-    this.forgetStartupSyncPath(docUuid);
+    this.forgetStartupPath(docUuid);
     await this.docs.removeAndClean(docUuid);
     this.lastServerVV.delete(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
@@ -4478,13 +4609,13 @@ var SyncEngine = class {
   }
   onFileChanged(path) {
     this.startupEditedPaths.add(path);
-    this.markStartupSyncPathDirty(path);
+    this.markStartupPathDirty(path);
     this.trace.observePath(path);
     this.trace.markPath("editor-change.accepted", path, { initialSyncRunning: this.initialSyncRunning });
     this.push.onFileChanged(path);
   }
   onFileChangedImmediate(path, content) {
-    this.markStartupSyncPathDirty(path);
+    this.markStartupPathDirty(path);
     this.trace.observePath(path);
     this.trace.markPath("vault-change.accepted", path, {
       initialSyncRunning: this.initialSyncRunning,
@@ -4493,12 +4624,12 @@ var SyncEngine = class {
     this.push.onFileChangedImmediate(path, content);
   }
   onFileDeleted(path) {
-    this.forgetStartupSyncPath(path);
+    this.forgetStartupPath(path);
     this.push.onFileDeleted(path);
   }
   onFileRenamed(oldPath, newPath, content) {
-    this.forgetStartupSyncPath(oldPath);
-    this.markStartupSyncPathDirty(newPath);
+    this.forgetStartupPath(oldPath);
+    this.markStartupPathDirty(newPath);
     this.push.onFileRenamed(oldPath, newPath, content);
   }
   /**
@@ -4507,7 +4638,7 @@ var SyncEngine = class {
    * so nothing is pushed for it.
    */
   onFileDeletedOnly(path) {
-    this.forgetStartupSyncPath(path);
+    this.forgetStartupPath(path);
     this.push.deleteOnly(path);
   }
   // ── Guards ──────────────────────────────────────────────────────────────────
@@ -4533,32 +4664,19 @@ var SyncEngine = class {
     };
   }
   // ── Private helpers ─────────────────────────────────────────────────────────
-  markStartupSyncPathDirty(path) {
-    var _a, _b;
-    const existing = this.startupSyncIndex.get(path);
-    if (existing == null ? void 0 : existing.dirty) return;
-    this.startupSyncIndex.set(path, {
-      vv: (_a = existing == null ? void 0 : existing.vv) != null ? _a : "",
-      contentHash: (_b = existing == null ? void 0 : existing.contentHash) != null ? _b : 0,
-      dirty: true
-    });
-    this.queueStartupSyncIndexPersist();
+  markStartupPathDirty(path) {
+    this.startupDirty.markDirty(path);
   }
-  forgetStartupSyncPath(path) {
-    if (!this.startupSyncIndex.delete(path)) return;
-    this.queueStartupSyncIndexPersist();
+  forgetStartupPath(path) {
+    this.startupDirty.clear(path);
+    this.vvCache.delete(path);
   }
-  replaceStartupSyncIndex(map) {
-    this.startupSyncIndex = new Map(map);
-    return this.queueStartupSyncIndexPersist();
+  async replaceVVCache(map) {
+    this.vvCache = new Map(map);
+    await this.docs.saveVVCache(this.vvCache);
   }
-  queueStartupSyncIndexPersist() {
-    const snapshot = new Map(this.startupSyncIndex);
-    this.startupSyncIndexPersist = this.startupSyncIndexPersist.catch(() => {
-    }).then(() => this.docs.saveVVCache(snapshot)).catch((err) => {
-      warn(`${this.tag} startup sync index persist failed`, { err });
-    });
-    return this.startupSyncIndexPersist;
+  replaceDirtyPaths(paths) {
+    this.startupDirty.replace(paths);
   }
   send(msg) {
     var _a;

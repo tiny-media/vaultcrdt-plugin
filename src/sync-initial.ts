@@ -60,7 +60,9 @@ export interface InitialSyncDeps {
     clientVV: string | null,
   ) => Promise<{ delta: Uint8Array; serverVV: string } | null>;
   cachedVVs: ReadonlyMap<string, VVCacheEntry> | null;
-  saveSyncIndex: (map: Map<string, VVCacheEntry>) => Promise<void>;
+  saveVVCache: (map: Map<string, VVCacheEntry>) => Promise<void>;
+  dirtyPaths: ReadonlySet<string>;
+  saveDirtyPaths: (paths: Iterable<string>) => void;
   trace: (event: string, data?: Record<string, unknown>) => void;
   tracePath: (event: string, path: string, data?: Record<string, unknown>) => void;
   observePath: (path: string) => void;
@@ -117,10 +119,12 @@ export async function runInitialSync(
     }
   }
 
-  // Snapshot the startup sync index loaded by SyncEngine before initialSync.
-  // It carries the last known server VV, content hash, and a persisted dirty
-  // flag per path.
+  // Snapshot the shared VV/hash cache loaded by SyncEngine before initialSync.
+  // Device-local dirty paths are tracked separately.
   const cachedVVs = deps.cachedVVs;
+  const dirtyPaths = new Set(deps.dirtyPaths);
+  const clearDirty = (path: string): void => { dirtyPaths.delete(path); };
+  const keepDirty = (path: string): void => { dirtyPaths.add(path); };
 
   deps.trace('initial-sync.start', {
     serverDocs: serverDocs.length,
@@ -188,8 +192,10 @@ export async function runInitialSync(
     const file = localFileMap.get(activeDoc)!;
     deps.tracePath('initial-sync.priority.begin', activeDoc);
     const localContent = await readEffectiveLocalContent(app, editor, file);
-    await syncOverlappingDoc(deps, activeDoc, localContent, serverDocMap);
+    const outcome = await syncOverlappingDoc(deps, activeDoc, localContent, serverDocMap);
     await rememberCurrentDocHash(activeDoc);
+    if (outcome.keepDirty) keepDirty(activeDoc);
+    else clearDirty(activeDoc);
     syncedPaths.add(activeDoc);
     stepsDone++;
     changed++;
@@ -227,6 +233,7 @@ export async function runInitialSync(
           contentHashes.set(uuid, fnv1aHash(serverText));
           await editor.writeToVault(uuid, serverText);
           await docs.persist(uuid);
+          clearDirty(uuid);
           downloadOk++;
           changed++;
         }
@@ -283,41 +290,45 @@ export async function runInitialSync(
     if (syncedPaths.has(path)) return false;
     const currentServerVV = serverVVStrings.get(path);
     const cached = cachedVVs?.get(path);
-    return !(cached && currentServerVV && vvEquals(currentServerVV, cached.vv) && !cached.dirty);
+    return !(cached && currentServerVV && vvEquals(currentServerVV, cached.vv) && !dirtyPaths.has(path));
   };
 
-  // Pre-read only the files that are not already proven clean by the sync
-  // index. This is the main Android startup win: VV-stable + clean paths skip
-  // the disk entirely.
+  // Pre-read only the files that are not already proven clean by the shared
+  // cache plus the device-local dirty tracker. This is the main Android
+  // startup win: VV-stable + clean paths skip the disk entirely.
   const effectiveContents = new Map<string, string>();
-  {
-    const filesToRead = overlappingFiles.filter((f) => needsRead(f.path));
-    for (let i = 0; i < filesToRead.length; i += PARALLEL_OVERLAPPING) {
-      const batch = filesToRead.slice(i, i + PARALLEL_OVERLAPPING);
-      const results = await Promise.all(batch.map(async (file) => {
-        const tRead = performance.now();
-        const content = await readEffectiveLocalContent(app, editor, file);
-        const readMs = performance.now() - tRead;
-        if (readMs > 30) {
-          deps.tracePath('initial-sync.read.slow', file.path, {
-            readMs: Number(readMs.toFixed(0)),
-            bytes: content.length,
-          });
-        }
-        return { path: file.path, content };
-      }));
-      for (const { path: p, content: c } of results) {
-        effectiveContents.set(p, c);
-      }
-
-      const done = Math.min(i + PARALLEL_OVERLAPPING, filesToRead.length);
-      if (done % 100 < PARALLEL_OVERLAPPING || done === filesToRead.length) {
-        deps.trace('initial-sync.overlapping.progress', {
-          done,
-          total: filesToRead.length,
-          elapsedMs: Number((performance.now() - tPhase).toFixed(0)),
+  const filesToRead = overlappingFiles.filter((f) => needsRead(f.path));
+  deps.trace('initial-sync.overlapping.plan', {
+    total: overlappingFiles.length,
+    readsPlanned: filesToRead.length,
+    cleanSkipsPlanned: overlappingFiles.length - filesToRead.length - syncedPaths.size,
+    localDirty: dirtyPaths.size,
+  });
+  for (let i = 0; i < filesToRead.length; i += PARALLEL_OVERLAPPING) {
+    const batch = filesToRead.slice(i, i + PARALLEL_OVERLAPPING);
+    const results = await Promise.all(batch.map(async (file) => {
+      const tRead = performance.now();
+      const content = await readEffectiveLocalContent(app, editor, file);
+      const readMs = performance.now() - tRead;
+      if (readMs > 30) {
+        deps.tracePath('initial-sync.read.slow', file.path, {
+          readMs: Number(readMs.toFixed(0)),
+          bytes: content.length,
         });
       }
+      return { path: file.path, content };
+    }));
+    for (const { path: p, content: c } of results) {
+      effectiveContents.set(p, c);
+    }
+
+    const done = Math.min(i + PARALLEL_OVERLAPPING, filesToRead.length);
+    if (done % 100 < PARALLEL_OVERLAPPING || done === filesToRead.length) {
+      deps.trace('initial-sync.overlapping.progress', {
+        done,
+        total: filesToRead.length,
+        elapsedMs: Number((performance.now() - tPhase).toFixed(0)),
+      });
     }
   }
 
@@ -334,7 +345,7 @@ export async function runInitialSync(
     const cached = cachedVVs?.get(file.path);
 
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-      if (!cached.dirty) {
+      if (!dirtyPaths.has(file.path)) {
         deps.tracePath('initial-sync.vv-clean-skip', file.path, {
           contentHash: cached.contentHash,
         });
@@ -362,6 +373,7 @@ export async function runInitialSync(
       if (effectiveHash === cached.contentHash) {
         deps.tracePath('initial-sync.vv-hash-skip', file.path, { effectiveHash });
         lastServerVV.set(file.path, currentServerVV);
+        clearDirty(file.path);
         skippedHashMatch++;
         stepsDone++;
         onProgress?.(stepsDone, totalSteps, changed);
@@ -373,8 +385,10 @@ export async function runInitialSync(
         effectiveHash,
         cachedHash: cached.contentHash,
       });
-      await syncOverlappingDoc(deps, file.path, effective, serverDocMap);
+      const outcome = await syncOverlappingDoc(deps, file.path, effective, serverDocMap);
       await rememberCurrentDocHash(file.path);
+      if (outcome.keepDirty) keepDirty(file.path);
+      else clearDirty(file.path);
       changed++;
       stepsDone++;
       onProgress?.(stepsDone, totalSteps, changed);
@@ -387,8 +401,10 @@ export async function runInitialSync(
       reason: cached ? 'vv-mismatch' : 'no-cache',
       localLen: localContent.length,
     });
-    await syncOverlappingDoc(deps, file.path, localContent, serverDocMap);
+    const outcome = await syncOverlappingDoc(deps, file.path, localContent, serverDocMap);
     await rememberCurrentDocHash(file.path);
+    if (outcome.keepDirty) keepDirty(file.path);
+    else clearDirty(file.path);
     stepsDone++;
     onProgress?.(stepsDone, totalSteps, changed);
     overlappingProcessed++;
@@ -398,7 +414,9 @@ export async function runInitialSync(
   deps.trace('initial-sync.overlapping.done', {
     skippedClean,
     skippedHashMatch,
+    reads: filesToRead.length,
     synced: overlappingFiles.length - skippedClean - skippedHashMatch,
+    dirtyRemaining: dirtyPaths.size,
     elapsedMs: Number(overlappingMs.toFixed(0)),
   });
   console.info(
@@ -416,6 +434,7 @@ export async function runInitialSync(
       doc.sync_from_disk(content);
       push.pushDocCreate(file.path, doc);
       await docs.persist(file.path);
+      clearDirty(file.path);
       changed++;
       stepsDone++;
       onProgress?.(stepsDone, totalSteps, changed);
@@ -454,10 +473,10 @@ export async function runInitialSync(
     vvCacheEntries.set(path, {
       vv,
       contentHash: contentHashes.get(path) ?? 0,
-      dirty: false,
     });
   }
-  await deps.saveSyncIndex(vvCacheEntries);
+  await deps.saveVVCache(vvCacheEntries);
+  deps.saveDirtyPaths(dirtyPaths);
 
   const vvCacheSaveMs = performance.now() - tPhase;
 
@@ -486,15 +505,21 @@ export async function runInitialSync(
   console.info(`${tag} initialSync complete (${(performance.now() - t0).toFixed(0)}ms)`);
 }
 
+interface OverlapSyncOutcome {
+  keepDirty: boolean;
+}
+
 /** Full sync for a single overlapping doc — conflict detection + merge + push. */
 async function syncOverlappingDoc(
   deps: InitialSyncDeps,
   path: string,
   localContent: string,
   serverDocMap: Map<string, DocEntry>,
-): Promise<void> {
+): Promise<OverlapSyncOutcome> {
   const { app, docs, editor, push, lastServerVV, lastRemoteWrite, tag } = deps;
   deps.tracePath('overlap.begin', path, { localLen: localContent.length });
+  let keepDirty = false;
+  let wroteToVault = false;
 
   // Belt-and-suspenders: every caller is supposed to pass editor-aware
   // content (see readEffectiveLocalContent), but defensively re-read from
@@ -549,10 +574,11 @@ async function syncOverlappingDoc(
       lastServerVV.set(path, probe.serverVV);
       if (textsDiffer) {
         deps.tracePath('overlap.phase2-write-to-vault', path, { textLen: serverText.length });
+        wroteToVault = true;
         await editor.writeToVault(path, serverText);
       }
       await docs.persist(path);
-      return;
+      return { keepDirty };
     }
     // Server has the path in doc_list but returned no delta (or doc_unknown).
     // This means there is nothing to adopt: either the server stub is empty,
@@ -604,9 +630,10 @@ async function syncOverlappingDoc(
             lastServerVV.set(path, fullResult.serverVV);
           }
           deps.tracePath('overlap.concurrent-write-to-vault', path, { textLen: freshDoc.get_text().length });
+          wroteToVault = true;
           await editor.writeToVault(path, freshDoc.get_text());
           await docs.persist(path);
-          return;
+          return { keepDirty };
         }
       }
     }
@@ -640,26 +667,24 @@ async function syncOverlappingDoc(
         log(`${tag} disjoint VV adopt (identical text)`, { path });
       }
 
-      // Discard the disjoint local CRDT history entirely and replace it with
-      // a fresh doc seeded from the server snapshot. removeAndClean drops
-      // both the in-memory doc and the persisted .loro file.
       await docs.removeAndClean(path);
       const freshDoc = await docs.getOrLoad(path);
       freshDoc.import_snapshot(result.delta);
       lastServerVV.set(path, result.serverVV);
       if (textsDiffer) {
         deps.tracePath('overlap.phase3-write-to-vault', path, { textLen: serverText.length });
+        wroteToVault = true;
         await editor.writeToVault(path, serverText);
       }
       await docs.persist(path);
-      return;
+      return { keepDirty };
     }
 
     // For the active editor doc: flush pending keystrokes into the CRDT
     // before merging so import_and_diff produces a correct surgical diff.
     const isActiveEditorDoc = editor.getActiveEditorPath() === path;
     deps.tracePath('overlap.editor-mode', path, { isActiveEditorDoc });
-    if (isActiveEditorDoc && result && result.delta.length > 0) {
+    if (isActiveEditorDoc && result.delta.length > 0) {
       await push.flushPendingEdits(path);
     }
 
@@ -685,6 +710,7 @@ async function syncOverlappingDoc(
     if (localContent.trim() === '' && serverContent.trim() !== '' && !isActiveEditorDoc) {
       deps.tracePath('overlap.empty-local-write-to-vault', path, { textLen: serverContent.length });
       log(`${tag} overlapping: empty local, adopting server`, { path });
+      wroteToVault = true;
       await editor.writeToVault(path, serverContent);
     } else {
       const clientVVAfterMerge = doc.export_vv_json();
@@ -703,7 +729,6 @@ async function syncOverlappingDoc(
         log(`${tag} overlapping match`, { path });
       }
 
-      // Apply merged content — active editor gets surgical diff, others get full replace
       if (isActiveEditorDoc) {
         const currentEditorContent = editor.readCurrentContent(path);
         const editorAlreadyMatches =
@@ -711,13 +736,11 @@ async function syncOverlappingDoc(
 
         if (editorAlreadyMatches) {
           if (editedDuringStartup) {
-            // Active editor already shows the merged text and the user typed
-            // during startup — skip vault.modify(). On mobile, writing to the
-            // active file during the startup window triggers an editor rebind
-            // that eats in-flight keystrokes. Obsidian autosave persists later.
             deps.tracePath('overlap.active-skip-disk-persist', path, { textLen: serverContent.length });
+            keepDirty = true;
           } else {
             deps.tracePath('overlap.active-persist-disk', path, { textLen: serverContent.length });
+            wroteToVault = true;
             await editor.writeToVault(path, serverContent);
           }
         } else if (diffJson) {
@@ -727,7 +750,9 @@ async function syncOverlappingDoc(
             hasTextChanges = Array.isArray(ops) && ops.some(
               (op: { insert?: string; delete?: number }) => op.insert !== undefined || op.delete !== undefined
             );
-          } catch { /* empty */ }
+          } catch {
+            // empty
+          }
 
           if (hasTextChanges) {
             if (editor.applyDiffToEditor(path, diffJson, serverContent, true)) {
@@ -737,23 +762,30 @@ async function syncOverlappingDoc(
                 doc.sync_from_disk(postApplyContent);
               }
               lastRemoteWrite.set(path, postApplyContent ?? serverContent);
+              keepDirty = true;
             } else {
               deps.tracePath('overlap.apply-diff-fallback-write', path, { textLen: serverContent.length });
+              wroteToVault = true;
               await editor.writeToVault(path, serverContent);
             }
           } else {
             deps.tracePath('overlap.active-persist-disk', path, { textLen: serverContent.length, reason: 'empty-diff' });
+            wroteToVault = true;
             await editor.writeToVault(path, serverContent);
           }
         } else if (result.delta.length > 0) {
           deps.tracePath('overlap.active-write-to-vault', path, { textLen: serverContent.length });
+          wroteToVault = true;
           await editor.writeToVault(path, serverContent);
         }
       } else if (localContent !== serverContent) {
         deps.tracePath('overlap.write-to-vault', path, { textLen: serverContent.length });
+        wroteToVault = true;
         await editor.writeToVault(path, serverContent);
       }
     }
   }
   await docs.persist(path);
+  deps.tracePath('overlap.result', path, { keepDirty, wroteToVault });
+  return { keepDirty };
 }

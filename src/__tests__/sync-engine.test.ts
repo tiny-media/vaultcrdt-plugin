@@ -493,7 +493,7 @@ describe('SyncEngine', () => {
   // ── initialSync — content-hash fast-path (Tier 1) ──────────────────────────
 
   describe('initialSync — content-hash fast-path', () => {
-    it('skips CRDT sync when VV and content hash both match', async () => {
+    it('skips disk read and CRDT sync when VV and content hash both match', async () => {
       const tfile = Object.create(TFile.prototype);
       tfile.path = 'cached.md';
       mockVault.getMarkdownFiles.mockReturnValue([tfile]);
@@ -502,11 +502,10 @@ describe('SyncEngine', () => {
       const { fnv1aHash } = await import('../conflict-utils');
       const expectedHash = fnv1aHash('hello world');
 
-      // Matching VV/hash but still dirty -> one verification read, no sync_start.
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
-        _version: 4,
-        'cached.md': { vv: '{"peer1":10}', contentHash: expectedHash, dirty: true },
+        _version: 3,
+        'cached.md': { vv: '{"peer1":10}', contentHash: expectedHash },
       }));
       mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
 
@@ -523,15 +522,14 @@ describe('SyncEngine', () => {
 
       await syncPromise;
 
-      // File is read for hash check, but no sync_start is sent (skip)
-      expect(mockVault.read).toHaveBeenCalled();
+      expect(mockVault.read).not.toHaveBeenCalled();
       const syncStartCalls = mockEncode.mock.calls.filter(
         (c: any[]) => c[0]?.type === 'sync_start'
       );
       expect(syncStartCalls.length).toBe(0);
     });
 
-    it('skips disk read entirely when v4 entry is clean and VV matches', async () => {
+    it('skips disk read entirely when loading a v0.2.31 v4 cache entry', async () => {
       const { fnv1aHash } = await import('../conflict-utils');
       const { textFiles } = installVirtualStateStore();
       const tfile = Object.create(TFile.prototype);
@@ -576,8 +574,8 @@ describe('SyncEngine', () => {
 
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
-        _version: 4,
-        'edited.md': { vv: '{"peer1":5}', contentHash: 12345, dirty: false },
+        _version: 3,
+        'edited.md': { vv: '{"peer1":5}', contentHash: 12345 },
       }));
       mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
 
@@ -691,7 +689,6 @@ describe('SyncEngine', () => {
       expect(vvCache['remote.md']).toEqual({
         vv: '{"peer1":1}',
         contentHash: fnv1aHash('server content'),
-        dirty: false,
       });
 
       const localFile = Object.create(TFile.prototype);
@@ -761,7 +758,6 @@ describe('SyncEngine', () => {
       expect(vvCache['overlap.md']).toEqual({
         vv: '{"peer1":2}',
         contentHash: fnv1aHash('server merged'),
-        dirty: false,
       });
 
       const syncStartsBefore = mockEncode.mock.calls.filter(
@@ -785,7 +781,7 @@ describe('SyncEngine', () => {
       expect(syncStartsAfter).toBe(syncStartsBefore);
     });
 
-    it('marks locally changed paths dirty and clears the flag after startup verification', async () => {
+    it('marks locally changed paths dirty and clears them after startup verification', async () => {
       const { fnv1aHash } = await import('../conflict-utils');
       const { textFiles } = installVirtualStateStore();
       const tfile = Object.create(TFile.prototype);
@@ -794,43 +790,40 @@ describe('SyncEngine', () => {
       mockVault.read.mockResolvedValue('same text');
 
       textFiles.set('.obsidian/plugins/vaultcrdt/state/vv-cache.json', JSON.stringify({
-        _version: 4,
+        _version: 3,
         'dirty.md': {
           vv: '{"peer1":10}',
           contentHash: fnv1aHash('same text'),
-          dirty: false,
         },
       }));
 
       await engine.start();
       engine.onFileChanged('dirty.md');
       await flush();
+      mockVault.read.mockClear();
 
-      const dirtyRaw = textFiles.get('.obsidian/plugins/vaultcrdt/state/vv-cache.json');
-      expect(dirtyRaw).toBeTruthy();
-      const dirtyIndex = JSON.parse(dirtyRaw!);
-      expect(dirtyIndex['dirty.md'].dirty).toBe(true);
-
-      const syncPromise = engine.initialSync();
+      const firstSync = engine.initialSync();
       await flush();
-
       fireMessage({
         type: 'doc_list',
         docs: [{ doc_uuid: 'dirty.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
         tombstones: [],
       });
-
-      await syncPromise;
+      await firstSync;
 
       expect(mockVault.read).toHaveBeenCalledWith(tfile);
-      const cleanedRaw = textFiles.get('.obsidian/plugins/vaultcrdt/state/vv-cache.json');
-      expect(cleanedRaw).toBeTruthy();
-      const cleanedIndex = JSON.parse(cleanedRaw!);
-      expect(cleanedIndex['dirty.md']).toEqual({
-        vv: '{"peer1":10}',
-        contentHash: fnv1aHash('same text'),
-        dirty: false,
+      mockVault.read.mockClear();
+
+      const secondSync = engine.initialSync();
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'dirty.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
+        tombstones: [],
       });
+      await secondSync;
+
+      expect(mockVault.read).not.toHaveBeenCalled();
     });
   });
 
@@ -852,14 +845,16 @@ describe('SyncEngine', () => {
 
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
-        _version: 4,
-        'a.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
-        'b.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
-        'c.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
+        _version: 3,
+        'a.md': { vv: '{"p":1}', contentHash: hash },
+        'b.md': { vv: '{"p":1}', contentHash: hash },
+        'c.md': { vv: '{"p":1}', contentHash: hash },
       }));
       mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
 
       await engine.start();
+      for (const f of files) engine.onFileChanged(f.path);
+      await flush();
       const syncPromise = engine.initialSync();
       await flush();
 
@@ -892,14 +887,16 @@ describe('SyncEngine', () => {
 
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
-        _version: 4,
-        'x.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
-        'y.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
-        'z.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
+        _version: 3,
+        'x.md': { vv: '{"p":1}', contentHash: hash },
+        'y.md': { vv: '{"p":1}', contentHash: hash },
+        'z.md': { vv: '{"p":1}', contentHash: hash },
       }));
       mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
 
       await engine.start();
+      for (const f of files) engine.onFileChanged(f.path);
+      await flush();
       const syncPromise = engine.initialSync();
       await flush();
 
@@ -936,14 +933,16 @@ describe('SyncEngine', () => {
       // m2.md has wrong hash → triggers full sync
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
-        _version: 4,
-        'm1.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
-        'm2.md': { vv: '{"p":1}', contentHash: 99999, dirty: true },
-        'm3.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
+        _version: 3,
+        'm1.md': { vv: '{"p":1}', contentHash: hash },
+        'm2.md': { vv: '{"p":1}', contentHash: 99999 },
+        'm3.md': { vv: '{"p":1}', contentHash: hash },
       }));
       mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
 
       await engine.start();
+      for (const f of files) engine.onFileChanged(f.path);
+      await flush();
       const syncPromise = engine.initialSync();
       await flush();
 
@@ -988,12 +987,14 @@ describe('SyncEngine', () => {
 
       // Pre-populate with matching cache
       textFiles.set('.obsidian/plugins/vaultcrdt/state/vv-cache.json', JSON.stringify({
-        _version: 4,
-        'c1.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
-        'c2.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
+        _version: 3,
+        'c1.md': { vv: '{"p":1}', contentHash: hash },
+        'c2.md': { vv: '{"p":1}', contentHash: hash },
       }));
 
       await engine.start();
+      for (const f of files) engine.onFileChanged(f.path);
+      await flush();
       const syncPromise = engine.initialSync();
       await flush();
 
@@ -1026,12 +1027,14 @@ describe('SyncEngine', () => {
 
       mockAdapter.exists.mockResolvedValue(true);
       mockAdapter.read.mockResolvedValue(JSON.stringify({
-        _version: 4,
-        'trace.md': { vv: '{"p":1}', contentHash: hash, dirty: true },
+        _version: 3,
+        'trace.md': { vv: '{"p":1}', contentHash: hash },
       }));
       mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
 
       await engine.start();
+      engine.onFileChanged('trace.md');
+      await flush();
       const syncPromise = engine.initialSync();
       await flush();
 

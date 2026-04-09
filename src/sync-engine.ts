@@ -13,6 +13,7 @@ import { validateServerUrl, toHttpBase, toWsBase } from './url-policy';
 import { runInitialSync, type SyncMode } from './sync-initial';
 import { SyncTrace } from './sync-trace';
 import type { VVCacheEntry } from './state-storage';
+import { StartupDirtyTracker } from './startup-dirty-tracker';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
 export { type SyncMode } from './sync-initial';
@@ -55,10 +56,10 @@ export class SyncEngine {
   private lastRemoteWrite = new Map<string, string>();
   /** Serialized broadcast processing queue — prevents concurrent CRDT mutations. */
   private broadcastQueue: Promise<void> = Promise.resolve();
-  /** Startup sync index: last VV/hash plus persisted dirty bit per path. */
-  private startupSyncIndex = new Map<string, VVCacheEntry>();
-  /** Serializes writes to the persisted startup sync index file. */
-  private startupSyncIndexPersist: Promise<void> = Promise.resolve();
+  /** Shared VV/content-hash cache from vv-cache.json. */
+  private vvCache = new Map<string, VVCacheEntry>();
+  /** Device-local dirty tracker for startup verification. */
+  private startupDirty: StartupDirtyTracker;
   /** Set to true after stop() — prevents reconnect after intentional close. */
   private stopped = false;
   private trace = new SyncTrace();
@@ -82,6 +83,7 @@ export class SyncEngine {
     // (loadSettings() generates one before constructing SyncEngine). We pass
     // it through so every CRDT doc commits ops on a stable per-device VV line.
     this.docs = new DocumentManager(app, settings.peerId);
+    this.startupDirty = new StartupDirtyTracker(settings.vaultId, settings.peerId);
     this.editor = new EditorIntegration(app, this.writingFromRemote, this.lastRemoteWrite, this.tag);
     this.push = new PushHandler(
       this.docs,
@@ -123,22 +125,14 @@ export class SyncEngine {
     await this.push.loadPendingDeletesFromJournal();
     this.trace.mark('start.pending-deletes-loaded');
 
-    // Load the persisted startup sync index before any initial-sync work.
-    // It is updated live during the session when local paths become dirty.
-    const loadedSyncIndex = await this.docs.loadVVCache() ?? new Map();
-    for (const [path, entry] of this.startupSyncIndex) {
-      if (!entry.dirty) continue;
-      const existing = loadedSyncIndex.get(path);
-      loadedSyncIndex.set(path, {
-        vv: existing?.vv ?? entry.vv,
-        contentHash: existing?.contentHash ?? entry.contentHash,
-        dirty: true,
-      });
-    }
-    this.startupSyncIndex = loadedSyncIndex;
-    this.trace.mark('start.sync-index-loaded', {
-      entries: this.startupSyncIndex.size,
-      dirty: [...this.startupSyncIndex.values()].filter((entry) => entry.dirty).length,
+    // Shared cache lives in the vault (`vv-cache.json`); the local dirty set
+    // lives device-locally in localStorage so Android does not inherit stale
+    // dirty bits from other devices or sync timing.
+    this.vvCache = await this.docs.loadVVCache() ?? new Map();
+    this.startupDirty.reload();
+    this.trace.mark('start.startup-state-loaded', {
+      cacheEntries: this.vvCache.size,
+      localDirty: this.startupDirty.size(),
     });
 
     await this.auth();
@@ -163,7 +157,6 @@ export class SyncEngine {
     this.ws?.close();
     this.ws = null;
     await this.docs.persistAll();
-    await this.startupSyncIndexPersist.catch(() => {});
   }
 
   // ── Server communication ────────────────────────────────────────────────────
@@ -215,8 +208,8 @@ export class SyncEngine {
     this.catchUpInProgress.clear();
     this.queuedBroadcasts = [];
     this.startupEditedPaths.clear();
-    this.startupSyncIndex.clear();
-    this.startupSyncIndexPersist = Promise.resolve();
+    this.vvCache.clear();
+    this.startupDirty.clearAll();
   }
 
   private wsUrl(): string {
@@ -311,8 +304,10 @@ export class SyncEngine {
           send: (msg) => this.send(msg),
           requestDocList: () => this.requestDocList(),
           requestSyncStart: (uuid, vv) => this.requestSyncStart(uuid, vv),
-          cachedVVs: new Map(this.startupSyncIndex),
-          saveSyncIndex: (map) => this.replaceStartupSyncIndex(map),
+          cachedVVs: new Map(this.vvCache),
+          saveVVCache: (map) => this.replaceVVCache(map),
+          dirtyPaths: this.startupDirty.snapshot(),
+          saveDirtyPaths: (paths) => this.replaceDirtyPaths(paths),
           trace: (event, data) => this.trace.mark(event, data),
           tracePath: (event, path, data) => this.trace.markPath(event, path, data),
           observePath: (path) => this.trace.observePath(path),
@@ -549,7 +544,7 @@ export class SyncEngine {
       warn(`${this.tag} rejected delete for invalid path`, { docUuid });
       return;
     }
-    this.forgetStartupSyncPath(docUuid);
+    this.forgetStartupPath(docUuid);
     await this.docs.removeAndClean(docUuid);
     this.lastServerVV.delete(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
@@ -572,14 +567,14 @@ export class SyncEngine {
 
   onFileChanged(path: string): void {
     this.startupEditedPaths.add(path);
-    this.markStartupSyncPathDirty(path);
+    this.markStartupPathDirty(path);
     this.trace.observePath(path);
     this.trace.markPath('editor-change.accepted', path, { initialSyncRunning: this.initialSyncRunning });
     this.push.onFileChanged(path);
   }
 
   onFileChangedImmediate(path: string, content: string): void {
-    this.markStartupSyncPathDirty(path);
+    this.markStartupPathDirty(path);
     this.trace.observePath(path);
     this.trace.markPath('vault-change.accepted', path, {
       initialSyncRunning: this.initialSyncRunning,
@@ -589,13 +584,13 @@ export class SyncEngine {
   }
 
   onFileDeleted(path: string): void {
-    this.forgetStartupSyncPath(path);
+    this.forgetStartupPath(path);
     this.push.onFileDeleted(path);
   }
 
   onFileRenamed(oldPath: string, newPath: string, content: string): void {
-    this.forgetStartupSyncPath(oldPath);
-    this.markStartupSyncPathDirty(newPath);
+    this.forgetStartupPath(oldPath);
+    this.markStartupPathDirty(newPath);
     this.push.onFileRenamed(oldPath, newPath, content);
   }
 
@@ -605,7 +600,7 @@ export class SyncEngine {
    * so nothing is pushed for it.
    */
   onFileDeletedOnly(path: string): void {
-    this.forgetStartupSyncPath(path);
+    this.forgetStartupPath(path);
     this.push.deleteOnly(path);
   }
 
@@ -643,36 +638,22 @@ export class SyncEngine {
 
   // ── Private helpers ─────────────────────────────────────────────────────────
 
-  private markStartupSyncPathDirty(path: string): void {
-    const existing = this.startupSyncIndex.get(path);
-    if (existing?.dirty) return;
-    this.startupSyncIndex.set(path, {
-      vv: existing?.vv ?? '',
-      contentHash: existing?.contentHash ?? 0,
-      dirty: true,
-    });
-    this.queueStartupSyncIndexPersist();
+  private markStartupPathDirty(path: string): void {
+    this.startupDirty.markDirty(path);
   }
 
-  private forgetStartupSyncPath(path: string): void {
-    if (!this.startupSyncIndex.delete(path)) return;
-    this.queueStartupSyncIndexPersist();
+  private forgetStartupPath(path: string): void {
+    this.startupDirty.clear(path);
+    this.vvCache.delete(path);
   }
 
-  private replaceStartupSyncIndex(map: Map<string, VVCacheEntry>): Promise<void> {
-    this.startupSyncIndex = new Map(map);
-    return this.queueStartupSyncIndexPersist();
+  private async replaceVVCache(map: Map<string, VVCacheEntry>): Promise<void> {
+    this.vvCache = new Map(map);
+    await this.docs.saveVVCache(this.vvCache);
   }
 
-  private queueStartupSyncIndexPersist(): Promise<void> {
-    const snapshot = new Map(this.startupSyncIndex);
-    this.startupSyncIndexPersist = this.startupSyncIndexPersist
-      .catch(() => {})
-      .then(() => this.docs.saveVVCache(snapshot))
-      .catch((err) => {
-        warn(`${this.tag} startup sync index persist failed`, { err });
-      });
-    return this.startupSyncIndexPersist;
+  private replaceDirtyPaths(paths: Iterable<string>): void {
+    this.startupDirty.replace(paths);
   }
 
   private send(msg: object): void {
