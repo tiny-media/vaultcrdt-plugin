@@ -15,6 +15,10 @@
   - path: ../vaultcrdt-server/.agent-memory/decisions/keep-tombstones-sticky-until-retention-expires.md
 
 ## Conventions
+- Keep Android startup traces off by default
+  - id: con-20260409-1a07
+  - status: active
+  - path: .agent-memory/conventions/keep-android-startup-traces-off-by-default.md
 - Keep authentication errors generic
   - id: con-20260408-47b4
   - status: active
@@ -49,4 +53,15 @@
   - path: .agent-memory/mistakes/android-mtime-caused-wrong-cache-and-skip-logic.md
 
 ## Plans
-- None yet.
+- Audit long-term retention and storage behavior
+  - id: plan-20260409-7e3d
+  - status: active
+  - path: .agent-memory/plans/audit-long-term-retention-and-storage-behavior.md
+- Prepare plugin for community-facing self-hosted release
+  - id: plan-20260409-2850
+  - status: active
+  - path: .agent-memory/plans/prepare-plugin-for-community-facing-self-hosted-release.md
+- Review Android startup paths for code quality
+  - id: plan-20260409-2add
+  - status: active
+  - path: .agent-memory/plans/review-android-startup-paths-for-code-quality.md

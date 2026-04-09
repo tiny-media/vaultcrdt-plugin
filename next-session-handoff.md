@@ -102,6 +102,32 @@ Prominent und aktuell halten:
 - `gpt-audit/previous-cycles.md`
 - jeweilige `gpt-audit/archive-*/` Verzeichnisse nur als historische Details
 
+## Wenn spaeter wieder am Plugin gearbeitet wird
+
+1. **Android-Traces standardmaessig aus lassen.**
+   Startup-Traces und aehnliche Diagnose-Hilfen nur gezielt aktivieren,
+   wenn ein echter Android-Befund untersucht wird.
+
+2. **Android-Startup-Code gezielt auf Codequalitaet nachpruefen.**
+   Der Fix wurde ueber viele Iterationen erarbeitet; die beteiligten
+   Startup-Pfade sollten spaeter noch einmal in Ruhe auf Vereinfachung,
+   klare Benennung, tote Sonderfaelle und uebrig gebliebene Debug-Logik
+   geprueft werden.
+
+3. **Langfrist-Audit fuer theoretischen 5-Jahres-Betrieb machen.**
+   Nicht nur Korrektheit pruefen, sondern auch:
+   - Wachstum von Server-DB, Tombstones und Plugin-State
+   - Verhalten bei langem Single-User-Betrieb
+   - Bedarf fuer Compaction-, Cleanup- oder Retention-Optionen
+   - klare Betriebsdoku fuer Self-Hoster
+
+4. **Plugin fuer eine spaetere Community-Vorstellung vorbereiten.**
+   Fokus:
+   - klare Self-Hosting-Anleitung
+   - klarer Setup-Flow vom Install bis zum ersten Sync
+   - Troubleshooting fuer typische Fehlerfaelle
+   - insgesamt ein oeffentlich verstaendlicherer Onboarding-Pfad
+
 ## Naechste sinnvolle Schritte
 
 1. Kurzer Android-Smoketest nach `v0.3.0`
