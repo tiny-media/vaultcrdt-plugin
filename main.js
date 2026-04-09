@@ -3786,8 +3786,12 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
         const currentEditorContent = editor.readCurrentContent(path);
         const editorAlreadyMatches = currentEditorContent !== null && doc.text_matches(currentEditorContent);
         if (editorAlreadyMatches) {
-          deps.tracePath("overlap.active-persist-disk", path, { textLen: serverContent.length });
-          await editor.writeToVault(path, serverContent);
+          if (editedDuringStartup) {
+            deps.tracePath("overlap.active-skip-disk-persist", path, { textLen: serverContent.length });
+          } else {
+            deps.tracePath("overlap.active-persist-disk", path, { textLen: serverContent.length });
+            await editor.writeToVault(path, serverContent);
+          }
         } else if (diffJson) {
           let hasTextChanges = false;
           try {

@@ -593,8 +593,16 @@ async function syncOverlappingDoc(
           currentEditorContent !== null && doc.text_matches(currentEditorContent);
 
         if (editorAlreadyMatches) {
-          deps.tracePath('overlap.active-persist-disk', path, { textLen: serverContent.length });
-          await editor.writeToVault(path, serverContent);
+          if (editedDuringStartup) {
+            // Active editor already shows the merged text and the user typed
+            // during startup — skip vault.modify(). On mobile, writing to the
+            // active file during the startup window triggers an editor rebind
+            // that eats in-flight keystrokes. Obsidian autosave persists later.
+            deps.tracePath('overlap.active-skip-disk-persist', path, { textLen: serverContent.length });
+          } else {
+            deps.tracePath('overlap.active-persist-disk', path, { textLen: serverContent.length });
+            await editor.writeToVault(path, serverContent);
+          }
         } else if (diffJson) {
           let hasTextChanges = false;
           try {

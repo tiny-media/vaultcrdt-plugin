@@ -1869,6 +1869,234 @@ describe('SyncEngine', () => {
       );
       expect(conflictCreates.length).toBe(0);
     });
+
+    // ── active-editor startup disk-persist skip (correctness fix) ──────────
+    // On mobile, vault.modify() on the active file during the startup window
+    // triggers an editor rebind that eats in-flight keystrokes. When the user
+    // typed during startup AND the editor already shows the merged text, skip
+    // the disk write and let Obsidian autosave handle persistence later.
+
+    it('T-C1: skips vault.modify for active editor during startup when editor matches merged text', async () => {
+      vi.useFakeTimers();
+      const leaf = makeStaleEditorLeaf('tc1.md', 'MERGED text');
+      const app = makeApp([leaf]);
+      app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
+      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc1.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      // text_matches true: local content matches CRDT, editor matches after import
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":5}');
+      mockDocInstance.get_text.mockReturnValue('MERGED text');
+      mockDocInstance.import_and_diff.mockReturnValue('[]');
+
+      await engine.start();
+      engine.onFileChanged('tc1.md'); // marks editedDuringStartup
+      const syncPromise = engine.initialSync();
+
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'tc1.md', updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":6}') }],
+        tombstones: [],
+      });
+      await flush(50);
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'tc1.md',
+        delta: new Uint8Array(22),
+        server_vv: new TextEncoder().encode('{"peer1":6}'),
+      });
+      await syncPromise;
+
+      // vault.modify must NOT be called — that's the whole fix
+      expect(mockVault.modify).not.toHaveBeenCalled();
+      // editor.setValue must NOT be called either
+      expect(leaf.view.editor.setValue).not.toHaveBeenCalled();
+      // CRDT state must still be persisted to .loro file
+      expect(mockAdapter.writeBinary).toHaveBeenCalled();
+
+      vi.useRealTimers();
+    });
+
+    it('T-C3: non-active editor still gets writeToVault during startup', async () => {
+      vi.useFakeTimers();
+      const leaf = makeStaleEditorLeaf('tc3.md', 'MERGED text');
+      const app = makeApp([leaf]);
+      // Active view is null → not the active editor doc
+      app.workspace.getActiveViewOfType.mockReturnValue(null);
+      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc3.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(false);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":5}');
+      mockDocInstance.get_text.mockReturnValue('SERVER merged');
+      mockDocInstance.import_snapshot.mockReturnValue(undefined);
+
+      // getAbstractFileByPath for writeToVault disk-write path
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('DISK stale');
+
+      await engine.start();
+      engine.onFileChanged('tc3.md');
+      const syncPromise = engine.initialSync();
+
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'tc3.md', updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":6}') }],
+        tombstones: [],
+      });
+      await flush(50);
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'tc3.md',
+        delta: new Uint8Array(22),
+        server_vv: new TextEncoder().encode('{"peer1":6}'),
+      });
+      await syncPromise;
+
+      // Non-active file: writeToVault SHOULD be called (editor path → setValue)
+      expect(leaf.view.editor.setValue).toHaveBeenCalled();
+
+      vi.useRealTimers();
+    });
+
+    it('T-C4: active editor with editedDuringStartup=false still gets disk persist', async () => {
+      const leaf = makeStaleEditorLeaf('tc4.md', 'MERGED text');
+      const app = makeApp([leaf]);
+      app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
+      engine = new SyncEngine(app, makeSettings());
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc4.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":5}');
+      mockDocInstance.get_text.mockReturnValue('MERGED text');
+      mockDocInstance.import_and_diff.mockReturnValue('[]');
+
+      // getAbstractFileByPath needed for writeToVault's vault.read check
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+
+      await engine.start();
+      // NOTE: no onFileChanged call → editedDuringStartup stays false
+      const syncPromise = engine.initialSync();
+
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'tc4.md', updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":6}') }],
+        tombstones: [],
+      });
+      await flush(50);
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'tc4.md',
+        delta: new Uint8Array(22),
+        server_vv: new TextEncoder().encode('{"peer1":6}'),
+      });
+      await syncPromise;
+
+      // Not edited during startup → disk persist should still happen
+      expect(mockVault.modify).toHaveBeenCalled();
+    });
+
+    it('T-C5: vv-cache hash reflects CRDT text after startup skip', async () => {
+      vi.useFakeTimers();
+      const { textFiles } = installVirtualStateStore();
+
+      const leaf = makeStaleEditorLeaf('tc5.md', 'MERGED text');
+      const app = makeApp([leaf]);
+      app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
+      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc5.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":5}');
+      mockDocInstance.get_text.mockReturnValue('MERGED text');
+      mockDocInstance.import_and_diff.mockReturnValue('[]');
+
+      await engine.start();
+      engine.onFileChanged('tc5.md');
+      const syncPromise = engine.initialSync();
+
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'tc5.md', updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":6}') }],
+        tombstones: [],
+      });
+      await flush(50);
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'tc5.md',
+        delta: new Uint8Array(22),
+        server_vv: new TextEncoder().encode('{"peer1":6}'),
+      });
+      await syncPromise;
+
+      // vv-cache.json must have been persisted with correct hash
+      const cacheRaw = textFiles.get('.obsidian/plugins/vaultcrdt/state/vv-cache.json');
+      expect(cacheRaw).toBeDefined();
+      const cache = JSON.parse(cacheRaw!);
+      expect(cache['tc5.md']).toBeDefined();
+      // Hash must be non-zero (derived from CRDT text, not the stale disk)
+      expect(cache['tc5.md'].contentHash).not.toBe(0);
+
+      vi.useRealTimers();
+    });
+
+    it('T-C6: no conflict file created during startup disk-persist skip', async () => {
+      vi.useFakeTimers();
+      const leaf = makeStaleEditorLeaf('tc6.md', 'MERGED text');
+      const app = makeApp([leaf]);
+      app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
+      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc6.md' }]);
+      mockVault.read.mockResolvedValue('DISK stale');
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":5}');
+      mockDocInstance.get_text.mockReturnValue('MERGED text');
+      mockDocInstance.import_and_diff.mockReturnValue('[]');
+
+      await engine.start();
+      engine.onFileChanged('tc6.md');
+      const syncPromise = engine.initialSync();
+
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'tc6.md', updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":6}') }],
+        tombstones: [],
+      });
+      await flush(50);
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'tc6.md',
+        delta: new Uint8Array(22),
+        server_vv: new TextEncoder().encode('{"peer1":6}'),
+      });
+      await syncPromise;
+
+      // No conflict files created
+      const conflictCreates = mockVault.create.mock.calls.filter(
+        (c: any[]) => (c[0] as string).includes('conflict')
+      );
+      expect(conflictCreates.length).toBe(0);
+
+      vi.useRealTimers();
+    });
   });
 
   // ── echo guard ─────────────────────────────────────────────────────────────
