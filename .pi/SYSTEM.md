@@ -24,7 +24,7 @@ Zwei-Repo-Setup:
 
 ## Kritische Regeln (gelten IMMER)
 
-- **Test-Befehl: `bun run test`** — NIEMALS `bun test` (Bun-Runner skippt Vitest still)
+- **Test-Befehl: `bun run test`** — NIEMALS Buns eingebauten Test-Runner verwenden (der skippt Vitest still)
 - **Android mtime ist unzuverlaessig** — niemals fuer Caching oder Skip-Logik
 - **`wasm-bindgen = "=0.2.117"`** exakt gepinnt; CLI muss matchen. `bun run wasm:check` faengt Drift ab
 - **`wasm/` niemals von Hand editieren** — Source of Truth ist `crates/vaultcrdt-wasm/`
@@ -56,7 +56,7 @@ Zwei-Repo-Setup:
 
 ## Verfuegbare Extension-Tools
 
-- `verify_plugin` — scannt das Repo auf Invariants: WASM-Freshness, Versions-Sync (package.json ↔ manifest.json ↔ versions.json), wasm-bindgen Pin, Emoji-Guard in src/crates/docs, `bun test`-Aufrufe. Nutze nach groesseren Aenderungen und vor `/commit`.
+- `verify_plugin` — scannt das Repo auf Invariants: WASM-Freshness, Versions-Sync (package.json ↔ manifest.json ↔ versions.json), wasm-bindgen Pin, Emoji-Guard in src/crates/docs, Aufrufe des eingebauten Bun-Test-Runners. Nutze nach groesseren Aenderungen und vor `/commit`.
 
 ## Arbeitsweise
 

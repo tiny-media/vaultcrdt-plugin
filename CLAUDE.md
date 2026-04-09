@@ -49,13 +49,13 @@ You normally do not rebuild WASM. Only touch it when something in `crates/` chan
 ## Build + test commands
 
 ```bash
-bun run test         # Vitest — MUST be `bun run test`, NOT `bun test`
+bun run test         # Vitest — MUST use this script, not Bun's built-in test runner
 bun run build        # esbuild → main.js
 bun run wasm         # rebuild WASM from crates/
 bun run wasm:check   # verify committed wasm/ is fresh
 ```
 
-The distinction `bun run test` vs `bun test` is load-bearing: `bun test` runs Bun's own test runner and silently skips Vitest tests.
+The distinction is load-bearing: Bun's built-in test runner can silently skip the Vitest suite, so this repo must use `bun run test`.
 
 ## Where to start each session
 
@@ -105,6 +105,48 @@ The repo ships with both Claude Code and pi-coding-agent harnesses:
 - `.claude/agents/reviewer.md` — read-only Sonnet reviewer
 - `.pi/SYSTEM.md` + `.pi/settings.json` — pi-coding-agent entry point
 - `.pi/skills/` — `commit`, `check`, `wasm-rebuild`, `review`, `deploy`, `audit-cycle`
-- `.pi/extensions/pi-ultrathink.ts` — exposes the `verify_plugin` tool (wasm freshness, version sync, wasm-bindgen pin, emoji guard, `bun test` misuse guard)
+- `.pi/extensions/pi-ultrathink.ts` — exposes the `verify_plugin` tool (wasm freshness, version sync, wasm-bindgen pin, emoji guard, built-in Bun test-runner misuse guard)
 
 The `verify_plugin` tool is the invariant checker; call it after non-trivial changes and before `/commit`.
+
+## Memory note
+
+This repo's `.agent-memory/` also links `../vaultcrdt-server`.
+If server memory changes, rerun `memory-vault reindex` and `memory-vault generate --sync-context-files` here to refresh the linked view.
+
+<!-- BEGIN MEMORY-VAULT MANAGED BLOCK -->
+## Managed memory workflow
+- Durable project memory lives in `.agent-memory/`.
+- Search before architecture, workflow, or coding-rule changes with `memory-vault find <query...>`.
+- Read exact items with `memory-vault show <id-or-path>` when a search hit looks relevant.
+- Write only reusable long-term knowledge with typed `memory-vault add ...` commands.
+- After writing new memory, run `memory-vault reindex` and `memory-vault generate --sync-context-files`.
+
+## Managed memory digest
+### Decisions
+- Keep startup dirty tracking device-local — why: Dirty state is device-specific rather than shared vault state.
+- Keep tombstones sticky until retention expires — why: Sticky tombstones prevent deleted documents from being resurrected during sync.
+- Keep shared CRDT crates and WASM build in vaultcrdt-plugin — why: The old monorepo is retired and the stale copied crates were removed from vaultcrdt-server.
+
+### Conventions
+- Keep authentication errors generic — why: Specific auth failures would make vault enumeration easier.
+- Use bun run test, not Bun's built-in test runner — why: Bun's built-in test runner can silently skip the Vitest suite.
+
+### Procedures
+- Read Android startup perf traces — steps: Check start.startup-state-loaded for cacheEntries and localDirty.
+- Deploy server via fleet from vaultcrdt-server — steps: Work from the vaultcrdt-server repo.
+- Rebuild and verify WASM only after crates changes — steps: Run cargo fmt --all and cargo clippy --all-targets --workspace -- -D warnings.
+
+### Mistakes
+- Android cold-start vault events poisoned dirty tracking — prevention: Ignore vault modify/create/rename events until the first initial sync completes on startup-sensitive Android paths.
+- Android mtime caused wrong cache and skip logic — prevention: Do not use Android mtime for caching, skip logic, or sync change detection.
+
+### Plans
+- None yet.
+
+See `.agent-memory/_generated/MEMORY.md` for the fuller digest and `.agent-memory/_generated/INDEX.md` for the complete index.
+<!-- END MEMORY-VAULT MANAGED BLOCK -->
+
+
+
+

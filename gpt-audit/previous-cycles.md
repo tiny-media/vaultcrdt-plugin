@@ -4,6 +4,10 @@ One paragraph per closed cycle. Newest on top. Links point into the dated archiv
 
 ---
 
+## 2026-04-08/09 — Android initial-sync performance + startup dirty-tracking (closed 2026-04-09)
+
+**Not a GPT-audit cycle** — out-of-band Android bug-chase archived under `archive-2026-04-08-initial-sync-perf/` (`plan.md`, `trace-findings.md`, `android-tests-performance.md`, `android-tests-correctness.md`). Two root causes were separated cleanly: (1) the remaining cold-start delay came from overlapping-file checks, and (2) the failed no-read fast path was self-inflicted because dirty tracking first lived in shared `vv-cache.json` and then got re-poisoned by Android's cold-start `vault modify/create/rename` event flood. **Outcome:** plugin commits `1c6a626`/`33f9f34`/`1aa1153` moved dirty tracking to device-local storage keyed by `vaultId + peerId`, added trace points around startup state and overlapping planning, and ignored Android cold-start vault events until the first `initialSync` finishes. The last good Android trace showed `readsPlanned=0`, `skippedClean=806`, `overlappingMs=3`, `initial-sync.complete` in ~612ms. No server change needed; released as `v0.2.33`.
+
 ## 2026-04-07/08 — conflict-storm regression + editor-staleness follow-up (closed 2026-04-08)
 
 **Not a GPT-audit cycle** — out-of-band bug-chase triggered by the `richardsachen` vault producing 805 conflict files. Archived under `archive-2026-04-07-conflict-storm/` (three working docs: `conflict-storm-plan.md`, `conflict-storm-follow-up-plan.md`, `conflict-storm-follow-up-runsheet.md`).
@@ -40,12 +44,12 @@ One paragraph per closed cycle. Newest on top. Links point into the dated archiv
 
 | # | Item | Status | Landed in |
 |---|------|--------|-----------|
-| 1 | Offline delete/rename resurrection on reconnect | ✅ | plugin `4c8ea7a` — persistent delete-journal, consulted before server-only download in `runInitialSync()` |
-| 2 | `doc_delete` bypassed per-document lock (TOCTOU vs `sync_push`/`doc_create`) | ✅ | server `6fe950f` — `DocDelete` now held under the same `DocLocks` |
-| 3 | Path-policy gap in initial sync + rename transitions | ✅ | plugin `4c8ea7a` — `isSyncablePath()` applied at source in `runInitialSync()`, rename handler split into all four old/new-syncable transitions |
-| 4 | URL/TLS validation via `includes("localhost")` substring trick | ✅ | plugin `4c8ea7a` — central `new URL(...)` parse, enforced in SetupModal + SettingsTab + SyncEngine |
-| 5 | `docker-compose.yml` shipped with `change-me-in-production` defaults | ✅ | server `6fe950f` — compose fail-fast via `${VAR:?required}`, example values moved to `.env.example` |
-| 6 | Stale READMEs (split + Argon2id claims) | ✅ | plugin + server — corrected WASM-build location, auth model (Argon2id PHC), two-repo layout |
+| 1 | Offline delete/rename resurrection on reconnect | done | plugin `4c8ea7a` — persistent delete-journal, consulted before server-only download in `runInitialSync()` |
+| 2 | `doc_delete` bypassed per-document lock (TOCTOU vs `sync_push`/`doc_create`) | done | server `6fe950f` — `DocDelete` now held under the same `DocLocks` |
+| 3 | Path-policy gap in initial sync + rename transitions | done | plugin `4c8ea7a` — `isSyncablePath()` applied at source in `runInitialSync()`, rename handler split into all four old/new-syncable transitions |
+| 4 | URL/TLS validation via `includes("localhost")` substring trick | done | plugin `4c8ea7a` — central `new URL(...)` parse, enforced in SetupModal + SettingsTab + SyncEngine |
+| 5 | `docker-compose.yml` shipped with `change-me-in-production` defaults | done | server `6fe950f` — compose fail-fast via `${VAR:?required}`, example values moved to `.env.example` |
+| 6 | Stale READMEs (split + Argon2id claims) | done | plugin + server — corrected WASM-build location, auth model (Argon2id PHC), two-repo layout |
 
 **GPT follow-up review (2026-04-07):** confirmed the fixes sit in the right places and are not cosmetic. Flagged one residual: the delete journal is **send-based, not ack-based** — `pendingDeletes` is cleared right after `send()`, so a WS death between send and server processing can still drop a delete. For self-hosted single-user this is acceptable; harden before a community release (path-specific delete-ack or tombstone-visibility confirmation via `doc_list`).
 
@@ -63,14 +67,14 @@ One paragraph per closed cycle. Newest on top. Links point into the dated archiv
 
 | # | Item | Status | Landed in |
 |---|------|--------|-----------|
-| 1 | Initial-sync content-hash check | ✅ Phase A | plugin `db26525` |
-| 2 | Path / file-type policy | ✅ Phase A | plugin `db26525` (`src/path-policy.ts`) |
-| 3 | State-key encoding | ✅ Phase A | plugin `db26525` (`encodeURIComponent`) |
-| 4 | Delete / tombstone model | ✅ Phase B | server `124a2d7`, plugin `3280be4` |
-| 5 | WASM source/artifact sync | ✅ Phase B | monorepo `b18532c` (since absorbed into plugin, see two-repo consolidation) |
-| 6 | Auth / secret hardening (Argon2id) | ✅ Phase B | server `124a2d7` with lazy plaintext→PHC migration on first verify |
-| 7 | Multi-editor consistency | ⏸ deferred | UX polish, no correctness issue — revisit before public release |
-| 8 | WS-token / logging hardening | ⏸ deferred | self-hosted single-user is sufficient — revisit before public release |
+| 1 | Initial-sync content-hash check | done, Phase A | plugin `db26525` |
+| 2 | Path / file-type policy | done, Phase A | plugin `db26525` (`src/path-policy.ts`) |
+| 3 | State-key encoding | done, Phase A | plugin `db26525` (`encodeURIComponent`) |
+| 4 | Delete / tombstone model | done, Phase B | server `124a2d7`, plugin `3280be4` |
+| 5 | WASM source/artifact sync | done, Phase B | monorepo `b18532c` (since absorbed into plugin, see two-repo consolidation) |
+| 6 | Auth / secret hardening (Argon2id) | done, Phase B | server `124a2d7` with lazy plaintext→PHC migration on first verify |
+| 7 | Multi-editor consistency | deferred | UX polish, no correctness issue — revisit before public release |
+| 8 | WS-token / logging hardening | deferred | self-hosted single-user is sufficient — revisit before public release |
 
 **Notable deliberate non-implementations:**
 - **Server-side path validation** (part of Item 4) was consciously left to the plugin: on the server `doc_uuid` is opaque transport, path policy is the plugin's domain. Duplicating it in Rust risked drift.

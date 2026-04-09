@@ -29,7 +29,7 @@ Nicht in diesen Plan ziehen:
 - Server-Aenderungen
 - neue Protokoll-Frames
 - die spaetere Grossfrage "peerId vault-lokal vs device-lokal"
-- repo-weite Altlasten aus `verify_plugin` wie Emoji-/`bun test`-Findings in alten Audit-Dokumenten
+- repo-weite Altlasten aus `verify_plugin` wie Emoji- oder Built-in-Bun-Test-Runner-Findings in alten Audit-Dokumenten
 
 Die eine repo-weite Invariante, die **sehr wohl** in diesen Plan gehoert, ist allein:
 

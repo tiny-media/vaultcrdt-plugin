@@ -7,7 +7,7 @@ globs: src/**, esbuild.config.mjs, tsconfig.json, vitest.config.mts, package.jso
 
 ## Build / Test
 
-- **Test-Befehl ist `bun run test`** — NIEMALS `bun test` (Bun-Runner skippt Vitest still, Tests laufen dann nicht und sehen grün aus)
+- **Test-Befehl ist `bun run test`** — NIEMALS Buns eingebauten Test-Runner verwenden (der skippt Vitest still, Tests laufen dann nicht und sehen gruen aus)
 - Build: `bun run build` → `main.js` im Repo-Root (esbuild bundle)
 - Dev: `bun run dev` (esbuild watch)
 

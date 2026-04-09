@@ -114,14 +114,14 @@ Commits:
 
 | # | Audit-Item | Status |
 |---|-----------|--------|
-| 1 | Initial-Sync Hash | ✅ Phase A (db26525) |
-| 2 | State-Key Encoding | ✅ Phase A (db26525) |
-| 3 | Pfad-Policy | ✅ Phase A (db26525) |
-| 4 | Tombstone-Härtung | ✅ Phase B (124a2d7 + 3280be4) |
-| 5 | WASM-Build | ✅ Phase B (b18532c) |
-| 6 | Auth-Härtung | ✅ Phase B (124a2d7) |
-| 7 | Multi-Editor-Konsistenz | ⏸ aufgeschoben (UX-Polish) |
-| 8 | WS-Token-Logging | ⏸ aufgeschoben (Self-Hosted ausreichend) |
+| 1 | Initial-Sync Hash | done, Phase A (db26525) |
+| 2 | State-Key Encoding | done, Phase A (db26525) |
+| 3 | Pfad-Policy | done, Phase A (db26525) |
+| 4 | Tombstone-Haertung | done, Phase B (124a2d7 + 3280be4) |
+| 5 | WASM-Build | done, Phase B (b18532c) |
+| 6 | Auth-Haertung | done, Phase B (124a2d7) |
+| 7 | Multi-Editor-Konsistenz | deferred (UX-Polish) |
+| 8 | WS-Token-Logging | deferred (Self-Hosted ausreichend) |
 
 **6 von 8 Audit-Punkten umgesetzt.** Die zwei verbleibenden sind bewusste Defer-Entscheidungen, kein technischer Schuldenrest.
 
