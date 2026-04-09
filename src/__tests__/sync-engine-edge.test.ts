@@ -137,7 +137,7 @@ const makeApp = () =>
     },
   }) as any;
 
-const flush = async (n = 10) => {
+const flush = async (n = 20) => {
   for (let i = 0; i < n; i++) await Promise.resolve();
 };
 

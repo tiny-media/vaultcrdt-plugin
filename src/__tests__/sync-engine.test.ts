@@ -148,7 +148,7 @@ const makeApp = (leaves: any[] = []) =>
   }) as any;
 
 /** Drain the microtask queue N levels deep. */
-const flush = async (n = 10) => {
+const flush = async (n = 20) => {
   for (let i = 0; i < n; i++) await Promise.resolve();
 };
 
@@ -750,6 +750,227 @@ describe('SyncEngine', () => {
         (c: any[]) => c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'overlap.md'
       ).length;
       expect(syncStartsAfter).toBe(syncStartsBefore);
+    });
+  });
+
+  // ── initialSync — parallel overlapping reads (performance) ─────────────────
+
+  describe('initialSync — parallel overlapping reads', () => {
+    it('T-P1: reads each overlapping file exactly once', async () => {
+      const { fnv1aHash } = await import('../conflict-utils');
+      const content = 'hello world';
+      const hash = fnv1aHash(content);
+
+      const files = ['a.md', 'b.md', 'c.md'].map(p => {
+        const f = Object.create(TFile.prototype);
+        f.path = p;
+        return f;
+      });
+      mockVault.getMarkdownFiles.mockReturnValue(files);
+      mockVault.read.mockResolvedValue(content);
+
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        _version: 3,
+        'a.md': { vv: '{"p":1}', contentHash: hash },
+        'b.md': { vv: '{"p":1}', contentHash: hash },
+        'c.md': { vv: '{"p":1}', contentHash: hash },
+      }));
+      mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: files.map(f => ({ doc_uuid: f.path, updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"p":1}') })),
+        tombstones: [],
+      });
+      await syncPromise;
+
+      // Each file read exactly once (parallel pre-read, no double reads)
+      const readCalls = mockVault.read.mock.calls.filter(
+        (c: any[]) => files.some(f => f === c[0] || f.path === c[0]?.path)
+      );
+      expect(readCalls.length).toBe(3);
+    });
+
+    it('T-P2: all VV+hash matches → zero requestSyncStart and zero writeToVault', async () => {
+      const { fnv1aHash } = await import('../conflict-utils');
+      const content = 'consistent';
+      const hash = fnv1aHash(content);
+
+      const files = ['x.md', 'y.md', 'z.md'].map(p => {
+        const f = Object.create(TFile.prototype);
+        f.path = p;
+        return f;
+      });
+      mockVault.getMarkdownFiles.mockReturnValue(files);
+      mockVault.read.mockResolvedValue(content);
+
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        _version: 3,
+        'x.md': { vv: '{"p":1}', contentHash: hash },
+        'y.md': { vv: '{"p":1}', contentHash: hash },
+        'z.md': { vv: '{"p":1}', contentHash: hash },
+      }));
+      mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: files.map(f => ({ doc_uuid: f.path, updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"p":1}') })),
+        tombstones: [],
+      });
+      await syncPromise;
+
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start'
+      );
+      expect(syncStartCalls.length).toBe(0);
+      expect(mockVault.modify).not.toHaveBeenCalled();
+    });
+
+    it('T-P3: one hash mismatch triggers exactly one requestSyncStart', async () => {
+      const { fnv1aHash } = await import('../conflict-utils');
+      const content = 'shared content';
+      const hash = fnv1aHash(content);
+
+      const files = ['m1.md', 'm2.md', 'm3.md'].map(p => {
+        const f = Object.create(TFile.prototype);
+        f.path = p;
+        return f;
+      });
+      mockVault.getMarkdownFiles.mockReturnValue(files);
+      mockVault.read.mockResolvedValue(content);
+      mockDocInstance.version.mockReturnValue(5);
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.get_text.mockReturnValue(content);
+
+      // m2.md has wrong hash → triggers full sync
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        _version: 3,
+        'm1.md': { vv: '{"p":1}', contentHash: hash },
+        'm2.md': { vv: '{"p":1}', contentHash: 99999 },
+        'm3.md': { vv: '{"p":1}', contentHash: hash },
+      }));
+      mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: files.map(f => ({ doc_uuid: f.path, updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"p":1}') })),
+        tombstones: [],
+      });
+
+      await flush(50);
+
+      // Only m2.md should have triggered sync_start
+      fireMessage({
+        type: 'sync_delta',
+        doc_uuid: 'm2.md',
+        delta: new Uint8Array(0),
+        server_vv: new TextEncoder().encode('{"p":1}'),
+      });
+
+      await syncPromise;
+
+      const syncStartCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'sync_start'
+      );
+      expect(syncStartCalls.length).toBe(1);
+      expect(syncStartCalls[0][0].doc_uuid).toBe('m2.md');
+    });
+
+    it('T-P4: vv-cache persisted with correct entries after parallel reads', async () => {
+      const { fnv1aHash } = await import('../conflict-utils');
+      const content = 'cached text';
+      const hash = fnv1aHash(content);
+      const { textFiles } = installVirtualStateStore();
+
+      const files = ['c1.md', 'c2.md'].map(p => {
+        const f = Object.create(TFile.prototype);
+        f.path = p;
+        return f;
+      });
+      mockVault.getMarkdownFiles.mockReturnValue(files);
+      mockVault.read.mockResolvedValue(content);
+
+      // Pre-populate with matching cache
+      textFiles.set('.obsidian/plugins/vaultcrdt/state/vv-cache.json', JSON.stringify({
+        _version: 3,
+        'c1.md': { vv: '{"p":1}', contentHash: hash },
+        'c2.md': { vv: '{"p":1}', contentHash: hash },
+      }));
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: files.map(f => ({ doc_uuid: f.path, updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"p":1}') })),
+        tombstones: [],
+      });
+      await syncPromise;
+
+      const saved = textFiles.get('.obsidian/plugins/vaultcrdt/state/vv-cache.json');
+      expect(saved).toBeDefined();
+      const cache = JSON.parse(saved!);
+      expect(cache['c1.md']).toBeDefined();
+      expect(cache['c2.md']).toBeDefined();
+      expect(cache['c1.md'].contentHash).toBe(hash);
+      expect(cache['c2.md'].contentHash).toBe(hash);
+      expect(cache['c1.md'].vv).toBe('{"p":1}');
+    });
+
+    it('T-P7: phase-timings appear in startup trace', async () => {
+      const { fnv1aHash } = await import('../conflict-utils');
+      const content = 'trace test';
+      const hash = fnv1aHash(content);
+
+      const tfile = Object.create(TFile.prototype);
+      tfile.path = 'trace.md';
+      mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+      mockVault.read.mockResolvedValue(content);
+
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        _version: 3,
+        'trace.md': { vv: '{"p":1}', contentHash: hash },
+      }));
+      mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+      await flush();
+
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'trace.md', updated_at: '2026-04-09T00:00:00Z', server_vv: new TextEncoder().encode('{"p":1}') }],
+        tombstones: [],
+      });
+      await syncPromise;
+
+      const report = engine.getStartupTraceReport();
+      expect(report).toContain('initial-sync.phase-timings');
+      expect(report).toContain('docListMs');
+      expect(report).toContain('priorityMs');
+      expect(report).toContain('downloadsMs');
+      expect(report).toContain('overlappingMs');
+      expect(report).toContain('localOnlyMs');
+      expect(report).toContain('tombstonesMs');
+      expect(report).toContain('vvCacheSaveMs');
+      expect(report).toContain('orphansMs');
     });
   });
 

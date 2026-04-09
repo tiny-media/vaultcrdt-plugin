@@ -17,6 +17,7 @@ interface DocEntry {
 }
 
 const PARALLEL_DOWNLOADS = 5;
+const PARALLEL_OVERLAPPING = 4;
 
 // Marker identifiers for throwaway probe documents used to inspect server
 // snapshots without polluting the device's stable peer-id space. The probe
@@ -96,7 +97,9 @@ export async function runInitialSync(
   const pendingDeleteSet = new Set(push.pendingDeletePaths());
   push.resendPendingDeletes();
 
+  let tPhase = performance.now();
   const { docs: serverDocs, tombstones } = await deps.requestDocList();
+  const docListMs = performance.now() - tPhase;
   const tombstoneSet = new Set(tombstones);
   const localPathSet = new Set(localFileMap.keys());
   const serverUuidSet = new Set(serverDocs.map((d) => d.doc_uuid));
@@ -174,6 +177,7 @@ export async function runInitialSync(
 
   // Priority sync: sync the currently active editor doc FIRST so the user
   // can start typing immediately.
+  tPhase = performance.now();
   const activeDoc = editor.getActiveEditorPath();
   if (activeDoc) deps.observePath(activeDoc);
   if (activeDoc && serverDocMap.has(activeDoc) && localFileMap.has(activeDoc)) {
@@ -191,6 +195,9 @@ export async function runInitialSync(
     });
     console.info(`${tag} priority sync complete (${(performance.now() - t0).toFixed(0)}ms)`, { path: activeDoc });
   }
+
+  const priorityMs = performance.now() - tPhase;
+  tPhase = performance.now();
 
   let downloadOk = 0;
   let downloadFail = 0;
@@ -256,21 +263,69 @@ export async function runInitialSync(
     elapsedMs: Number((performance.now() - t0).toFixed(0)),
   });
   console.info(`${tag} downloads done (${(performance.now() - t0).toFixed(0)}ms): ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
+  const downloadsMs = performance.now() - tPhase;
 
   // 2. Overlapping docs — two-tier skip: VV+hash → full sync
+  //    File reads are batched in parallel (PARALLEL_OVERLAPPING) to reduce I/O
+  //    latency on mobile. Full syncs (syncOverlappingDoc) stay serial because
+  //    they involve WS round-trips.
+  tPhase = performance.now();
   let skippedVVMatch = 0;
+  let overlappingProcessed = 0;
+  deps.trace('initial-sync.overlapping.begin', { overlapping: overlappingFiles.length });
 
+  // Pre-read all effective content in parallel batches — the read is the
+  // bottleneck on Android (~10ms per file via SAF). Processing stays serial.
+  const effectiveContents = new Map<string, string>();
+  {
+    const filesToRead = overlappingFiles.filter(f => !syncedPaths.has(f.path));
+    for (let i = 0; i < filesToRead.length; i += PARALLEL_OVERLAPPING) {
+      const batch = filesToRead.slice(i, i + PARALLEL_OVERLAPPING);
+      const results = await Promise.all(batch.map(async (file) => {
+        const tRead = performance.now();
+        const content = await readEffectiveLocalContent(app, editor, file);
+        const readMs = performance.now() - tRead;
+        if (readMs > 30) {
+          deps.tracePath('initial-sync.read.slow', file.path, {
+            readMs: Number(readMs.toFixed(0)),
+            bytes: content.length,
+          });
+        }
+        return { path: file.path, content };
+      }));
+      for (const { path: p, content: c } of results) {
+        effectiveContents.set(p, c);
+      }
+
+      const done = Math.min(i + PARALLEL_OVERLAPPING, filesToRead.length);
+      if (done % 100 < PARALLEL_OVERLAPPING || done === filesToRead.length) {
+        deps.trace('initial-sync.overlapping.progress', {
+          done,
+          total: filesToRead.length,
+          elapsedMs: Number((performance.now() - tPhase).toFixed(0)),
+        });
+      }
+    }
+  }
+
+  // Process overlapping files serially — same structure as before, but reads
+  // come from the pre-fetched map instead of individual awaits.
   for (const file of overlappingFiles) {
-    if (syncedPaths.has(file.path)) { stepsDone++; onProgress?.(stepsDone, totalSteps, changed); continue; }
+    if (syncedPaths.has(file.path)) { stepsDone++; onProgress?.(stepsDone, totalSteps, changed); overlappingProcessed++; continue; }
     const currentServerVV = serverVVStrings.get(file.path);
     const cached = cachedVVs?.get(file.path);
 
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-      // VV matches — but verify local content hasn't changed externally
-      // (git pull, Syncthing, manual edit while Obsidian was closed) OR
-      // in an open editor with unsaved keystrokes.
-      const effective = await readEffectiveLocalContent(app, editor, file);
+      const effective = effectiveContents.get(file.path)!;
+      const tHash = performance.now();
       const effectiveHash = fnv1aHash(effective);
+      const hashMs = performance.now() - tHash;
+      if (hashMs > 20) {
+        deps.tracePath('initial-sync.hash.slow', file.path, {
+          hashMs: Number(hashMs.toFixed(0)),
+          bytes: effective.length,
+        });
+      }
       contentHashes.set(file.path, effectiveHash);
 
       if (effectiveHash === cached.contentHash) {
@@ -279,9 +334,9 @@ export async function runInitialSync(
         skippedVVMatch++;
         stepsDone++;
         onProgress?.(stepsDone, totalSteps, changed);
+        overlappingProcessed++;
         continue;
       }
-      // Local content changed (disk or editor) — fall through to full sync
       deps.tracePath('initial-sync.overlap-sync', file.path, {
         reason: 'hash-mismatch',
         effectiveHash,
@@ -292,10 +347,11 @@ export async function runInitialSync(
       changed++;
       stepsDone++;
       onProgress?.(stepsDone, totalSteps, changed);
+      overlappingProcessed++;
       continue;
     }
 
-    const localContent = await readEffectiveLocalContent(app, editor, file);
+    const localContent = effectiveContents.get(file.path)!;
     deps.tracePath('initial-sync.overlap-sync', file.path, {
       reason: cached ? 'vv-mismatch' : 'no-cache',
       localLen: localContent.length,
@@ -304,16 +360,19 @@ export async function runInitialSync(
     await rememberCurrentDocHash(file.path);
     stepsDone++;
     onProgress?.(stepsDone, totalSteps, changed);
+    overlappingProcessed++;
   }
 
+  const overlappingMs = performance.now() - tPhase;
   deps.trace('initial-sync.overlapping.done', {
     skippedVVMatch,
     synced: overlappingFiles.length - skippedVVMatch,
-    elapsedMs: Number((performance.now() - t0).toFixed(0)),
+    elapsedMs: Number(overlappingMs.toFixed(0)),
   });
-  console.info(`${tag} overlapping done (${(performance.now() - t0).toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
+  console.info(`${tag} overlapping done (${overlappingMs.toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
 
   // 3. Local-only docs — push full snapshot via doc_create (skip in pull mode)
+  tPhase = performance.now();
   if (mode !== 'pull') {
     for (const file of localOnlyFiles) {
       const content = await readEffectiveLocalContent(app, editor, file);
@@ -332,9 +391,12 @@ export async function runInitialSync(
     onProgress?.(stepsDone, totalSteps, changed);
   }
 
+  const localOnlyMs = performance.now() - tPhase;
+
   // 4. Offline deletes were already flushed above, before any downloads.
 
   // 5. Tombstones — trash local files (skip if server also has the doc — create-after-delete)
+  tPhase = performance.now();
   for (const uuid of tombstoneSet) {
     if (serverDocMap.has(uuid)) continue;
     if (!isSyncablePath(uuid)) continue;
@@ -349,20 +411,37 @@ export async function runInitialSync(
     }
   }
 
+  const tombstonesMs = performance.now() - tPhase;
+
   // 6. Persist VV cache with content hashes for next startup
+  tPhase = performance.now();
   const vvCacheEntries = new Map<string, VVCacheEntry>();
   for (const [path, vv] of lastServerVV) {
     vvCacheEntries.set(path, { vv, contentHash: contentHashes.get(path) ?? 0 });
   }
   await docs.saveVVCache(vvCacheEntries);
 
+  const vvCacheSaveMs = performance.now() - tPhase;
+
   // 7. Clean orphaned .loro files (deleted/renamed docs, old encoding)
+  tPhase = performance.now();
   const validPaths = new Set<string>([...localPathSet, ...serverDocMap.keys()]);
   const orphansRemoved = await docs.cleanOrphans(validPaths);
   if (orphansRemoved > 0) {
     log(`${tag} cleaned ${orphansRemoved} orphaned state files`);
   }
+  const orphansMs = performance.now() - tPhase;
 
+  deps.trace('initial-sync.phase-timings', {
+    docListMs: Number(docListMs.toFixed(0)),
+    priorityMs: Number(priorityMs.toFixed(0)),
+    downloadsMs: Number(downloadsMs.toFixed(0)),
+    overlappingMs: Number(overlappingMs.toFixed(0)),
+    localOnlyMs: Number(localOnlyMs.toFixed(0)),
+    tombstonesMs: Number(tombstonesMs.toFixed(0)),
+    vvCacheSaveMs: Number(vvCacheSaveMs.toFixed(0)),
+    orphansMs: Number(orphansMs.toFixed(0)),
+  });
   deps.trace('initial-sync.complete', {
     elapsedMs: Number((performance.now() - t0).toFixed(0)),
   });

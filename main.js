@@ -3391,6 +3391,7 @@ function isSyncablePath(path) {
 // src/sync-initial.ts
 var import_obsidian4 = require("obsidian");
 var PARALLEL_DOWNLOADS = 5;
+var PARALLEL_OVERLAPPING = 4;
 var PROBE_DOC_UUID = "__probe__";
 var PROBE_PEER_ID = "__probe__";
 async function readEffectiveLocalContent(app, editor, file) {
@@ -3411,7 +3412,9 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
   }
   const pendingDeleteSet = new Set(push.pendingDeletePaths());
   push.resendPendingDeletes();
+  let tPhase = performance.now();
   const { docs: serverDocs, tombstones } = await deps.requestDocList();
+  const docListMs = performance.now() - tPhase;
   const tombstoneSet = new Set(tombstones);
   const localPathSet = new Set(localFileMap.keys());
   const serverUuidSet = new Set(serverDocs.map((d) => d.doc_uuid));
@@ -3460,6 +3463,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     const doc = await docs.getOrLoad(path);
     contentHashes.set(path, fnv1aHash(doc.get_text()));
   };
+  tPhase = performance.now();
   const activeDoc = editor.getActiveEditorPath();
   if (activeDoc) deps.observePath(activeDoc);
   if (activeDoc && serverDocMap.has(activeDoc) && localFileMap.has(activeDoc)) {
@@ -3477,6 +3481,8 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     });
     console.info(`${tag} priority sync complete (${(performance.now() - t0).toFixed(0)}ms)`, { path: activeDoc });
   }
+  const priorityMs = performance.now() - tPhase;
+  tPhase = performance.now();
   let downloadOk = 0;
   let downloadFail = 0;
   if (mode !== "push") {
@@ -3540,18 +3546,61 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     elapsedMs: Number((performance.now() - t0).toFixed(0))
   });
   console.info(`${tag} downloads done (${(performance.now() - t0).toFixed(0)}ms): ${downloadOk} ok, ${downloadFail} fail of ${serverOnlyUuids.length}`);
+  const downloadsMs = performance.now() - tPhase;
+  tPhase = performance.now();
   let skippedVVMatch = 0;
+  let overlappingProcessed = 0;
+  deps.trace("initial-sync.overlapping.begin", { overlapping: overlappingFiles.length });
+  const effectiveContents = /* @__PURE__ */ new Map();
+  {
+    const filesToRead = overlappingFiles.filter((f) => !syncedPaths.has(f.path));
+    for (let i = 0; i < filesToRead.length; i += PARALLEL_OVERLAPPING) {
+      const batch = filesToRead.slice(i, i + PARALLEL_OVERLAPPING);
+      const results = await Promise.all(batch.map(async (file) => {
+        const tRead = performance.now();
+        const content = await readEffectiveLocalContent(app, editor, file);
+        const readMs = performance.now() - tRead;
+        if (readMs > 30) {
+          deps.tracePath("initial-sync.read.slow", file.path, {
+            readMs: Number(readMs.toFixed(0)),
+            bytes: content.length
+          });
+        }
+        return { path: file.path, content };
+      }));
+      for (const { path: p, content: c } of results) {
+        effectiveContents.set(p, c);
+      }
+      const done = Math.min(i + PARALLEL_OVERLAPPING, filesToRead.length);
+      if (done % 100 < PARALLEL_OVERLAPPING || done === filesToRead.length) {
+        deps.trace("initial-sync.overlapping.progress", {
+          done,
+          total: filesToRead.length,
+          elapsedMs: Number((performance.now() - tPhase).toFixed(0))
+        });
+      }
+    }
+  }
   for (const file of overlappingFiles) {
     if (syncedPaths.has(file.path)) {
       stepsDone++;
       onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+      overlappingProcessed++;
       continue;
     }
     const currentServerVV = serverVVStrings.get(file.path);
     const cached = cachedVVs == null ? void 0 : cachedVVs.get(file.path);
     if (cached && currentServerVV && vvEquals(currentServerVV, cached.vv)) {
-      const effective = await readEffectiveLocalContent(app, editor, file);
+      const effective = effectiveContents.get(file.path);
+      const tHash = performance.now();
       const effectiveHash = fnv1aHash(effective);
+      const hashMs = performance.now() - tHash;
+      if (hashMs > 20) {
+        deps.tracePath("initial-sync.hash.slow", file.path, {
+          hashMs: Number(hashMs.toFixed(0)),
+          bytes: effective.length
+        });
+      }
       contentHashes.set(file.path, effectiveHash);
       if (effectiveHash === cached.contentHash) {
         deps.tracePath("initial-sync.vv-hash-skip", file.path, { effectiveHash });
@@ -3559,6 +3608,7 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
         skippedVVMatch++;
         stepsDone++;
         onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+        overlappingProcessed++;
         continue;
       }
       deps.tracePath("initial-sync.overlap-sync", file.path, {
@@ -3571,9 +3621,10 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
       changed++;
       stepsDone++;
       onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+      overlappingProcessed++;
       continue;
     }
-    const localContent = await readEffectiveLocalContent(app, editor, file);
+    const localContent = effectiveContents.get(file.path);
     deps.tracePath("initial-sync.overlap-sync", file.path, {
       reason: cached ? "vv-mismatch" : "no-cache",
       localLen: localContent.length
@@ -3582,13 +3633,16 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     await rememberCurrentDocHash(file.path);
     stepsDone++;
     onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
+    overlappingProcessed++;
   }
+  const overlappingMs = performance.now() - tPhase;
   deps.trace("initial-sync.overlapping.done", {
     skippedVVMatch,
     synced: overlappingFiles.length - skippedVVMatch,
-    elapsedMs: Number((performance.now() - t0).toFixed(0))
+    elapsedMs: Number(overlappingMs.toFixed(0))
   });
-  console.info(`${tag} overlapping done (${(performance.now() - t0).toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
+  console.info(`${tag} overlapping done (${overlappingMs.toFixed(0)}ms): ${skippedVVMatch} skipped (VV match), ${overlappingFiles.length - skippedVVMatch} synced`);
+  tPhase = performance.now();
   if (mode !== "pull") {
     for (const file of localOnlyFiles) {
       const content = await readEffectiveLocalContent(app, editor, file);
@@ -3606,6 +3660,8 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
     stepsDone += localOnlyFiles.length;
     onProgress == null ? void 0 : onProgress(stepsDone, totalSteps, changed);
   }
+  const localOnlyMs = performance.now() - tPhase;
+  tPhase = performance.now();
   for (const uuid of tombstoneSet) {
     if (serverDocMap.has(uuid)) continue;
     if (!isSyncablePath(uuid)) continue;
@@ -3619,16 +3675,31 @@ async function runInitialSync(deps, onProgress, mode = "merge") {
       }
     }
   }
+  const tombstonesMs = performance.now() - tPhase;
+  tPhase = performance.now();
   const vvCacheEntries = /* @__PURE__ */ new Map();
   for (const [path, vv] of lastServerVV) {
     vvCacheEntries.set(path, { vv, contentHash: (_a = contentHashes.get(path)) != null ? _a : 0 });
   }
   await docs.saveVVCache(vvCacheEntries);
+  const vvCacheSaveMs = performance.now() - tPhase;
+  tPhase = performance.now();
   const validPaths = /* @__PURE__ */ new Set([...localPathSet, ...serverDocMap.keys()]);
   const orphansRemoved = await docs.cleanOrphans(validPaths);
   if (orphansRemoved > 0) {
     log(`${tag} cleaned ${orphansRemoved} orphaned state files`);
   }
+  const orphansMs = performance.now() - tPhase;
+  deps.trace("initial-sync.phase-timings", {
+    docListMs: Number(docListMs.toFixed(0)),
+    priorityMs: Number(priorityMs.toFixed(0)),
+    downloadsMs: Number(downloadsMs.toFixed(0)),
+    overlappingMs: Number(overlappingMs.toFixed(0)),
+    localOnlyMs: Number(localOnlyMs.toFixed(0)),
+    tombstonesMs: Number(tombstonesMs.toFixed(0)),
+    vvCacheSaveMs: Number(vvCacheSaveMs.toFixed(0)),
+    orphansMs: Number(orphansMs.toFixed(0))
+  });
   deps.trace("initial-sync.complete", {
     elapsedMs: Number((performance.now() - t0).toFixed(0))
   });
