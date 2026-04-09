@@ -6,7 +6,7 @@ This plugin does not connect to any cloud service. It requires a running instanc
 
 ## Status
 
-Pre-release (0.2.x). The protocol and storage format may change between versions. Not yet listed in the Obsidian community plugin directory.
+Pre-release (0.3.x). The protocol and storage format may change between versions. Not yet listed in the Obsidian community plugin directory.
 
 ## Requirements
 

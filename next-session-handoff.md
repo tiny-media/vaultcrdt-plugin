@@ -1,192 +1,123 @@
-# Session Handoff — Server v0.2.6 live, Plugin SetupModal-Fix wartet
+# Session Handoff — v0.3.0 released after Docs-/Memory-Konsolidierung
 
-Datum: 2026-04-08 (Ende der zehnten Session)
-Branch: `main`, sauber, **auf `origin/main`** gepusht (Plugin-Repo).
-Plugin-Release: weiterhin **`v0.2.17`** (kein neuer Release diese Session).
-Server-Release: **`v0.2.6`** live + auf `home` deployt.
+Datum: 2026-04-09
+Branch: `main`
+Plugin-Release live: `v0.3.0`
+Vorheriger Plugin-Release: `v0.2.33`
+Server-Release unveraendert live: `v0.2.6`
 
 ## Status in einem Satz
 
-Server-Repo ist auf Release-Flow umgestellt und v0.2.6 deployt, DB ist
-gewiped fuer eine saubere Baseline — naechste Session muss **das Plugin-
-SetupModal um ein Admin-Token-Feld erweitern**, weil der User sonst fuer
-jeden neuen Vault einen `curl` out-of-band feuern muss.
+Der Android-Startup ist nach den `v0.2.31`..`v0.2.33`-Fixes schnell genug,
+die Repo-/Docs-/Memory-Konsolidierung ist erledigt, und `v0.3.0` wurde als
+sauberer Folgerelease abgeschlossen.
 
-## Was diese Session passiert ist
+## Relevanter technischer Stand
 
-### 1. Server-Repo auf Release-Flow umgestellt
+Die entscheidenden Android-Erkenntnisse bleiben:
 
-`vaultcrdt-server` (anderes Repo, `/home/richard/projects/vaultcrdt-server`):
+1. **Startup-Dirty-Tracking ist device-lokal, nicht vault-lokal.**
+   Es darf nicht in einer gesyncten Vault-Datei liegen.
 
-- Neuer `.github/workflows/release.yml` analog zum Plugin: Tag-Push triggert
-  cargo fmt/clippy/test + `softprops/action-gh-release@v2` mit
-  `generate_release_notes: true`. Der bestehende `docker.yml` (GHCR-Image
-  Publish) bleibt unveraendert.
-- Cargo `0.2.5 → 0.2.6`, Cargo.lock mitgezogen, CHANGELOG `[0.2.6]` Eintrag.
-- Commit `98479ba`, Tag `v0.2.6`, beide gepusht. Alle vier Workflows gruen
-  (Release, CI, Docker main, Docker v0.2.6).
-- GitHub Release `v0.2.6` ist live, diesmal vom `github-actions[bot]`
-  erstellt — nicht mehr manuell wie v0.2.5.
+2. **Android-Kaltstart-Vault-Events (`modify/create/rename`) sind waehrend
+   des ersten Startup-Fensters kein verlaessliches Dirty-Signal.**
+   Waehle in dieser Phase nur echte `editor-change` Events als Signal.
 
-### 2. Server auf home redeployt
+3. **Der no-read Fast-Path funktioniert jetzt im Zielzustand.**
+   Bester bestaetigter Trace:
+   - `start.startup-state-loaded | cacheEntries=807 | localDirty=0`
+   - `initial-sync.overlapping.plan | readsPlanned=0 | cleanSkipsPlanned=806`
+   - `initial-sync.overlapping.done | skippedClean=806 | reads=0 | elapsedMs=3`
+   - `initial-sync.complete | elapsedMs=612`
 
-- Fleet compose `hosts/home/stacks/vaultcrdt/compose.yaml` Version-Bump
-  v0.2.5 → v0.2.6 (lokal committed in fleet als `23d748b`, **nicht
-  gepusht** — die anderen dirty files in fleet sind nicht unsere Baustelle).
-- `just home-deploy vaultcrdt` lief durch (nach 1Password-Desktop-Restart,
-  weil `op`-CLI als Broker dient).
-- Container `vaultcrdt-server:0.2.6` gestartet 2026-04-08 13:45,
-  healthy, external HTTP 200 gegen `https://obsidian-sync.hyys.de/health`.
+## Relevante Commits der Android-Linie
 
-### 3. Server-DB komplett gewiped + Baseline gesichert
+- `1c6a626` — erster no-read Startup-Fast-Path
+- `33f9f34` — Dirty-Tracking device-lokal gemacht
+- `1aa1153` — Android-Kaltstart-Vault-Events bis Ende des ersten `initialSync` ignoriert
 
-- **Vor Wipe:** 50 MB total in `/opt/docker-setups-home/vaultcrdt/data/`
-  (24 MB main.db + 24 MB WAL + 2.9 MB v1→v2 .bak)
-- **Nach Wipe + Restart:** 177 KB total — leeres Schema nach Migrations.
-- **Memory gespeichert:** `memory/project_server_baseline_2026-04-08.md`
-  enthaelt Disk + NET I/O Baseline und einen `ssh home ...`-One-liner
-  fuer den Re-Check. Target: **2026-07-08** (3-Monats-Delta).
-- **Caveat im Memory:** `docker stats` NET-I/O Counter resetten bei jedem
-  Container-Restart. Wenn der Container zwischen jetzt und Juli neugestartet
-  wird, ist das Network-Delta verloren — Disk-Delta bleibt.
+## Was in dieser Session gelandet ist
 
-### 4. Plugin-SetupModal Gap entdeckt
+### 1. Docs und Repo aufgeraeumt
 
-User hat seine Vaults aufgeraeumt und ueber BRAT v0.2.17 frisch
-installiert. Beim Versuch, sich nach dem DB-Wipe zu connecten, kam die
-Frage: "Wie lege ich neue Vaults auf dem Server an?"
+Geloescht:
+- `docs/next-session-prompt.md`
+- `docs/next-session-review.md`
 
-Antwort: Heute fummelig. Der Server hat keinen `/vault/create`-Endpoint;
-Vault-Erstellung passiert implizit ueber `POST /auth/verify` mit einem
-zusaetzlichen `admin_token`-Feld im Body. **Das Plugin sendet dieses
-Feld nirgendwo** (siehe `setup-modal.ts:148`, `sync-engine.ts:133`,
-`settings.ts:344+394`). Der User muss out-of-band per `curl` mit dem
-Admin-Token aus SOPS einen neuen Vault anlegen, *bevor* das Plugin sich
-verbinden kann.
+Neu/uebernommen:
+- `AGENTS.md`
+- `.claude/rules/memory-vault.md`
+- `.agent-memory/` als projektweite langlebige Memory-Basis
+- `gpt-audit/archive-2026-04-08-initial-sync-perf/`
 
-User hat sich entschieden: nicht curl-Workaround, sondern den UX-Fix
-nachhaltig im Plugin loesen. Diese Session hat dafuer den Plan geschrieben,
-die Implementation kommt naechste Session.
+Aktualisiert:
+- `CLAUDE.md`
+- `gpt-audit/previous-cycles.md`
+- mehrere aeltere Audit-/Rule-Dokumente, damit die Repo-Invariants wieder gruen sind
 
-## Naechste Session — Aufgaben in Reihenfolge
+Meta-Commit dieser Konsolidierung:
+- `f21a7e2` — `docs: consolidate memory and audit docs`
 
-### 1. Plugin SetupModal Admin-Token-Feld + Reconfigure-Button
+### 2. Memory Vault gepflegt
 
-**Plan:** [`gpt-audit/archive-2026-04-08-setup-admin-token/plan.md`](gpt-audit/archive-2026-04-08-setup-admin-token/plan.md)
+Neu eingetragen:
+- **Decision:** startup dirty tracking stays device-local
+- **Mistake:** Android cold-start vault events poisoned dirty tracking
+- **Procedure:** how to read Android startup performance traces
 
-Kurz:
+Danach:
+- `memory-vault reindex`
+- `memory-vault generate --sync-context-files`
 
-- `SetupModal` bekommt ein collapsible "Creating a new vault?" mit einem
-  optionalen Admin-Token-Feld.
-- `SyncEngine.auth()` akzeptiert einen one-shot Admin-Token (RAM-only,
-  niemals in `data.json` persistiert, gecleared nach erstem Auth).
-- `main.ts startWithSetup()` reicht den Token vom SetupModal an
-  `SyncEngine.setOneShotAdminToken()` durch.
-- `SettingsTab` bekommt einen "Reconnect to a different vault" Button,
-  der das SetupModal mit Preset-Werten oeffnet (fuer Vault-Wechsel).
-- Tests: neuer `setup-modal.test.ts`, erweiterte `sync-engine.test.ts`,
-  `__mocks__/obsidian.ts` um `Modal` + `Notice` ergaenzen.
-- Release: Plugin `v0.2.18`, BRAT zieht.
+### 3. 0.3.0 sauber validiert und released
 
-**Server bleibt auf v0.2.6**, kein Server-Redeploy. Der bestehende
-`auth_verify`-Pfad in `vaultcrdt-server/src/lib.rs:125-164` akzeptiert
-`admin_token` schon als optionales Body-Feld.
+Versionen synchronisiert auf:
+- `package.json` -> `0.3.0`
+- `manifest.json` -> `0.3.0`
+- `versions.json` -> `0.3.0`
+- `README.md` -> `0.3.x`
 
-**Offene TODOs aus dem Plan:**
+Validierung vor Release:
+- `bunx tsc --noEmit`
+- `bun run test`
+- `bun run build`
+- `verify_plugin --skipWasm`
 
-- Verifizieren ob `StateStorage` per vault-id geschluesselt ist (sonst
-  wuerde ein Reconfigure-Vault-Wechsel den lokalen CRDT-State
-  verschmutzen).
-- Falsche-Auth-Fehlermeldung um Hinweis auf Admin-Token-Feld erweitern
-  (bei 401: "If you are creating a NEW vault, expand 'Creating a new
-  vault?' and enter the admin token.")
+Alles gruen.
 
-### 2. Vaults via Plugin anlegen
+Release-Schritt:
+- Commit fuer den Versions-Bump erstellt
+- `main` gepusht
+- Tag `v0.3.0` gepusht
+- GitHub Release fuer BRAT erstellt via Release-Workflow
 
-Mit `v0.2.18` BRAT-installiert auf Desktop:
+## Aktiver Dokumentationszustand
 
-- SetupModal oeffnen
-- Server-URL `https://obsidian-sync.hyys.de`, Vault-Name (lowercase, z.B.
-  `richardsachen`), Password frei waehlen
-- "Creating a new vault?" aufklappen, Admin-Token aus 1Password (oder
-  via `sops -d /home/richard/fleet/hosts/home/stacks/vaultcrdt/secrets.sops.yaml | yq -r '.VAULTCRDT_ADMIN_TOKEN'`)
-- Connect → Vault wird angelegt → Token verschwindet aus Memory
-- Auf Android: gleicher Vault-Name + gleiches Password, Admin-Token
-  ist NICHT mehr noetig (Vault existiert dann ja schon)
+Prominent und aktuell halten:
+- `README.md`
+- `CLAUDE.md`
+- `AGENTS.md`
+- `next-session-handoff.md`
+- `docs/install-brat.md`
+- `gpt-audit/previous-cycles.md`
+- jeweilige `gpt-audit/archive-*/` Verzeichnisse nur als historische Details
 
-### 3. Dogfooding-Checkliste durchlaufen
+## Naechste sinnvolle Schritte
 
-`dogfooding-checklist.md`, neun Sektionen, Sektion 9 ist die Conflict-
-Storm-Haertung mit sechs Sub-Faellen:
+1. Kurzer Android-Smoketest nach `v0.3.0`
+   - 1 Kaltstart ohne Tippen
+   - 1 Kaltstart mit sofortigem Tippen
 
-- 9a: Stabile PeerID ueber Restarts
-- 9b: Phase-3 Adopt (disjoint VV, gleicher Text)
-- 9c: Phase-2 Adopt (fehlender lokaler CRDT-State)
-- 9d: Editor-first Content Reads (stale disk vs. frisches Editor-Buffer)
-- 9e: Local-only `doc_create` mit offenem Editor
-- 9f: Vault-Klon-Caveat (erwartet bricht — nur dokumentieren)
+2. Nur bei neuem echten Befund weiter in Startup-/Perf-Arbeit investieren.
+   Kein blindes Nachoptimieren mehr.
 
-Optional Sektion 10 ergaenzen, die den neuen Setup-Flow auf Desktop +
-Android verifiziert.
+3. Wenn ein neuer externer Audit startet:
+   - Top-Level von `gpt-audit/` sauber halten
+   - neuen Zyklus wieder in eigenes `archive-<datum>/` legen
 
-### 4. Handoff + Close
+## Was weiterhin nicht getan werden soll
 
-Nach Durchlauf: Handoff schliessen, ggf. Funde in
-`gpt-audit/archive-2026-04-08-setup-admin-token/response.md` (oder ein
-neuer Cycle-Ordner) sammeln.
-
-## Wichtige Dateipfade fuer den Plugin-Fix
-
-```
-src/setup-modal.ts                       (148: auth/verify body)
-src/sync-engine.ts                       (128-139: auth() method)
-src/settings.ts                          (74-381: SettingsTab.display)
-src/main.ts                              (122-138: startWithSetup)
-src/__mocks__/obsidian.ts                (Modal + Notice fehlen)
-src/__tests__/sync-engine.test.ts        (185-220: auth tests)
-
-vaultcrdt-server/src/lib.rs:125-164      (auth_verify, server-side)
-```
-
-## Known caveats / parkend
-
-- **Vault-Klon-Caveat** — `peerId` liegt vault-lokal in `data.json`. Wer
-  Vault inkl. Plugin-Konfig auf ein zweites Geraet kopiert, schleppt
-  dieselbe Loro-PeerID mit. Memory: `project_peerid_clone_caveat.md`.
-  Pre-community-release Arbeit.
-- **Server-Baseline NET-I/O** — Counter reset bei jedem Container-Restart.
-  Wenn `home` zwischen jetzt und Juli neu booted oder der Container neu
-  startet, ist das Network-Delta zur Baseline verloren. Disk-Delta bleibt
-  belastbar.
-- **Fleet-Commit `23d748b` ist lokal, nicht gepusht.** Der Rest des dirty
-  state in fleet ist nicht unsere Baustelle, deshalb kein `git push`.
-  Beim naechsten fleet-Push sollte er mit raus.
-- **versions.json ist stale** — Eintraege fuer 0.2.2..0.2.16 fehlen. Fuer
-  BRAT irrelevant, fuer den offiziellen Obsidian Plugin Store relevant —
-  aber wir sind self-hosted. Kein Handlungsbedarf.
-
-## Deferred (unveraendert)
-
-- **#7 Multi-Editor-Konsistenz** — public release
-- **#8 WS-Token-Logging** — public release
-
-Siehe `gpt-audit/archive-2026-04-06/claude-response.md`.
-
-## Wenn etwas schiefgeht
-
-- **`bun run test` schlaegt fehl wegen `Modal`/`Notice`**: `__mocks__/obsidian.ts`
-  fehlen die Stubs, siehe Plan-Skizze.
-- **`bunx tsc --noEmit` schlaegt fehl**: vermutlich SetupResult-Interface-
-  Drift; das `adminToken?: string` muss ueberall konsistent durchgereicht
-  werden. tsc ist Pflicht laut `.claude/rules/plugin-src.md` — wenn das
-  nicht laeuft, kein Commit.
-- **BRAT zieht v0.2.18 nicht**: `manifest.json` Version pruefen, dann
-  `gh release view v0.2.18` Assets pruefen.
-- **SetupModal Admin-Token-Feld bleibt sichtbar nach Connect**: das ist
-  OK und gewollt — der Token wird aus dem Memory gecleared, das Feld
-  selbst ist aber Teil des UI bis das Modal schliesst. Beim naechsten
-  Oeffnen ist das Feld leer.
-- **Reconfigure-Button wechselt Vault, aber alter CRDT-State bleibt**:
-  TODO aus dem Plan: `StateStorage` per vault-id keying verifizieren.
-  Falls nicht prefixed, vor dem Restart `state-storage.ts` clearen oder
-  Migration einbauen.
+- keinen Server anfassen
+- kein mtime-Caching einfuehren
+- kein neues Protokoll / keine neue Server-API anfangen
+- `wasm/` nicht anfassen, solange `crates/` unveraendert bleiben
