@@ -4161,6 +4161,10 @@ var SyncEngine = class {
     __publicField(this, "queuedBroadcasts", []);
     /** Paths that received a real editor-change during the current startup. */
     __publicField(this, "startupEditedPaths", /* @__PURE__ */ new Set());
+    /** Ignore noisy vault modify/create/rename events until the first initial sync settled. */
+    __publicField(this, "acceptVaultChangeEvents", false);
+    /** Aggregate count of noisy cold-start vault events we deliberately ignored. */
+    __publicField(this, "suppressedColdStartVaultEvents", { modify: 0, create: 0, rename: 0 });
     /** Stores the server VV (JSON string) per doc after last successful sync. */
     __publicField(this, "lastServerVV", /* @__PURE__ */ new Map());
     /** Tracks docs currently doing a VV-gap catch-up to prevent duplicates. */
@@ -4210,6 +4214,8 @@ var SyncEngine = class {
     var _a;
     this.stopped = false;
     this.startupEditedPaths.clear();
+    this.acceptVaultChangeEvents = false;
+    this.suppressedColdStartVaultEvents = { modify: 0, create: 0, rename: 0 };
     this.trace.resetStartup({
       vaultId: this.settings.vaultId,
       deviceName: this.settings.deviceName,
@@ -4401,7 +4407,13 @@ var SyncEngine = class {
       }
       this.queuedBroadcasts = [];
       this.trace.mark("initial-sync.end");
+      if (this.suppressedColdStartVaultEvents.modify > 0 || this.suppressedColdStartVaultEvents.create > 0 || this.suppressedColdStartVaultEvents.rename > 0) {
+        this.trace.mark("startup.vault-events-suppressed", {
+          ...this.suppressedColdStartVaultEvents
+        });
+      }
       this.startupEditedPaths.clear();
+      this.acceptVaultChangeEvents = true;
       this.setStatus("connected");
     }
   }
@@ -4641,7 +4653,13 @@ var SyncEngine = class {
     this.forgetStartupPath(path);
     this.push.deleteOnly(path);
   }
+  noteSuppressedColdStartVaultEvent(type) {
+    this.suppressedColdStartVaultEvents[type]++;
+  }
   // ── Guards ──────────────────────────────────────────────────────────────────
+  shouldAcceptVaultChangeEvents() {
+    return this.acceptVaultChangeEvents;
+  }
   isWritingFromRemote(path) {
     return this.writingFromRemote.has(path);
   }
@@ -4787,6 +4805,10 @@ var VaultCRDTPlugin = class extends import_obsidian6.Plugin {
         if (!(abstractFile instanceof import_obsidian6.TFile)) return;
         if (!isSyncablePath(abstractFile.path)) return;
         if (this.syncEngine.isWritingFromRemote(abstractFile.path)) return;
+        if (!this.syncEngine.shouldAcceptVaultChangeEvents()) {
+          this.syncEngine.noteSuppressedColdStartVaultEvent("modify");
+          return;
+        }
         if (this.syncEngine.readCurrentContent(abstractFile.path) !== null) return;
         const content = await this.app.vault.read(abstractFile);
         this.syncEngine.onFileChangedImmediate(abstractFile.path, content);
@@ -4796,6 +4818,10 @@ var VaultCRDTPlugin = class extends import_obsidian6.Plugin {
       this.app.vault.on("create", async (file) => {
         if (!(file instanceof import_obsidian6.TFile) || !isSyncablePath(file.path)) return;
         if (this.syncEngine.isWritingFromRemote(file.path)) return;
+        if (!this.syncEngine.shouldAcceptVaultChangeEvents()) {
+          this.syncEngine.noteSuppressedColdStartVaultEvent("create");
+          return;
+        }
         const content = await this.app.vault.read(file);
         this.syncEngine.onFileChangedImmediate(file.path, content);
       })
@@ -4812,6 +4838,10 @@ var VaultCRDTPlugin = class extends import_obsidian6.Plugin {
         if (!(file instanceof import_obsidian6.TFile)) return;
         const oldSync = isSyncablePath(oldPath);
         const newSync = isSyncablePath(file.path);
+        if (!this.syncEngine.shouldAcceptVaultChangeEvents()) {
+          this.syncEngine.noteSuppressedColdStartVaultEvent("rename");
+          return;
+        }
         if (oldSync && newSync) {
           const content = await this.app.vault.read(file);
           this.syncEngine.onFileRenamed(oldPath, file.path, content);

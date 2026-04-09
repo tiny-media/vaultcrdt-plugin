@@ -48,6 +48,10 @@ export class SyncEngine {
   private queuedBroadcasts: Record<string, unknown>[] = [];
   /** Paths that received a real editor-change during the current startup. */
   private startupEditedPaths = new Set<string>();
+  /** Ignore noisy vault modify/create/rename events until the first initial sync settled. */
+  private acceptVaultChangeEvents = false;
+  /** Aggregate count of noisy cold-start vault events we deliberately ignored. */
+  private suppressedColdStartVaultEvents = { modify: 0, create: 0, rename: 0 };
   /** Stores the server VV (JSON string) per doc after last successful sync. */
   private lastServerVV = new Map<string, string>();
   /** Tracks docs currently doing a VV-gap catch-up to prevent duplicates. */
@@ -104,6 +108,8 @@ export class SyncEngine {
   async start(): Promise<void> {
     this.stopped = false;
     this.startupEditedPaths.clear();
+    this.acceptVaultChangeEvents = false;
+    this.suppressedColdStartVaultEvents = { modify: 0, create: 0, rename: 0 };
     this.trace.resetStartup({
       vaultId: this.settings.vaultId,
       deviceName: this.settings.deviceName,
@@ -331,7 +337,17 @@ export class SyncEngine {
       this.queuedBroadcasts = [];
 
       this.trace.mark('initial-sync.end');
+      if (
+        this.suppressedColdStartVaultEvents.modify > 0 ||
+        this.suppressedColdStartVaultEvents.create > 0 ||
+        this.suppressedColdStartVaultEvents.rename > 0
+      ) {
+        this.trace.mark('startup.vault-events-suppressed', {
+          ...this.suppressedColdStartVaultEvents,
+        });
+      }
       this.startupEditedPaths.clear();
+      this.acceptVaultChangeEvents = true;
       this.setStatus('connected');
     }
   }
@@ -604,7 +620,15 @@ export class SyncEngine {
     this.push.deleteOnly(path);
   }
 
+  noteSuppressedColdStartVaultEvent(type: 'modify' | 'create' | 'rename'): void {
+    this.suppressedColdStartVaultEvents[type]++;
+  }
+
   // ── Guards ──────────────────────────────────────────────────────────────────
+
+  shouldAcceptVaultChangeEvents(): boolean {
+    return this.acceptVaultChangeEvents;
+  }
 
   isWritingFromRemote(path: string): boolean {
     return this.writingFromRemote.has(path);

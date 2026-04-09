@@ -61,6 +61,10 @@ export default class VaultCRDTPlugin extends Plugin {
         if (!(abstractFile instanceof TFile)) return;
         if (!isSyncablePath(abstractFile.path)) return;
         if (this.syncEngine.isWritingFromRemote(abstractFile.path)) return;
+        if (!this.syncEngine.shouldAcceptVaultChangeEvents()) {
+          this.syncEngine.noteSuppressedColdStartVaultEvent('modify');
+          return;
+        }
         if (this.syncEngine.readCurrentContent(abstractFile.path) !== null) return;
         const content = await this.app.vault.read(abstractFile);
         this.syncEngine.onFileChangedImmediate(abstractFile.path, content);
@@ -72,6 +76,10 @@ export default class VaultCRDTPlugin extends Plugin {
       this.app.vault.on('create', async (file) => {
         if (!(file instanceof TFile) || !isSyncablePath(file.path)) return;
         if (this.syncEngine.isWritingFromRemote(file.path)) return;
+        if (!this.syncEngine.shouldAcceptVaultChangeEvents()) {
+          this.syncEngine.noteSuppressedColdStartVaultEvent('create');
+          return;
+        }
         const content = await this.app.vault.read(file);
         this.syncEngine.onFileChangedImmediate(file.path, content);
       })
@@ -100,6 +108,10 @@ export default class VaultCRDTPlugin extends Plugin {
         if (!(file instanceof TFile)) return;
         const oldSync = isSyncablePath(oldPath);
         const newSync = isSyncablePath(file.path);
+        if (!this.syncEngine.shouldAcceptVaultChangeEvents()) {
+          this.syncEngine.noteSuppressedColdStartVaultEvent('rename');
+          return;
+        }
         if (oldSync && newSync) {
           const content = await this.app.vault.read(file);
           this.syncEngine.onFileRenamed(oldPath, file.path, content);
