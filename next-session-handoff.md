@@ -1,149 +1,129 @@
-# Session Handoff — v0.3.0 released after Docs-/Memory-Konsolidierung
+# Session Handoff — Friend-Handoff-Haertung vorbereitet
 
-Datum: 2026-04-09
+Datum: 2026-05-01
 Branch: `main`
 Plugin-Release live: `v0.3.0`
-Vorheriger Plugin-Release: `v0.2.33`
-Server-Release unveraendert live: `v0.2.6`
+Server-Release live auf `home`: `v0.2.6`
 
 ## Status in einem Satz
 
-Der Android-Startup ist nach den `v0.2.31`..`v0.2.33`-Fixes schnell genug,
-die Repo-/Docs-/Memory-Konsolidierung ist erledigt, und `v0.3.0` wurde als
-sauberer Folgerelease abgeschlossen.
+Die externe Audit-Runde fuer die Uebergabe an Richards Freundin ist abgeschlossen, die kleinen Plugin- und Server-Haertungen sind lokal umgesetzt und validiert, aber noch nicht committed/deployed/released und noch nicht produktiv freigegeben.
 
-## Relevanter technischer Stand
+## Zielprofil fuer die Uebergabe
 
-Die entscheidenden Android-Erkenntnisse bleiben:
+- Zielgeraete: PC, Mac, iPad, Android.
+- Server: Richards bestehender Server auf `home`.
+- Vault: bestehender produktiver Vault der Freundin.
+- Start: direkt produktiv.
+- Keine E2E-Verschluesselung in dieser Runde.
+- Datenschutz: organisatorisch plus minimierte Logs, nicht kryptographisch garantiert.
 
-1. **Startup-Dirty-Tracking ist device-lokal, nicht vault-lokal.**
-   Es darf nicht in einer gesyncten Vault-Datei liegen.
+## Audit-Artefakte
 
-2. **Android-Kaltstart-Vault-Events (`modify/create/rename`) sind waehrend
-   des ersten Startup-Fensters kein verlaessliches Dirty-Signal.**
-   Waehle in dieser Phase nur echte `editor-change` Events als Signal.
+Neuer laufender Zyklus:
 
-3. **Der no-read Fast-Path funktioniert jetzt im Zielzustand.**
-   Bester bestaetigter Trace:
-   - `start.startup-state-loaded | cacheEntries=807 | localDirty=0`
-   - `initial-sync.overlapping.plan | readsPlanned=0 | cleanSkipsPlanned=806`
-   - `initial-sync.overlapping.done | skippedClean=806 | reads=0 | elapsedMs=3`
-   - `initial-sync.complete | elapsedMs=612`
+```text
+gpt-audit/archive-2026-04-30-friend-handoff-stability/
+```
 
-## Relevante Commits der Android-Linie
+Wichtigste Dateien:
 
-- `1c6a626` — erster no-read Startup-Fast-Path
-- `33f9f34` — Dirty-Tracking device-lokal gemacht
-- `1aa1153` — Android-Kaltstart-Vault-Events bis Ende des ersten `initialSync` ignoriert
+- `audit-claude1-2026-04-30.md`
+- `audit-pi-gpt55-xhigh-2026-04-30.md`
+- `01-synthesis-and-next-actions.md`
+- `02-pre-handoff-plan.md`
+- `03-friend-target-profile.md`
+- `06-fresh-session-briefing.md`
+- `live-server-observation.md`
 
-## Was in dieser Session gelandet ist
+## Plugin-Haertung umgesetzt
 
-### 1. Docs und Repo aufgeraeumt
+- `src/url-policy.ts`: `normalizeServerUrl()` ergaenzt; HTTP/WS-Bases strippen trailing slashes.
+- `src/setup-modal.ts`: Setup persistiert normalisierte URL und nutzt `toHttpBase()`.
+- `src/settings.ts`: Settings persistieren normalisierte URL.
+- `src/sync-engine.ts`: `doc_tombstoned` zeigt deduplizierte Notice statt nur Log.
+- `src/sync-initial.ts`: Conflict-Kopien zeigen Notice mit Pfad.
+- `README.md`: Sync-Scope auf Markdown `.md` korrigiert.
+- `main.js`: durch `bun run build` neu gebaut.
 
-Geloescht:
-- `docs/next-session-prompt.md`
-- `docs/next-session-review.md`
+Bewusst nicht umgesetzt:
 
-Neu/uebernommen:
-- `AGENTS.md`
-- `.claude/rules/memory-vault.md`
-- `.agent-memory/` als projektweite langlebige Memory-Basis
-- `gpt-audit/archive-2026-04-08-initial-sync-perf/`
+- Keine automatische Conflict-Kopie fuer `doc_tombstoned`.
+- Kein sync-aware Auto-Push fuer Conflict-Dateien; Notice reicht fuer diese Runde.
 
-Aktualisiert:
-- `CLAUDE.md`
-- `gpt-audit/previous-cycles.md`
-- mehrere aeltere Audit-/Rule-Dokumente, damit die Repo-Invariants wieder gruen sind
+Plugin-Checks zuletzt gruen:
 
-Meta-Commit dieser Konsolidierung:
-- `f21a7e2` — `docs: consolidate memory and audit docs`
+```bash
+bunx tsc --noEmit
+bun run test        # 206 Tests gruen
+bun run build       # gruen, bekannte import.meta-WASM-Warnung
+bun run wasm:check  # OK
+```
 
-### 2. Memory Vault gepflegt
+## Server-Haertung umgesetzt im Schwesterrepo
 
-Neu eingetragen:
-- **Decision:** startup dirty tracking stays device-local
-- **Mistake:** Android cold-start vault events poisoned dirty tracking
-- **Procedure:** how to read Android startup performance traces
+Repo: `/home/richard/projects/vaultcrdt-server`
 
-Danach:
-- `memory-vault reindex`
-- `memory-vault generate --sync-context-files`
+- `src/ws.rs`: WS idle timeout 60s -> 120s.
+- `src/handlers.rs`: per-document logs von `info!` auf `debug!` gesenkt.
+- `src/main.rs`: EnvFilter Default `info,loro=warn,loro_internal=warn`.
+- `Cargo.toml`: `tracing-subscriber` mit `env-filter` Feature.
+- `README.md`: Version 0.2.6, Backup/Restore, Security-/Operator-Hinweise, Env-Tabelle.
+- `.env.example`: `VAULTCRDT_TOMBSTONE_DAYS=365` Empfehlung.
+- `docker-compose.yml`: `restart: unless-stopped`.
+- `Dockerfile`: Runtime installiert `sqlite`, damit dokumentierter `.backup`-Befehl funktioniert.
+- `.dockerignore`: neu, damit Remote-Docker-Builds nicht `target/`, `data/`, Secrets oder `.git/` uebertragen.
 
-### 3. 0.3.0 sauber validiert und released
+Server-Checks zuletzt gruen:
 
-Versionen synchronisiert auf:
-- `package.json` -> `0.3.0`
-- `manifest.json` -> `0.3.0`
-- `versions.json` -> `0.3.0`
-- `README.md` -> `0.3.x`
+```bash
+cd ../vaultcrdt-server
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace  # 36 Tests gruen
+```
 
-Validierung vor Release:
-- `bunx tsc --noEmit`
-- `bun run test`
-- `bun run build`
-- `verify_plugin --skipWasm`
+Remote-Validierung:
 
-Alles gruen.
+- `ssh home`: Asahi/Fedora aarch64, Docker und Rust 1.94 vorhanden.
+- Server-Code per rsync nach `/tmp/vaultcrdt-server-remote-check` kopiert.
+- Auf `home`: `cargo test --workspace --quiet` gruen.
+- Auf `home`: `docker build -t vaultcrdt-server:remote-build-check .` gruen.
+- `ssh macStudio`: macOS arm64 mit Rust 1.94, aber ohne Docker/Podman/Bun/Node; geeignet fuer cargo-only Checks, nicht fuer deploybare Linux-Docker-Artefakte.
 
-Release-Schritt:
-- Commit fuer den Versions-Bump erstellt
-- `main` gepusht
-- Tag `v0.3.0` gepusht
-- GitHub Release fuer BRAT erstellt via Release-Workflow
+Memory:
 
-## Aktiver Dokumentationszustand
+- `proc-20260501-c626 — Use remote ARM hosts for long VaultCRDT server builds`
 
-Prominent und aktuell halten:
-- `README.md`
-- `CLAUDE.md`
-- `AGENTS.md`
-- `next-session-handoff.md`
-- `docs/install-brat.md`
-- `gpt-audit/previous-cycles.md`
-- jeweilige `gpt-audit/archive-*/` Verzeichnisse nur als historische Details
+## Noch offen vor Weitergabe
 
-## Wenn spaeter wieder am Plugin gearbeitet wird
+1. Aenderungen reviewen und committen.
+2. Versionierung entscheiden:
+   - Plugin evtl. `0.3.1`.
+   - Server evtl. `0.2.7`.
+3. Server-Deploy auf `home` nur nach expliziter Freigabe.
+4. Live-Server `.env` pruefen/setzen: `VAULTCRDT_TOMBSTONE_DAYS=365`.
+5. Live-Backup vor Deploy ziehen.
+6. Finale Freundin-Anleitung schreiben, wahrscheinlich `docs/freundin-handoff.md`.
+7. Smoke-Test mit Testvault oder bewusstem Produktiv-Backup:
+   - Desktop Push/Pull.
+   - Mobile/iPad/Android aktiv-offen Sync.
+   - Delete/Rename/Offline-Reconnect.
+   - Server-Restart/Reconnect nur nach Freigabe.
+8. Produktiven Vault der Freundin erst nach Backup und Richards finaler Freigabe registrieren.
 
-1. **Android-Traces standardmaessig aus lassen.**
-   Startup-Traces und aehnliche Diagnose-Hilfen nur gezielt aktivieren,
-   wenn ein echter Android-Befund untersucht wird.
+## Harte Guardrails bleiben
 
-2. **Android-Startup-Code gezielt auf Codequalitaet nachpruefen.**
-   Der Fix wurde ueber viele Iterationen erarbeitet; die beteiligten
-   Startup-Pfade sollten spaeter noch einmal in Ruhe auf Vereinfachung,
-   klare Benennung, tote Sonderfaelle und uebrig gebliebene Debug-Logik
-   geprueft werden.
+- Kein Deploy, Release, Tag, Push oder Server-Restart ohne explizite Freigabe.
+- `wasm/` nicht manuell editieren.
+- `bun run test`, nie `bun test`.
+- Android `mtime` nie fuer Caching/Skip-Logik.
+- Keine Secrets, Admin Tokens, Passwoerter oder echten Vault-Werte in Git.
 
-3. **Langfrist-Audit fuer theoretischen 5-Jahres-Betrieb machen.**
-   Nicht nur Korrektheit pruefen, sondern auch:
-   - Wachstum von Server-DB, Tombstones und Plugin-State
-   - Verhalten bei langem Single-User-Betrieb
-   - Bedarf fuer Compaction-, Cleanup- oder Retention-Optionen
-   - klare Betriebsdoku fuer Self-Hoster
+## Empfohlener Start fuer die naechste Session
 
-4. **Plugin fuer eine spaetere Community-Vorstellung vorbereiten.**
-   Fokus:
-   - klare Self-Hosting-Anleitung
-   - klarer Setup-Flow vom Install bis zum ersten Sync
-   - Troubleshooting fuer typische Fehlerfaelle
-   - insgesamt ein oeffentlich verstaendlicherer Onboarding-Pfad
-
-## Naechste sinnvolle Schritte
-
-1. Kurzer Android-Smoketest nach `v0.3.0`
-   - 1 Kaltstart ohne Tippen
-   - 1 Kaltstart mit sofortigem Tippen
-
-2. Nur bei neuem echten Befund weiter in Startup-/Perf-Arbeit investieren.
-   Kein blindes Nachoptimieren mehr.
-
-3. Wenn ein neuer externer Audit startet:
-   - Top-Level von `gpt-audit/` sauber halten
-   - neuen Zyklus wieder in eigenes `archive-<datum>/` legen
-
-## Was weiterhin nicht getan werden soll
-
-- keinen Server anfassen
-- kein mtime-Caching einfuehren
-- kein neues Protokoll / keine neue Server-API anfangen
-- `wasm/` nicht anfassen, solange `crates/` unveraendert bleiben
+1. `CLAUDE.md`, `AGENTS.md`, `next-session-handoff.md` lesen.
+2. `gpt-audit/archive-2026-04-30-friend-handoff-stability/06-fresh-session-briefing.md` lesen.
+3. Repo-Status in Plugin und Server pruefen.
+4. Geaenderte Dateien reviewen.
+5. Danach Commit-Schnitt, Versionierung und Deploy-/Anleitungsreihenfolge entscheiden.

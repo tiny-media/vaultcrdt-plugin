@@ -41,6 +41,10 @@
   - id: proc-20260408-43ac
   - status: active
   - path: .agent-memory/procedures/rebuild-and-verify-wasm-only-after-crates-changes.md
+- Use remote ARM hosts for long VaultCRDT server builds
+  - id: proc-20260501-c626
+  - status: active
+  - path: .agent-memory/procedures/use-remote-arm-hosts-for-long-vaultcrdt-server-builds.md
 
 ## Mistakes
 - Android cold-start vault events poisoned dirty tracking
