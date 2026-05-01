@@ -56,7 +56,7 @@ Zwei-Repo-Setup:
 
 ## Verfuegbare Extension-Tools
 
-- `verify_plugin` — scannt das Repo auf Invariants: WASM-Freshness, Versions-Sync (package.json ↔ manifest.json ↔ versions.json), wasm-bindgen Pin, Emoji-Guard in src/crates/docs, Aufrufe des eingebauten Bun-Test-Runners. Nutze nach groesseren Aenderungen und vor `/commit`.
+Keine projektspezifischen Pi-Extension-Tools aktiv. Fuer Guardrails nutze `/skill:check`.
 
 ## Arbeitsweise
 

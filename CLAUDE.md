@@ -105,9 +105,8 @@ The repo ships with both Claude Code and pi-coding-agent harnesses:
 - `.claude/agents/reviewer.md` — read-only Sonnet reviewer
 - `.pi/SYSTEM.md` + `.pi/settings.json` — pi-coding-agent entry point
 - `.pi/skills/` — `commit`, `check`, `wasm-rebuild`, `review`, `deploy`, `audit-cycle`
-- `.pi/extensions/pi-ultrathink.ts` — exposes the `verify_plugin` tool (wasm freshness, version sync, wasm-bindgen pin, emoji guard, built-in Bun test-runner misuse guard)
 
-The `verify_plugin` tool is the invariant checker; call it after non-trivial changes and before `/commit`.
+Project-specific Pi invariant checks are not currently exposed as an active extension. Use `/skill:check` for the normal guardrail path.
 
 ## Memory note
 
@@ -134,9 +133,9 @@ If server memory changes, rerun `memory-vault reindex` and `memory-vault generat
 - Use bun run test, not Bun's built-in test runner — why: Bun's built-in test runner can silently skip the Vitest suite.
 
 ### Procedures
+- Use remote ARM hosts for long VaultCRDT server builds — steps: Prefer ssh home for deployable vaultcrdt-server Docker builds because home is the target aarch64 Fedora/Asahi Linux host and has Docker.
 - Read Android startup perf traces — steps: Check start.startup-state-loaded for cacheEntries and localDirty.
 - Deploy server via fleet from vaultcrdt-server — steps: Work from the vaultcrdt-server repo.
-- Rebuild and verify WASM only after crates changes — steps: Run cargo fmt --all and cargo clippy --all-targets --workspace -- -D warnings.
 
 ### Mistakes
 - Android cold-start vault events poisoned dirty tracking — prevention: Ignore vault modify/create/rename events until the first initial sync completes on startup-sensitive Android paths.
@@ -149,6 +148,7 @@ If server memory changes, rerun `memory-vault reindex` and `memory-vault generat
 
 See `.agent-memory/_generated/MEMORY.md` for the fuller digest and `.agent-memory/_generated/INDEX.md` for the complete index.
 <!-- END MEMORY-VAULT MANAGED BLOCK -->
+
 
 
 

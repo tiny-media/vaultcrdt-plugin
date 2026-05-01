@@ -1,16 +1,15 @@
 {
-  "defaultProvider": "openai-chatgpt",
-  "defaultModel": "gpt-5.4",
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.5",
   "defaultThinkingLevel": "high",
   "enabledModels": [
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6"
+    "openai-codex/gpt-5.5",
+    "openai-codex/gpt-5.4",
+    "openai-codex/gpt-5.4-mini",
+    "openai-codex/gpt-5.3-codex"
   ],
   "enabledExtensions": [
-    "pi-ultrathink"
+    "anchor-return"
   ],
   "compaction": {
     "enabled": true,
