@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-05-01
+
+### Changed
+- Normalize server URLs during setup and settings edits to avoid double-slash auth and WebSocket paths.
+- Show user-visible notices for tombstoned documents and initial-sync conflict copies.
+- Clarify that VaultCRDT currently syncs Markdown `.md` files only.
+
 ## [0.2.18] - 2026-04-08
 
 ### Added
