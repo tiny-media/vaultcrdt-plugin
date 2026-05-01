@@ -23,6 +23,10 @@
   - id: con-20260408-47b4
   - status: active
   - path: ../vaultcrdt-server/.agent-memory/conventions/keep-authentication-errors-generic.md
+- Use BRAT for plugin distribution
+  - id: con-20260501-cc33
+  - status: active
+  - path: .agent-memory/conventions/use-brat-for-plugin-distribution.md
 - Use bun run test, not Bun's built-in test runner
   - id: con-20260408-2ab7
   - status: active

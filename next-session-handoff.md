@@ -1,13 +1,92 @@
-# Session Handoff — Friend-Handoff-Haertung vorbereitet
+# Session Handoff — Friend-Handoff Release deployed
 
 Datum: 2026-05-01
 Branch: `main`
-Plugin-Release live: `v0.3.0`
-Server-Release live auf `home`: `v0.2.6`
+Plugin-Release live: `v0.3.1`
+Server-Release live auf `home`: `v0.2.7`
 
 ## Status in einem Satz
 
-Die externe Audit-Runde fuer die Uebergabe an Richards Freundin ist abgeschlossen, die kleinen Plugin- und Server-Haertungen sind lokal umgesetzt und validiert, aber noch nicht committed/deployed/released und noch nicht produktiv freigegeben.
+Plugin- und Server-Haertungen fuer die Uebergabe an Richards Freundin sind released, gepusht und der Server ist auf `home` deployed; produktiver Freundin-Handoff bleibt bis nach Smoke-Test und Richards finaler Freigabe gesperrt.
+
+## Relevante Commits und Releases
+
+Plugin-Repo `/home/richard/projects/vaultcrdt-plugin`:
+
+- `844a415 fix(plugin): harden friend handoff sync UX`
+- `0725f0d docs(gpt-audit): document friend handoff stability cycle`
+- `9f04c83 chore(plugin): release 0.3.1`
+- Tag/Release: `v0.3.1`
+
+Server-Repo `/home/richard/projects/vaultcrdt-server`:
+
+- `a367839 fix(server): harden ops privacy for friend handoff`
+- `285d4ef chore(server): release 0.2.7`
+- Tag/Release: `v0.2.7`
+
+GitHub Actions:
+
+- Plugin CI und Release fuer `v0.3.1` gruen.
+- Server CI, Release und Docker fuer `v0.2.7` gruen.
+
+## Plugin-Stand
+
+Umgesetzt:
+
+- Server-URL-Normalisierung in Setup und Settings.
+- Sichtbare Notices fuer `doc_tombstoned` und Initial-Sync-Conflict-Kopien.
+- README/Changelog/Manifest/Package/Versions auf `0.3.1` aktualisiert.
+- Sync-Scope als Markdown `.md` only dokumentiert.
+- Finale Freundin-Anleitung: `docs/freundin-handoff.md`.
+- Smoke-Test-Plan: `docs/freundin-smoke-test.md`.
+
+Plugin-Distribution:
+
+- Kanonischer Weg ist jetzt BRAT/GitHub Releases.
+- Alte lokale Copy-Deploys in Obsidian-Vault-Plugin-Ordner sind nicht mehr kanonisch.
+- Neues Memory: `con-20260501-cc33 — Use BRAT for plugin distribution`.
+- `.pi/skills/deploy/SKILL.md` wurde entsprechend entschärft.
+
+Plugin-Checks zuletzt gruen:
+
+```bash
+bun run wasm:check
+bun run test        # 206 Tests gruen
+bun run build       # gruen, bekannte import.meta-WASM-Warnung
+cargo fmt --all -- --check
+cargo clippy --all-targets --workspace -- -D warnings
+cargo test --workspace
+bunx tsc --noEmit
+```
+
+## Server-Stand
+
+Umgesetzt und deployed:
+
+- WS idle timeout 120s.
+- Per-document Logs auf `debug`, Default `RUST_LOG=info,loro=warn,loro_internal=warn`.
+- `VAULTCRDT_TOMBSTONE_DAYS=365` live gesetzt.
+- Backup/Restore-Doku und Runtime-`sqlite` verfuegbar.
+- Docker restart policy `unless-stopped` aktiv.
+
+Server-Checks zuletzt gruen:
+
+```bash
+cd ../vaultcrdt-server
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace  # 36 Tests gruen
+```
+
+Live-Deploy auf `home`:
+
+- Cold-Backup vor Deploy: `/opt/docker-setups-home/vaultcrdt/data/vaultcrdt-pre-0.2.7-20260501-153130.db`.
+- Deployed via `/home/richard/fleet` mit Stack `vaultcrdt`.
+- Container healthy, `/health` meldet `version: 0.2.7`.
+- Runtime enthaelt `sqlite3`; `.backup` erfolgreich getestet:
+  `/opt/docker-setups-home/vaultcrdt/data/vaultcrdt-post-0.2.7-smoke.db`.
+
+Wichtig: Fleet-Repo hat eine uncommitted Aenderung in `hosts/home/stacks/vaultcrdt/compose.yaml` fuer `v0.2.7` und `VAULTCRDT_TOMBSTONE_DAYS=365`. Nicht automatisch committen/pushen ohne Richards Freigabe.
 
 ## Zielprofil fuer die Uebergabe
 
@@ -18,112 +97,23 @@ Die externe Audit-Runde fuer die Uebergabe an Richards Freundin ist abgeschlosse
 - Keine E2E-Verschluesselung in dieser Runde.
 - Datenschutz: organisatorisch plus minimierte Logs, nicht kryptographisch garantiert.
 
-## Audit-Artefakte
+## Noch offen vor produktivem Freundin-Handoff
 
-Neuer laufender Zyklus:
+1. Smoke-Test nach `docs/freundin-smoke-test.md` durchfuehren.
+2. Vollbackup des produktiven Freundin-Vaults bestaetigen.
+3. Test-/Freundin-Vault-ID und Passwort nur ausserhalb von Git handhaben.
+4. Falls noetig: Server-Vault registrieren, ohne Admin Token zu dokumentieren.
+5. iPad/Android aktiv-offen Sync bewusst testen oder Einschraenkung akzeptieren.
+6. Richard muss final sagen:
 
 ```text
-gpt-audit/archive-2026-04-30-friend-handoff-stability/
+Freigabe: Produktiv-Handoff an Freundin mit Richards Server.
 ```
-
-Wichtigste Dateien:
-
-- `audit-claude1-2026-04-30.md`
-- `audit-pi-gpt55-xhigh-2026-04-30.md`
-- `01-synthesis-and-next-actions.md`
-- `02-pre-handoff-plan.md`
-- `03-friend-target-profile.md`
-- `06-fresh-session-briefing.md`
-- `live-server-observation.md`
-
-## Plugin-Haertung umgesetzt
-
-- `src/url-policy.ts`: `normalizeServerUrl()` ergaenzt; HTTP/WS-Bases strippen trailing slashes.
-- `src/setup-modal.ts`: Setup persistiert normalisierte URL und nutzt `toHttpBase()`.
-- `src/settings.ts`: Settings persistieren normalisierte URL.
-- `src/sync-engine.ts`: `doc_tombstoned` zeigt deduplizierte Notice statt nur Log.
-- `src/sync-initial.ts`: Conflict-Kopien zeigen Notice mit Pfad.
-- `README.md`: Sync-Scope auf Markdown `.md` korrigiert.
-- `main.js`: durch `bun run build` neu gebaut.
-
-Bewusst nicht umgesetzt:
-
-- Keine automatische Conflict-Kopie fuer `doc_tombstoned`.
-- Kein sync-aware Auto-Push fuer Conflict-Dateien; Notice reicht fuer diese Runde.
-
-Plugin-Checks zuletzt gruen:
-
-```bash
-bunx tsc --noEmit
-bun run test        # 206 Tests gruen
-bun run build       # gruen, bekannte import.meta-WASM-Warnung
-bun run wasm:check  # OK
-```
-
-## Server-Haertung umgesetzt im Schwesterrepo
-
-Repo: `/home/richard/projects/vaultcrdt-server`
-
-- `src/ws.rs`: WS idle timeout 60s -> 120s.
-- `src/handlers.rs`: per-document logs von `info!` auf `debug!` gesenkt.
-- `src/main.rs`: EnvFilter Default `info,loro=warn,loro_internal=warn`.
-- `Cargo.toml`: `tracing-subscriber` mit `env-filter` Feature.
-- `README.md`: Version 0.2.6, Backup/Restore, Security-/Operator-Hinweise, Env-Tabelle.
-- `.env.example`: `VAULTCRDT_TOMBSTONE_DAYS=365` Empfehlung.
-- `docker-compose.yml`: `restart: unless-stopped`.
-- `Dockerfile`: Runtime installiert `sqlite`, damit dokumentierter `.backup`-Befehl funktioniert.
-- `.dockerignore`: neu, damit Remote-Docker-Builds nicht `target/`, `data/`, Secrets oder `.git/` uebertragen.
-
-Server-Checks zuletzt gruen:
-
-```bash
-cd ../vaultcrdt-server
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace  # 36 Tests gruen
-```
-
-Remote-Validierung:
-
-- `ssh home`: Asahi/Fedora aarch64, Docker und Rust 1.94 vorhanden.
-- Server-Code per rsync nach `/tmp/vaultcrdt-server-remote-check` kopiert.
-- Auf `home`: `cargo test --workspace --quiet` gruen.
-- Auf `home`: `docker build -t vaultcrdt-server:remote-build-check .` gruen.
-- `ssh macStudio`: macOS arm64 mit Rust 1.94, aber ohne Docker/Podman/Bun/Node; geeignet fuer cargo-only Checks, nicht fuer deploybare Linux-Docker-Artefakte.
-
-Memory:
-
-- `proc-20260501-c626 — Use remote ARM hosts for long VaultCRDT server builds`
-
-## Noch offen vor Weitergabe
-
-1. Aenderungen reviewen und committen.
-2. Versionierung entscheiden:
-   - Plugin evtl. `0.3.1`.
-   - Server evtl. `0.2.7`.
-3. Server-Deploy auf `home` nur nach expliziter Freigabe.
-4. Live-Server `.env` pruefen/setzen: `VAULTCRDT_TOMBSTONE_DAYS=365`.
-5. Live-Backup vor Deploy ziehen.
-6. Finale Freundin-Anleitung schreiben, wahrscheinlich `docs/freundin-handoff.md`.
-7. Smoke-Test mit Testvault oder bewusstem Produktiv-Backup:
-   - Desktop Push/Pull.
-   - Mobile/iPad/Android aktiv-offen Sync.
-   - Delete/Rename/Offline-Reconnect.
-   - Server-Restart/Reconnect nur nach Freigabe.
-8. Produktiven Vault der Freundin erst nach Backup und Richards finaler Freigabe registrieren.
 
 ## Harte Guardrails bleiben
 
-- Kein Deploy, Release, Tag, Push oder Server-Restart ohne explizite Freigabe.
-- `wasm/` nicht manuell editieren.
-- `bun run test`, nie `bun test`.
-- Android `mtime` nie fuer Caching/Skip-Logik.
 - Keine Secrets, Admin Tokens, Passwoerter oder echten Vault-Werte in Git.
-
-## Empfohlener Start fuer die naechste Session
-
-1. `CLAUDE.md`, `AGENTS.md`, `next-session-handoff.md` lesen.
-2. `gpt-audit/archive-2026-04-30-friend-handoff-stability/06-fresh-session-briefing.md` lesen.
-3. Repo-Status in Plugin und Server pruefen.
-4. Geaenderte Dateien reviewen.
-5. Danach Commit-Schnitt, Versionierung und Deploy-/Anleitungsreihenfolge entscheiden.
+- `bun run test`, nie `bun test`.
+- `wasm/` nicht manuell editieren.
+- Android `mtime` nie fuer Caching/Skip-Logik.
+- Server-Kontext nur gezielt aus `../vaultcrdt-server` oder `/home/richard/fleet` laden.

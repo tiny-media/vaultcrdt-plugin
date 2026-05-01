@@ -78,7 +78,7 @@ The first cycle (`archive-2026-04-06/`) is closed: 6/8 items implemented, 2 deli
 
 ## Deploy
 
-Plugin deploy copies `main.js` + `manifest.json` + `wasm/` to four locations. See the `deploy` skill or the reference_deploy memory. Server deploy is via `fleet` from the sibling `vaultcrdt-server` repo.
+Plugin distribution uses BRAT/GitHub Releases. Do not copy plugin files into local Obsidian vault plugin folders as a normal deploy path. Server deploy is via `fleet` from the sibling `vaultcrdt-server` repo.
 
 ## Invariants
 
@@ -148,6 +148,8 @@ If server memory changes, rerun `memory-vault reindex` and `memory-vault generat
 
 See `.agent-memory/_generated/MEMORY.md` for the fuller digest and `.agent-memory/_generated/INDEX.md` for the complete index.
 <!-- END MEMORY-VAULT MANAGED BLOCK -->
+
+
 
 
 
