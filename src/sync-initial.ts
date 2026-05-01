@@ -1,4 +1,4 @@
-import { App, TFile } from 'obsidian';
+import { App, TFile, Notice } from 'obsidian';
 import { createDocument, type WasmSyncDocument } from './wasm-bridge';
 import { DocumentManager } from './document-manager';
 import type { VVCacheEntry } from './state-storage';
@@ -24,6 +24,19 @@ const PARALLEL_OVERLAPPING = 4;
 // doc's VV/peerId never escapes its enclosing function scope.
 const PROBE_DOC_UUID = '__probe__';
 const PROBE_PEER_ID = '__probe__';
+
+/**
+ * Surface a freshly-created conflict file to the user. Without a Notice,
+ * a conflict file in a deep subfolder can land silently and the user only
+ * notices days later. The Notice is intentionally long-lived so it survives
+ * a busy initial-sync window.
+ */
+function notifyConflictCreated(conflictPath: string): void {
+  new Notice(
+    `VaultCRDT: created conflict copy ${conflictPath}. Review it and merge manually if needed.`,
+    15000,
+  );
+}
 
 /**
  * Return the freshest local text for a file: editor content if any leaf has
@@ -564,6 +577,7 @@ async function syncOverlappingDoc(
         const cPath = conflictPath(app, path);
         warn(`${tag} state-loss conflict (missing local CRDT)`, { path, conflictPath: cPath });
         await app.vault.create(cPath, localContent);
+        notifyConflictCreated(cPath);
       } else if (textsDiffer) {
         log(`${tag} state-loss adopt (empty local, server has content)`, { path });
       } else {
@@ -621,6 +635,7 @@ async function syncOverlappingDoc(
           const cPath = conflictPath(app, path);
           warn(`${tag} concurrent external edit conflict`, { path, conflictPath: cPath });
           await app.vault.create(cPath, localContent);
+          notifyConflictCreated(cPath);
 
           await docs.removeAndClean(path);
           const freshDoc = await docs.getOrLoad(path);
@@ -661,6 +676,7 @@ async function syncOverlappingDoc(
         const cPath = conflictPath(app, path);
         warn(`${tag} disjoint VV conflict`, { path, conflictPath: cPath });
         await app.vault.create(cPath, localContent);
+        notifyConflictCreated(cPath);
       } else if (textsDiffer) {
         log(`${tag} disjoint VV adopt (blank local)`, { path });
       } else {

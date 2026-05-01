@@ -87,11 +87,14 @@ function isLocalOrPrivateHost(hostname) {
   if (a === 192 && b === 168) return true;
   return false;
 }
+function normalizeServerUrl(raw) {
+  return raw.trim().replace(/\/+$/, "");
+}
 function toHttpBase(raw) {
-  return raw.trim().replace(/^ws:\/\//i, "http://").replace(/^wss:\/\//i, "https://");
+  return normalizeServerUrl(raw).replace(/^ws:\/\//i, "http://").replace(/^wss:\/\//i, "https://");
 }
 function toWsBase(raw) {
-  return raw.trim().replace(/^http:\/\//i, "ws://").replace(/^https:\/\//i, "wss://");
+  return normalizeServerUrl(raw).replace(/^http:\/\//i, "ws://").replace(/^https:\/\//i, "wss://");
 }
 
 // src/setup-modal.ts
@@ -184,11 +187,13 @@ var SetupModal = class extends import_obsidian.Modal {
       this.showError("Server URL is required");
       return;
     }
-    const urlCheck = validateServerUrl(this.serverUrl);
+    const normalizedUrl = normalizeServerUrl(this.serverUrl);
+    const urlCheck = validateServerUrl(normalizedUrl);
     if (!urlCheck.ok) {
       this.showError(urlCheck.reason);
       return;
     }
+    this.serverUrl = normalizedUrl;
     if (!VAULT_NAME_RE.test(this.vaultId)) {
       this.showError("Vault Name must be lowercase letters, numbers, or hyphens (e.g. my-notes)");
       return;
@@ -199,7 +204,7 @@ var SetupModal = class extends import_obsidian.Modal {
     }
     btn.setDisabled(true);
     btn.setButtonText("Connecting...");
-    const httpBase = this.serverUrl.replace(/^ws:\/\//, "http://").replace(/^wss:\/\//, "https://");
+    const httpBase = toHttpBase(this.serverUrl);
     const body = {
       vault_id: this.vaultId,
       api_key: this.vaultSecret
@@ -351,15 +356,15 @@ var VaultCRDTSettingsTab = class extends import_obsidian2.PluginSettingTab {
     containerEl.createEl("h2", { text: "Connection" });
     new import_obsidian2.Setting(containerEl).setName("Server").setDesc("Address of your VaultCRDT server. WebSocket connection is derived automatically.").addText(
       (text) => text.setPlaceholder("https://obsidian-sync.example.com").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
-        const trimmed = value.trim();
-        if (trimmed.length > 0) {
-          const check = validateServerUrl(trimmed);
+        const normalized = normalizeServerUrl(value);
+        if (normalized.length > 0) {
+          const check = validateServerUrl(normalized);
           if (!check.ok) {
             new import_obsidian2.Notice(`VaultCRDT: ${check.reason}`, 6e3);
             return;
           }
         }
-        this.plugin.settings.serverUrl = trimmed;
+        this.plugin.settings.serverUrl = normalized;
         await this.plugin.saveSettings();
         this.scheduleReconnect();
       })
@@ -3412,6 +3417,12 @@ var PARALLEL_DOWNLOADS = 5;
 var PARALLEL_OVERLAPPING = 4;
 var PROBE_DOC_UUID = "__probe__";
 var PROBE_PEER_ID = "__probe__";
+function notifyConflictCreated(conflictPath2) {
+  new import_obsidian4.Notice(
+    `VaultCRDT: created conflict copy ${conflictPath2}. Review it and merge manually if needed.`,
+    15e3
+  );
+}
 async function readEffectiveLocalContent(app, editor, file) {
   const fromEditor = editor.readCurrentContent(file.path);
   if (fromEditor !== null) return fromEditor;
@@ -3801,6 +3812,7 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
         const cPath = conflictPath(app, path);
         warn(`${tag} state-loss conflict (missing local CRDT)`, { path, conflictPath: cPath });
         await app.vault.create(cPath, localContent);
+        notifyConflictCreated(cPath);
       } else if (textsDiffer) {
         log(`${tag} state-loss adopt (empty local, server has content)`, { path });
       } else {
@@ -3842,6 +3854,7 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
           const cPath = conflictPath(app, path);
           warn(`${tag} concurrent external edit conflict`, { path, conflictPath: cPath });
           await app.vault.create(cPath, localContent);
+          notifyConflictCreated(cPath);
           await docs.removeAndClean(path);
           const freshDoc = await docs.getOrLoad(path);
           const fullResult = await deps.requestSyncStart(path, null);
@@ -3867,6 +3880,7 @@ async function syncOverlappingDoc(deps, path, localContent, serverDocMap) {
         const cPath = conflictPath(app, path);
         warn(`${tag} disjoint VV conflict`, { path, conflictPath: cPath });
         await app.vault.create(cPath, localContent);
+        notifyConflictCreated(cPath);
       } else if (textsDiffer) {
         log(`${tag} disjoint VV adopt (blank local)`, { path });
       } else {
@@ -4179,6 +4193,8 @@ var SyncEngine = class {
     __publicField(this, "startupDirty");
     /** Set to true after stop() — prevents reconnect after intentional close. */
     __publicField(this, "stopped", false);
+    /** Paths we have already shown a tombstone Notice for in this session. */
+    __publicField(this, "notifiedTombstones", /* @__PURE__ */ new Set());
     __publicField(this, "trace", new SyncTrace());
     /**
      * One-shot admin token sent with the next /auth/verify call to register
@@ -4301,6 +4317,7 @@ var SyncEngine = class {
     this.startupEditedPaths.clear();
     this.vvCache.clear();
     this.startupDirty.clearAll();
+    this.notifiedTombstones.clear();
   }
   wsUrl() {
     return toWsBase(this.settings.serverUrl) + "/ws";
@@ -4466,7 +4483,7 @@ var SyncEngine = class {
         }
         break;
       case "doc_tombstoned":
-        warn(`${this.tag} doc is tombstoned on server \u2014 push refused`, { doc: msg.doc_uuid });
+        this.handleDocTombstoned(msg.doc_uuid);
         break;
       case "ack":
         this.setStatus("connected");
@@ -4595,6 +4612,22 @@ var SyncEngine = class {
     this.trace.markPath("broadcast.write-to-vault", docUuid, { textLen: textAfter.length });
     await this.editor.writeToVault(docUuid, textAfter);
     await this.docs.persist(docUuid);
+  }
+  /**
+   * Server refused a push because the document is tombstoned (deleted on
+   * another device). The previous behaviour was a silent warn-log, which
+   * meant the user could keep typing into a doomed file with no feedback.
+   * Show a clear Notice (deduped per path within this session) so the user
+   * notices the situation and can recover the content manually.
+   */
+  handleDocTombstoned(docUuid) {
+    warn(`${this.tag} doc is tombstoned on server \u2014 push refused`, { doc: docUuid });
+    if (this.notifiedTombstones.has(docUuid)) return;
+    this.notifiedTombstones.add(docUuid);
+    new import_obsidian5.Notice(
+      `VaultCRDT: "${docUuid}" was deleted on another device. Local edits will not sync. Copy any unsaved text out before reloading.`,
+      12e3
+    );
   }
   async onDocDeleted(docUuid) {
     if (!isSyncablePath(docUuid)) {

@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { validateServerUrl, isLocalOrPrivateHost, toHttpBase, toWsBase } from '../url-policy';
+import {
+  validateServerUrl,
+  isLocalOrPrivateHost,
+  normalizeServerUrl,
+  toHttpBase,
+  toWsBase,
+} from '../url-policy';
 
 describe('validateServerUrl', () => {
   // ── Accepts ────────────────────────────────────────────────────────────────
@@ -70,5 +76,46 @@ describe('toHttpBase / toWsBase', () => {
     expect(toHttpBase('ws://localhost')).toBe('http://localhost');
     expect(toWsBase('https://x.example.com')).toBe('wss://x.example.com');
     expect(toWsBase('http://localhost')).toBe('ws://localhost');
+  });
+
+  // Trailing slashes used to leak into `${base}/auth/verify` and `${base}/ws`,
+  // producing `//auth/verify` and `//ws`. Callers MUST get a slash-free base.
+  it('strips trailing slashes', () => {
+    expect(toHttpBase('https://x.example.com/')).toBe('https://x.example.com');
+    expect(toHttpBase('https://x.example.com///')).toBe('https://x.example.com');
+    expect(toWsBase('https://x.example.com/')).toBe('wss://x.example.com');
+    expect(toWsBase('wss://x.example.com//')).toBe('wss://x.example.com');
+  });
+
+  it('preserves explicit paths but strips their trailing slash', () => {
+    expect(toHttpBase('https://x.example.com/api/')).toBe('https://x.example.com/api');
+    expect(toWsBase('https://x.example.com/api/')).toBe('wss://x.example.com/api');
+  });
+});
+
+describe('normalizeServerUrl', () => {
+  it('trims whitespace', () => {
+    expect(normalizeServerUrl('  https://sync.example.com  ')).toBe('https://sync.example.com');
+  });
+
+  it('strips a single trailing slash', () => {
+    expect(normalizeServerUrl('https://sync.example.com/')).toBe('https://sync.example.com');
+  });
+
+  it('strips repeated trailing slashes', () => {
+    expect(normalizeServerUrl('https://sync.example.com////')).toBe('https://sync.example.com');
+  });
+
+  it('keeps a path segment but removes its trailing slash', () => {
+    expect(normalizeServerUrl('https://sync.example.com/path/')).toBe('https://sync.example.com/path');
+  });
+
+  it('is idempotent', () => {
+    const once = normalizeServerUrl('https://sync.example.com/');
+    expect(normalizeServerUrl(once)).toBe(once);
+  });
+
+  it('leaves an already-canonical URL unchanged', () => {
+    expect(normalizeServerUrl('https://sync.example.com')).toBe('https://sync.example.com');
   });
 });

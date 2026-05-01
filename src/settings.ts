@@ -1,6 +1,6 @@
 import { App, Platform, PluginSettingTab, Setting, requestUrl, Notice } from 'obsidian';
 import type VaultCRDTPlugin from './main';
-import { validateServerUrl, toHttpBase } from './url-policy';
+import { validateServerUrl, toHttpBase, normalizeServerUrl } from './url-policy';
 import { SetupModal } from './setup-modal';
 
 export interface VaultCRDTSettings {
@@ -164,18 +164,18 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           .setPlaceholder('https://obsidian-sync.example.com')
           .setValue(this.plugin.settings.serverUrl)
           .onChange(async (value) => {
-            const trimmed = value.trim();
+            const normalized = normalizeServerUrl(value);
             // Allow an empty field (user clearing the input) without
             // spamming Notices, but reject any non-empty invalid URL here
             // so we never persist something the SyncEngine will later refuse.
-            if (trimmed.length > 0) {
-              const check = validateServerUrl(trimmed);
+            if (normalized.length > 0) {
+              const check = validateServerUrl(normalized);
               if (!check.ok) {
                 new Notice(`VaultCRDT: ${check.reason}`, 6000);
                 return;
               }
             }
-            this.plugin.settings.serverUrl = trimmed;
+            this.plugin.settings.serverUrl = normalized;
             await this.plugin.saveSettings();
             this.scheduleReconnect();
           })

@@ -67,12 +67,27 @@ export function isLocalOrPrivateHost(hostname: string): boolean {
   return false;
 }
 
+/**
+ * Canonicalise a user-supplied server URL: trim whitespace and strip any
+ * trailing slashes. Centralising this prevents `https://host/` from later
+ * producing `https://host//auth/verify` or `wss://host//ws` when callers
+ * concatenate well-known paths. SetupModal and SettingsTab persist the
+ * normalised form so the saved URL is already canonical at rest.
+ */
+export function normalizeServerUrl(raw: string): string {
+  return raw.trim().replace(/\/+$/, '');
+}
+
 /** Convert a validated server URL to the HTTP(S) base for REST calls. */
 export function toHttpBase(raw: string): string {
-  return raw.trim().replace(/^ws:\/\//i, 'http://').replace(/^wss:\/\//i, 'https://');
+  return normalizeServerUrl(raw)
+    .replace(/^ws:\/\//i, 'http://')
+    .replace(/^wss:\/\//i, 'https://');
 }
 
 /** Convert a validated server URL to the WS(S) base for the /ws endpoint. */
 export function toWsBase(raw: string): string {
-  return raw.trim().replace(/^http:\/\//i, 'ws://').replace(/^https:\/\//i, 'wss://');
+  return normalizeServerUrl(raw)
+    .replace(/^http:\/\//i, 'ws://')
+    .replace(/^https:\/\//i, 'wss://');
 }

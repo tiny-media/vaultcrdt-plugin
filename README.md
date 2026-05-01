@@ -53,7 +53,7 @@ When two clients diverge without a shared CRDT history (e.g. one client is offli
 ## What it does not do
 
 - End-to-end encryption. Data is transmitted in plaintext over the WebSocket connection. Use TLS (WSS) on the server to encrypt data in transit.
-- Binary file sync. Only Markdown notes and text files are synchronised.
+- Binary or non-Markdown file sync. Only Markdown (`.md`) notes are synchronised. Other formats (Canvas, Excalidraw, attachments, plain `.txt`) are ignored.
 
 ## Network usage
 

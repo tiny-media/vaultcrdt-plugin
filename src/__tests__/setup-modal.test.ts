@@ -144,6 +144,26 @@ describe('SetupModal', () => {
     await pending;
   });
 
+  it('persists the normalized server URL (strips trailing slash)', async () => {
+    mockRequestUrl.mockResolvedValueOnce({ json: { token: 'jwt-3' } });
+
+    const pending = openAndFill(modal, {
+      serverUrl: 'http://localhost:3737/',
+      vaultId: 'my-vault',
+      vaultSecret: 'pw',
+    });
+
+    await (modal as unknown as { submit: (b: unknown) => Promise<void> }).submit(fakeBtn());
+    const result = await pending;
+
+    expect(result?.serverUrl).toBe('http://localhost:3737');
+
+    // The /auth/verify URL must not contain a double slash.
+    const call = mockRequestUrl.mock.calls[0][0] as { url: string };
+    expect(call.url).toBe('http://localhost:3737/auth/verify');
+    expect(call.url.includes('//auth')).toBe(false);
+  });
+
   it('resolves with null when the user cancels via close()', async () => {
     const pending = modal.prompt();
     modal.close();

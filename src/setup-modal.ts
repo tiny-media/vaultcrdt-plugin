@@ -1,6 +1,6 @@
 import { Modal, App, Setting, requestUrl, Notice } from 'obsidian';
 import type { VaultCRDTSettings } from './settings';
-import { validateServerUrl } from './url-policy';
+import { validateServerUrl, normalizeServerUrl, toHttpBase } from './url-policy';
 
 export interface SetupResult {
   serverUrl: string;
@@ -143,11 +143,15 @@ export class SetupModal extends Modal {
       this.showError('Server URL is required');
       return;
     }
-    const urlCheck = validateServerUrl(this.serverUrl);
+    const normalizedUrl = normalizeServerUrl(this.serverUrl);
+    const urlCheck = validateServerUrl(normalizedUrl);
     if (!urlCheck.ok) {
       this.showError(urlCheck.reason);
       return;
     }
+    // Persist the normalised form everywhere downstream so we never store
+    // a trailing slash that would later become `//auth/verify` or `//ws`.
+    this.serverUrl = normalizedUrl;
     if (!VAULT_NAME_RE.test(this.vaultId)) {
       this.showError('Vault Name must be lowercase letters, numbers, or hyphens (e.g. my-notes)');
       return;
@@ -161,9 +165,7 @@ export class SetupModal extends Modal {
     btn.setDisabled(true);
     btn.setButtonText('Connecting...');
 
-    const httpBase = this.serverUrl
-      .replace(/^ws:\/\//, 'http://')
-      .replace(/^wss:\/\//, 'https://');
+    const httpBase = toHttpBase(this.serverUrl);
 
     // Build body — admin_token is only attached when the user has actually
     // entered one via the collapsible "Creating a new vault?" section.

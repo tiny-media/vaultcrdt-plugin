@@ -105,6 +105,7 @@ vi.mock('obsidian', () => ({
   TFile: vi.fn(),
   MarkdownView: MockMarkdownView,
   normalizePath: (p: string) => p,
+  Notice: class { constructor(_msg: string, _timeout?: number) {} },
 }));
 
 vi.mock('@msgpack/msgpack', () => ({

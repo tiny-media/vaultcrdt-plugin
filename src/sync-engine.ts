@@ -1,4 +1,4 @@
-import { App, TFile, requestUrl } from 'obsidian';
+import { App, TFile, Notice, requestUrl } from 'obsidian';
 import { encode, decode } from '@msgpack/msgpack';
 import type { VaultCRDTSettings } from './settings';
 import { type WasmSyncDocument } from './wasm-bridge';
@@ -66,6 +66,8 @@ export class SyncEngine {
   private startupDirty: StartupDirtyTracker;
   /** Set to true after stop() — prevents reconnect after intentional close. */
   private stopped = false;
+  /** Paths we have already shown a tombstone Notice for in this session. */
+  private notifiedTombstones = new Set<string>();
   private trace = new SyncTrace();
   /**
    * One-shot admin token sent with the next /auth/verify call to register
@@ -216,6 +218,7 @@ export class SyncEngine {
     this.startupEditedPaths.clear();
     this.vvCache.clear();
     this.startupDirty.clearAll();
+    this.notifiedTombstones.clear();
   }
 
   private wsUrl(): string {
@@ -407,7 +410,7 @@ export class SyncEngine {
         break;
 
       case 'doc_tombstoned':
-        warn(`${this.tag} doc is tombstoned on server — push refused`, { doc: msg.doc_uuid });
+        this.handleDocTombstoned(msg.doc_uuid as string);
         break;
 
       case 'ack':
@@ -553,6 +556,23 @@ export class SyncEngine {
     this.trace.markPath('broadcast.write-to-vault', docUuid, { textLen: textAfter.length });
     await this.editor.writeToVault(docUuid, textAfter);
     await this.docs.persist(docUuid);
+  }
+
+  /**
+   * Server refused a push because the document is tombstoned (deleted on
+   * another device). The previous behaviour was a silent warn-log, which
+   * meant the user could keep typing into a doomed file with no feedback.
+   * Show a clear Notice (deduped per path within this session) so the user
+   * notices the situation and can recover the content manually.
+   */
+  private handleDocTombstoned(docUuid: string): void {
+    warn(`${this.tag} doc is tombstoned on server — push refused`, { doc: docUuid });
+    if (this.notifiedTombstones.has(docUuid)) return;
+    this.notifiedTombstones.add(docUuid);
+    new Notice(
+      `VaultCRDT: "${docUuid}" was deleted on another device. Local edits will not sync. Copy any unsaved text out before reloading.`,
+      12000,
+    );
   }
 
   private async onDocDeleted(docUuid: string): Promise<void> {
