@@ -30,7 +30,7 @@ export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   peerId: '',
   vaultId: '',
   deviceName: '',
-  debounceMs: 700,
+  debounceMs: 300,
   showSyncStatus: true,
   onboardingComplete: false,
 };
@@ -357,10 +357,10 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Sync delay')
-      .setDesc('How long to wait after your last keystroke before sending changes (300–2000 ms)')
+      .setDesc('How long to wait after your last keystroke before sending changes (100–2000 ms)')
       .addSlider((slider) =>
         slider
-          .setLimits(300, 2000, 50)
+          .setLimits(100, 2000, 50)
           .setValue(this.plugin.settings.debounceMs)
           .setDynamicTooltip()
           .onChange(async (value) => {

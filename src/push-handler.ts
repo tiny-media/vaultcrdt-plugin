@@ -23,8 +23,19 @@ import { fnv1aHash64 } from './conflict-utils';
  * - The journal may therefore grow during a long session; it shrinks on the
  *   next reconnect-triggered initial sync.
  */
+/** Lower bound for the editor push debounce; keeps a misconfigured slider
+ * from turning every keystroke into its own push. */
+const MIN_DEBOUNCE_MS = 100;
+
+/** Upper bound on how long an unsynced burst of edits may sit locally.
+ * Without it, a trailing debounce that resets on every keystroke never fires
+ * during continuous typing while incoming edits keep arriving immediately. */
+export const PUSH_MAX_WAIT_MS = 2_000;
+
 export class PushHandler {
   private pushDebounceTimers = new Map<string, number>();
+  /** First unsynced edit per path; bounds how long a burst may stay unsynced. */
+  private pushFirstChangeAt = new Map<string, number>();
   private pendingDeletes = new Set<string>();
   /**
    * Sent-but-unacknowledged pushes (session-state only, never persisted).
@@ -51,14 +62,24 @@ export class PushHandler {
   ) {}
 
   onFileChanged(path: string): void {
+    const now = Date.now();
+    const firstChange = this.pushFirstChangeAt.get(path) ?? now;
+    this.pushFirstChangeAt.set(path, firstChange);
     const existing = this.pushDebounceTimers.get(path);
     if (existing) window.clearTimeout(existing);
-    const delayMs = Math.max(this.settings.debounceMs, 300);
+    const debounceMs = Math.max(this.settings.debounceMs, MIN_DEBOUNCE_MS);
+    // Never hold an edit longer than PUSH_MAX_WAIT_MS after the first unsynced
+    // change of the burst, even while typing keeps resetting the debounce.
+    const delayMs = Math.min(
+      debounceMs,
+      Math.max(0, firstChange + PUSH_MAX_WAIT_MS - now),
+    );
     this.tracePath('push.debounce.schedule', path, { delayMs });
     this.pushDebounceTimers.set(
       path,
       window.setTimeout(() => {
         this.pushDebounceTimers.delete(path);
+        this.pushFirstChangeAt.delete(path);
         const freshContent = this.editor.readCurrentContent(path);
         this.tracePath('push.debounce.fire', path, {
           hasEditorContent: freshContent !== null,
@@ -193,6 +214,7 @@ export class PushHandler {
     const timer = this.pushDebounceTimers.get(path);
     if (timer !== undefined) window.clearTimeout(timer);
     this.pushDebounceTimers.delete(path);
+    this.pushFirstChangeAt.delete(path);
   }
 
   /** Flush pending debounce edits into CRDT before merging broadcast. */
@@ -201,6 +223,7 @@ export class PushHandler {
     if (!timer) return;
     window.clearTimeout(timer);
     this.pushDebounceTimers.delete(path);
+    this.pushFirstChangeAt.delete(path);
     const freshContent = this.editor.readCurrentContent(path);
     this.tracePath('push.flush.begin', path, {
       hasEditorContent: freshContent !== null,
@@ -330,6 +353,7 @@ export class PushHandler {
   stopAllTimers(): void {
     for (const timer of this.pushDebounceTimers.values()) window.clearTimeout(timer);
     this.pushDebounceTimers.clear();
+    this.pushFirstChangeAt.clear();
   }
 
   // ── Private ──────────────────────────────────────────────────────────────────

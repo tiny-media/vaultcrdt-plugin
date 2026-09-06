@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-07
+
+### Added
+
+- The editor push debounce now has an upper bound: a burst of edits is
+  sent after two seconds at the latest, even while typing continues
+  without a pause. Previously a trailing debounce that reset on every
+  keystroke never fired during continuous typing, so work stayed
+  unsynced — and invisible to other devices — for as long as the author
+  kept writing. Measured on the real editor: 24 s of continuous typing
+  produced zero pushes.
+
+### Changed
+
+- Default sync delay 700 → 300 ms, slider lower bound 300 → 100 ms.
+  Transport between devices measures ~118 ms one-way, so the previous
+  default dominated the perceived sync latency; external file changes
+  already bypass the debounce entirely and the conflict merge held up
+  under concurrent whole-file writes at zero debounce.
+
 ## [0.5.1] - 2026-09-07
 
 ### Fixed
