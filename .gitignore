@@ -1,0 +1,19 @@
+node_modules/
+dist/
+target/
+_scratch/
+thoughts/shared/
+**/.DS_Store
+**/._*
+/main.js
+
+# internal — never tracked in the public repo
+/_archive/
+/_setup/
+/_local/
+
+# local-only smoke and handoff documents
+/docs/mobile-smoke.md
+/docs/mobile-smoke-results.md
+/docs/freundin-smoke-test.md
+AGENTS.override.md

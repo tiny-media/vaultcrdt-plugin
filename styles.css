@@ -1,0 +1,80 @@
+/* VaultCRDT — styles loaded automatically by Obsidian from the plugin folder. */
+
+/* Status bar indicator */
+.vcrdt-status-bar {
+  color: var(--text-faint);
+}
+
+.vcrdt-status-bar.vcrdt-status-connected {
+  color: var(--text-muted);
+}
+
+.vcrdt-status-dot {
+  font-size: 0.55em;
+  position: relative;
+  top: 0.05em;
+}
+
+/* Setup modal error line */
+.vcrdt-setup-error {
+  color: var(--text-error);
+  font-size: 0.85em;
+}
+
+/* Generic visibility helper */
+.vcrdt-hidden {
+  display: none;
+}
+
+/* Invite / setup QR code image */
+.vcrdt-qr {
+  max-width: 100%;
+  image-rendering: pixelated;
+}
+
+/* Ribbon icon tint when the inbox has items or the device is offline */
+.vcrdt-ribbon-attention {
+  color: var(--text-warning);
+}
+
+/* Status panel (ribbon) */
+.vcrdt-panel-status {
+  margin-bottom: 0.5em;
+}
+
+.vcrdt-panel-dot {
+  color: var(--text-faint);
+}
+
+.vcrdt-panel-dot.vcrdt-panel-dot-on {
+  color: var(--text-success);
+}
+
+.vcrdt-panel-lines {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.vcrdt-panel-line {
+  margin: 0.1em 0;
+}
+
+/* Copyable link/secret rows in the invite modal — long URIs must wrap
+   instead of overflowing the modal (WebView 84: no :has/clamp/gap). */
+.vcrdt-copy-code {
+  display: block;
+  white-space: normal;
+  word-break: break-all;
+  overflow-wrap: break-word;
+  padding: 0.2em 0.3em;
+}
+
+/* Minimum touch target for the status panel actions */
+.vcrdt-panel-action button {
+  min-height: 40px;
+}
+
+/* Inbox entries */
+.vcrdt-inbox-entry {
+  border-top: 1px solid var(--background-modifier-border);
+}

@@ -1,0 +1,20 @@
+[package]
+name = "vaultcrdt-crdt"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vaultcrdt-core = { path = "../vaultcrdt-core" }
+
+loro = { workspace = true }
+blake3 = { workspace = true }
+similar = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
