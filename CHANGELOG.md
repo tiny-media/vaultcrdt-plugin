@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-07
+
+### Changed
+
+- The WebAssembly module ships as a sibling asset next to `main.js`
+  instead of being inlined. `main.js` drops from 3,105,061 to 317,444
+  bytes (-90%); `vaultcrdt_wasm_bg.wasm` (2,122,007 bytes) is read from
+  the plugin directory at load time. Installations must carry all four
+  release assets: `main.js`, `manifest.json`, `styles.css` and
+  `vaultcrdt_wasm_bg.wasm`. A missing wasm file raises an explicit
+  notice instead of failing silently.
+- Loro pinned to 1.16.0 (from 1.13). Existing snapshots import forward;
+  the server must run 0.3.2 or newer.
+- Rust toolchain 1.98.1 for the wasm build (1.98.0 miscompiles
+  trait-object vtables and is never used).
+
 ## [0.4.9] - 2026-09-06
 
 ### Added
