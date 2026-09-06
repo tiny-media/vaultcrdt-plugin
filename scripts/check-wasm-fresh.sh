@@ -22,7 +22,12 @@ if ! command -v "$WASM_BINDGEN" >/dev/null 2>&1; then
   fi
 fi
 cargo build -p vaultcrdt-wasm --target wasm32-unknown-unknown --release
+# Flags must match scripts/build-wasm.sh exactly, or this check reports drift
+# that is really a flag mismatch.
 "$WASM_BINDGEN" --target web \
+  --omit-default-module-path \
+  --remove-name-section \
+  --remove-producers-section \
   --out-dir "$TMPDIR" \
   target/wasm32-unknown-unknown/release/vaultcrdt_wasm.wasm
 

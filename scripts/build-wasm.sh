@@ -19,7 +19,14 @@ if ! command -v "$WASM_BINDGEN" >/dev/null 2>&1; then
   fi
 fi
 cargo build -p vaultcrdt-wasm --target wasm32-unknown-unknown --release
+# --omit-default-module-path: the module is embedded in main.js and always
+#   passed as bytes, so the default `fetch(new URL(...))` branch is dead code.
+#   Dropping it also removes the import.meta reference esbuild warns about.
+# --remove-name-section / --remove-producers-section: debug metadata only.
 "$WASM_BINDGEN" --target web \
+  --omit-default-module-path \
+  --remove-name-section \
+  --remove-producers-section \
   --out-dir "$OUT_DIR" \
   target/wasm32-unknown-unknown/release/vaultcrdt_wasm.wasm
 

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-07
+
+### Fixed
+
+- 0.5.0 could not be installed by BRAT or from the community store. Both
+  install exactly `main.js`, `manifest.json` and `styles.css` and never
+  deliver additional release assets, so the sibling `vaultcrdt_wasm_bg.wasm`
+  introduced in 0.5.0 never reached the vault and the plugin refused to
+  start. Only manual and adb installs worked.
+
+### Changed
+
+- The WebAssembly module is embedded in `main.js` again, now gzip-compressed
+  before base64 instead of raw. It is inflated at load time through the
+  engine's native gzip decoder, with an fflate fallback for runtimes without
+  `DecompressionStream` (iOS 16.0-16.3). The module is bit-identical after
+  inflation; nothing is fetched at runtime.
+- `main.js` is 1,065,786 bytes, down from 3,105,061 in 0.4.9: 1,934,200
+  bytes from compressing before base64 and 105,075 bytes from minifying the
+  bundle. The wasm module itself is unchanged at 2,121,827 bytes.
+- A release ships three files again. `vaultcrdt_wasm_bg.wasm` is no longer a
+  release asset; installations carrying one from 0.5.0 can delete it.
+- The wasm build drops its default module path, so the bundle no longer
+  contains an unreachable `fetch` of a sibling file.
+- The CI size gate moved from 3 MiB to 2 MiB. Obsidian imposes no size
+  limit; the gate now guards the compression, not a store rule.
+
 ## [0.5.0] - 2026-09-07
 
 ### Changed

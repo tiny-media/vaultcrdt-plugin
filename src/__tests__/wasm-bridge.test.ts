@@ -27,38 +27,58 @@ vi.mock('../../wasm/vaultcrdt_wasm', () => ({
   WasmSyncDocument: MockWasmSyncDocument,
 }));
 
+import { gzipSync } from 'fflate';
+
 import { initWasm, createDocument } from '../wasm-bridge';
 
-const loadBytes = async () => new Uint8Array([0, 97, 115, 109]);
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+// esbuild substitutes this at bundle time; under vitest it must be defined
+// here. A real gzip stream of a wasm magic header keeps both inflate paths
+// (DecompressionStream and the fflate fallback) on genuine input.
+const WASM_MAGIC = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+vi.stubGlobal(
+  '__VAULTCRDT_WASM_GZ_B64__',
+  Buffer.from(gzipSync(WASM_MAGIC)).toString('base64'),
+);
 
 describe('initWasm', () => {
   beforeEach(() => {
     mockInitWasmModule.mockClear();
   });
 
-  // Runs first on purpose: the module-level guard must still be unset here,
-  // otherwise a later initWasm() would short-circuit instead of retrying.
-  it('rejects and stays uninitialized when the loader fails', async () => {
-    const failing = vi.fn().mockRejectedValue(new Error('missing'));
-    await expect(initWasm(failing)).rejects.toThrow('missing');
-    expect(mockInitWasmModule).not.toHaveBeenCalled();
-    // Retry possible: a working loader still initializes afterwards.
-    await expect(initWasm(loadBytes)).resolves.toBeUndefined();
+  it('inflates the embedded module and passes the exact bytes on', async () => {
+    await expect(initWasm()).resolves.toBeUndefined();
     expect(mockInitWasmModule).toHaveBeenCalledTimes(1);
+    const arg = mockInitWasmModule.mock.calls[0][0] as { module_or_path: Uint8Array };
+    // The inflated bytes must be the original input, not the compressed form.
+    expect(Array.from(arg.module_or_path)).toEqual(Array.from(WASM_MAGIC));
   });
 
-  it('calls the WASM init function on first call', async () => {
-    await initWasm(loadBytes);
-    // Due to the singleton guard in wasm-bridge.ts the mock may already have
-    // been called in a prior test; only assert it was called at least once.
-    expect(mockInitWasmModule.mock.calls.length).toBeGreaterThanOrEqual(0);
+  // iOS 16.0-16.3 has no DecompressionStream. That path cannot be reached on
+  // the devices we test on, so it is pinned here instead.
+  it('falls back to fflate when DecompressionStream is absent', async () => {
+    const native = globalThis.DecompressionStream;
+    // @ts-expect-error deliberately removing the global for this test
+    delete globalThis.DecompressionStream;
+    // A fresh module registry, so the singleton guard does not short-circuit.
+    vi.resetModules();
+    try {
+      const { initWasm: freshInit } = await import('../wasm-bridge');
+      await expect(freshInit()).resolves.toBeUndefined();
+      const call = mockInitWasmModule.mock.calls.at(-1) as [{ module_or_path: Uint8Array }];
+      expect(Array.from(call[0].module_or_path)).toEqual(Array.from(WASM_MAGIC));
+    } finally {
+      globalThis.DecompressionStream = native;
+      vi.resetModules();
+    }
   });
 
-  it('is safe to call multiple times without throwing', async () => {
-    await expect(initWasm(loadBytes)).resolves.toBeUndefined();
-    await expect(initWasm(loadBytes)).resolves.toBeUndefined();
+  it('is safe to call multiple times and initializes only once', async () => {
+    await expect(initWasm()).resolves.toBeUndefined();
+    await expect(initWasm()).resolves.toBeUndefined();
+    // Guard already set by the first test in this file.
+    expect(mockInitWasmModule).not.toHaveBeenCalled();
   });
 });
 

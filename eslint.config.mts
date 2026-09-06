@@ -39,6 +39,10 @@ export default defineConfig(
 		// Obsidian APIs and WASM handles; this code is never shipped.
 		files: ["src/__tests__/**/*.ts", "src/__mocks__/**/*.ts"],
 		rules: {
+			// vitest runs in node: there is no window to prefer, and probing
+			// globalThis is how a test removes a platform API (DecompressionStream)
+			// to exercise the fallback path.
+			"obsidianmd/no-global-this": "off",
 			"@typescript-eslint/no-explicit-any": "off",
 			"@typescript-eslint/no-unsafe-argument": "off",
 			"@typescript-eslint/no-unsafe-assignment": "off",

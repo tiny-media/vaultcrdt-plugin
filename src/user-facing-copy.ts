@@ -83,9 +83,9 @@ export function relativeTimeText(at: number, now: number): string {
   return `${Math.round(secs / 86400)}d ago`;
 }
 
-/** The wasm ships as a sibling file next to main.js; a missing copy is a broken install. */
-export const WASM_MISSING_NOTICE =
-  'VaultCRDT: installation incomplete — vaultcrdt_wasm_bg.wasm is missing next to main.js. Reinstall the plugin.';
+/** The wasm is embedded in main.js; a failure here means a damaged or partial install. */
+export const WASM_INIT_FAILED_NOTICE =
+  'VaultCRDT: the WebAssembly module failed to load — the installation looks damaged. Reinstall the plugin.';
 
 export const PLUGIN_REPO = 'tiny-media/vaultcrdt-plugin';
 export const SETUP_COPY = {
