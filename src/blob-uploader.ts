@@ -227,7 +227,7 @@ export class BlobUploader {
       return;
     }
     if (resp.status === 409) {
-      // ponytail: LWW loss drops the local version instead of writing a
+      // note: LWW loss drops the local version instead of writing a
       // conflict copy. Upgrade path: the S3 conflict-copy flow.
       warn('blob.lww-loss (dropped, conflict copy is S3):', path);
       return;

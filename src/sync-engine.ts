@@ -1120,7 +1120,7 @@ export class SyncEngine {
     this.startupDirty.replace(paths);
   }
 
-  // ponytail: a debounced push before auth_ok follows synchronous Auth on this
+  // note: a debounced push before auth_ok follows synchronous Auth on this
   // socket; add a client queue only if the server stops processing frames in order.
   private send(msg: object): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;

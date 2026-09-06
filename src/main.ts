@@ -716,7 +716,7 @@ export default class VaultCRDTPlugin extends Plugin {
 
   private async shutdown(): Promise<void> {
     this.clearActivityTimer();
-    // ponytail: pending deletes are not flushed on unload; startup reconciles.
+    // note: pending deletes are not flushed on unload; startup reconciles.
     this.pendingDeleteChecks.clear();
     // Wait for pending initialization before stopping
     if (this.pendingSyncEngineInit) {
