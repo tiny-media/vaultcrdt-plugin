@@ -21,11 +21,6 @@ const { mockInitWasmModule, MockWasmSyncDocument, mockDocInstance } = vi.hoisted
   return { mockInitWasmModule, MockWasmSyncDocument, mockDocInstance };
 });
 
-// Mock the WASM binary (esbuild inlines this as Uint8Array at build time)
-vi.mock('../../wasm/vaultcrdt_wasm_bg.wasm', () => ({
-  default: new Uint8Array([0, 97, 115, 109]),
-}));
-
 // Mock the WASM JS bindings
 vi.mock('../../wasm/vaultcrdt_wasm', () => ({
   default: mockInitWasmModule,
@@ -34,6 +29,8 @@ vi.mock('../../wasm/vaultcrdt_wasm', () => ({
 
 import { initWasm, createDocument } from '../wasm-bridge';
 
+const loadBytes = async () => new Uint8Array([0, 97, 115, 109]);
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('initWasm', () => {
@@ -41,16 +38,27 @@ describe('initWasm', () => {
     mockInitWasmModule.mockClear();
   });
 
+  // Runs first on purpose: the module-level guard must still be unset here,
+  // otherwise a later initWasm() would short-circuit instead of retrying.
+  it('rejects and stays uninitialized when the loader fails', async () => {
+    const failing = vi.fn().mockRejectedValue(new Error('missing'));
+    await expect(initWasm(failing)).rejects.toThrow('missing');
+    expect(mockInitWasmModule).not.toHaveBeenCalled();
+    // Retry possible: a working loader still initializes afterwards.
+    await expect(initWasm(loadBytes)).resolves.toBeUndefined();
+    expect(mockInitWasmModule).toHaveBeenCalledTimes(1);
+  });
+
   it('calls the WASM init function on first call', async () => {
-    await initWasm();
+    await initWasm(loadBytes);
     // Due to the singleton guard in wasm-bridge.ts the mock may already have
     // been called in a prior test; only assert it was called at least once.
     expect(mockInitWasmModule.mock.calls.length).toBeGreaterThanOrEqual(0);
   });
 
   it('is safe to call multiple times without throwing', async () => {
-    await expect(initWasm()).resolves.toBeUndefined();
-    await expect(initWasm()).resolves.toBeUndefined();
+    await expect(initWasm(loadBytes)).resolves.toBeUndefined();
+    await expect(initWasm(loadBytes)).resolves.toBeUndefined();
   });
 });
 

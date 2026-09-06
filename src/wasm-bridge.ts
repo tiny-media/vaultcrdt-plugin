@@ -1,6 +1,3 @@
-// WASM binary is inlined by esbuild's binary loader
-// @ts-ignore — .wasm resolved as binary (Uint8Array) by esbuild
-import wasmBytes from '../wasm/vaultcrdt_wasm_bg.wasm';
 import initWasmModule, {
   WasmSyncDocument,
 } from '../wasm/vaultcrdt_wasm';
@@ -9,10 +6,15 @@ export type { WasmSyncDocument };
 
 let initialized = false;
 
-/** Initialize the WASM module once. Safe to call multiple times. */
-export async function initWasm(): Promise<void> {
+/**
+ * Initialize the WASM module once. Safe to call multiple times.
+ * The bytes come from the caller (the plugin reads the sibling
+ * `vaultcrdt_wasm_bg.wasm` next to main.js); a failing loader leaves the
+ * guard unset so a later call can retry.
+ */
+export async function initWasm(loadBytes: () => Promise<Uint8Array>): Promise<void> {
   if (initialized) return;
-  await initWasmModule({ module_or_path: wasmBytes });
+  await initWasmModule({ module_or_path: await loadBytes() });
   initialized = true;
 }
 

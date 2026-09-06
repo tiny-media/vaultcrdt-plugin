@@ -330,7 +330,7 @@ function __wbg_get_imports() {
             const ret = getObject(arg0).node;
             return addHeapObject(ret);
         },
-        __wbg_now_28420cb976f1adde: function() {
+        __wbg_now_7f0591f86a6a4ead: function() {
             const ret = Date.now();
             return ret;
         },

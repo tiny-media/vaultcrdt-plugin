@@ -9,7 +9,7 @@ import { parseSetupParams } from './setup-link';
 import { InviteModal } from './invite-modal';
 import { ReplaceConnectionModal } from './replace-connection-modal';
 import { resetConnectionState } from './settings';
-import { SETUP_COPY } from './user-facing-copy';
+import { SETUP_COPY, WASM_MISSING_NOTICE } from './user-facing-copy';
 import { Modal } from 'obsidian';
 import { log, error, redact, setSecretProvider, getRecentIssues } from './logger';
 import { ServerFeatureCache, FEATURE_INVITE, FEATURE_BLOBS } from './server-features';
@@ -354,7 +354,18 @@ export default class VaultCRDTPlugin extends Plugin {
         // Lazy-initialize WASM + sync engine after editor is ready
         // (non-blocking). The WASM module must be ready before the
         // SyncEngine constructor touches any Loro bindings.
-        await initWasm();
+        await initWasm(async () => {
+          try {
+            return new Uint8Array(
+              await this.app.vault.adapter.readBinary(
+                this.manifest.dir + '/vaultcrdt_wasm_bg.wasm',
+              ),
+            );
+          } catch (err) {
+            new Notice(WASM_MISSING_NOTICE, 0);
+            throw err;
+          }
+        });
         this.buildAndWireSyncEngine();
         this.pendingSyncEngineInit = null;
 

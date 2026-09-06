@@ -6,6 +6,8 @@ thoughts/shared/
 **/.DS_Store
 **/._*
 /main.js
+# build output: wasm copied next to main.js (source of truth is wasm/)
+/vaultcrdt_wasm_bg.wasm
 
 # internal — never tracked in the public repo
 /_archive/

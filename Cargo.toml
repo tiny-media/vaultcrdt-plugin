@@ -21,7 +21,7 @@ strip = true
 
 [workspace.dependencies]
 # CRDT
-loro = "=1.13.9"
+loro = "=1.16.0"
 
 # Hashing
 blake3 = "1"

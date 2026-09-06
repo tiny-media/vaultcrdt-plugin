@@ -80,3 +80,4 @@ jobs:
             main.js
             manifest.json
             styles.css
+            vaultcrdt_wasm_bg.wasm
