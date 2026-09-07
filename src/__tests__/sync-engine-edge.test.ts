@@ -203,10 +203,13 @@ describe('SyncEngine — edge cases (S34)', () => {
     const syncPromise = engine.initialSync();
     await flush();
 
-    fireMessage({ type: 'doc_list', docs: [], tombstones: [] });
+    fireMessage({
+      type: 'doc_list',
+      docs: [{ doc_uuid: 'offline-del.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' }],
+      tombstones: [],
+    });
     await syncPromise;
 
-    // Now doc_delete should have been sent
     const deleteCallsAfter = mockEncode.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'offline-del.md'
     );
@@ -319,10 +322,13 @@ describe('SyncEngine — edge cases (S34)', () => {
 
     const syncPromise = engine.initialSync();
     await flush();
-    fireMessage({ type: 'doc_list', docs: [], tombstones: [] });
+    fireMessage({
+      type: 'doc_list',
+      docs: [{ doc_uuid: 'old.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' }],
+      tombstones: [],
+    });
     await syncPromise;
 
-    // doc_delete for old path should have been flushed
     const deleteCalls = mockEncode.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'old.md'
     );
@@ -446,10 +452,16 @@ describe('SyncEngine — edge cases (S34)', () => {
 
     const syncPromise = engine.initialSync();
     await flush();
-    fireMessage({ type: 'doc_list', docs: [], tombstones: [] });
+    fireMessage({
+      type: 'doc_list',
+      docs: [
+        { doc_uuid: 'x.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' },
+        { doc_uuid: 'y.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' },
+      ],
+      tombstones: [],
+    });
     await syncPromise;
 
-    // Both deletes flushed
     const deleteCalls = mockEncode.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'doc_delete'
     );
@@ -516,7 +528,7 @@ describe('SyncEngine — edge cases (S34)', () => {
     });
     await syncPromise;
 
-    // The flush already sent a doc_delete for ghost.md before requestDocList.
+    // Unacked ghost path is still live → resend after request_doc_list, not before.
     const deleteCalls = mockEncode.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'ghost.md',
     );
@@ -554,9 +566,9 @@ describe('SyncEngine — edge cases (S34)', () => {
     expect(lastPayload).toContain('online-del.md');
   });
 
-  // ── delete-ack hardening: resend before request_doc_list on reconnect ──────
+  // ── delete-ack hardening: resend after request_doc_list on reconnect ──────
 
-  it('reconnect resends pending deletes BEFORE request_doc_list', async () => {
+  it('reconnect resends pending deletes AFTER request_doc_list', async () => {
     mockAdapter.exists.mockImplementation(async (p: string) =>
       p.endsWith('delete-journal.json'),
     );
@@ -573,17 +585,19 @@ describe('SyncEngine — edge cases (S34)', () => {
     mockVault.getMarkdownFiles.mockReturnValue([]);
     const syncPromise = engine.initialSync();
     await flush();
+    fireMessage({
+      type: 'doc_list',
+      docs: [{ doc_uuid: 'resent.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' }],
+      tombstones: [],
+    });
+    await syncPromise;
 
-    // Capture index of doc_delete vs request_doc_list in the encode call log
     const sentTypes = mockEncode.mock.calls.map((c: any[]) => c[0]?.type);
     const deleteIdx = sentTypes.indexOf('doc_delete');
     const listIdx = sentTypes.indexOf('request_doc_list');
     expect(deleteIdx).toBeGreaterThanOrEqual(0);
     expect(listIdx).toBeGreaterThanOrEqual(0);
-    expect(deleteIdx).toBeLessThan(listIdx);
-
-    fireMessage({ type: 'doc_list', docs: [], tombstones: ['resent.md'] });
-    await syncPromise;
+    expect(listIdx).toBeLessThan(deleteIdx);
   });
 
   // ── delete-ack hardening: tombstone → clear ────────────────────────────────
@@ -616,6 +630,10 @@ describe('SyncEngine — edge cases (S34)', () => {
     expect(journalWrites.length).toBeGreaterThanOrEqual(1);
     const lastPayload = journalWrites[journalWrites.length - 1][1];
     expect(lastPayload).not.toContain('tombs.md');
+    const deleteCalls = mockEncode.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'tombs.md',
+    );
+    expect(deleteCalls.length).toBe(0);
   });
 
   // ── delete-ack hardening: active on server → stays pending, not downloaded
@@ -697,6 +715,89 @@ describe('SyncEngine — edge cases (S34)', () => {
     expect(journalWrites.length).toBeGreaterThanOrEqual(1);
     const lastPayload = journalWrites[journalWrites.length - 1][1];
     expect(lastPayload).not.toContain('gc.md');
+  });
+
+  it('reconnect resends only the unacked delete when the journal mixes acked and unacked', async () => {
+    mockAdapter.exists.mockImplementation(async (p: string) =>
+      p.endsWith('delete-journal.json'),
+    );
+    mockAdapter.read.mockImplementation(async (p: string) => {
+      if (p.endsWith('delete-journal.json')) {
+        return JSON.stringify({
+          _version: 2,
+          entries: [
+            { path: 'acked.md', acked: true },
+            { path: 'unacked.md', acked: false },
+          ],
+        });
+      }
+      return '';
+    });
+
+    engine = new SyncEngine(makeApp(), makeSettings());
+    await engine.start();
+
+    mockVault.getMarkdownFiles.mockReturnValue([]);
+    const syncPromise = engine.initialSync();
+    await flush();
+    fireMessage({
+      type: 'doc_list',
+      docs: [
+        { doc_uuid: 'acked.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' },
+        { doc_uuid: 'unacked.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' },
+      ],
+      tombstones: [],
+    });
+    await flush();
+    fireMessage({ type: 'doc_unknown', doc_uuid: 'acked.md' });
+    await syncPromise;
+
+    const deleteUuids = mockEncode.mock.calls
+      .filter((c: any[]) => c[0]?.type === 'doc_delete')
+      .map((c: any[]) => c[0]?.doc_uuid);
+    expect(deleteUuids).toEqual(['unacked.md']);
+  });
+
+  it('acked delete for a resurrected live doc is dropped and not resent', async () => {
+    mockAdapter.exists.mockImplementation(async (p: string) =>
+      p.endsWith('delete-journal.json'),
+    );
+    mockAdapter.read.mockImplementation(async (p: string) => {
+      if (p.endsWith('delete-journal.json')) {
+        return JSON.stringify({
+          _version: 2,
+          entries: [{ path: 'back.md', acked: true }],
+        });
+      }
+      return '';
+    });
+
+    engine = new SyncEngine(makeApp(), makeSettings());
+    await engine.start();
+
+    mockAdapter.write.mockClear();
+    mockVault.getMarkdownFiles.mockReturnValue([]);
+    const syncPromise = engine.initialSync();
+    await flush();
+    fireMessage({
+      type: 'doc_list',
+      docs: [{ doc_uuid: 'back.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' }],
+      tombstones: [],
+    });
+    await flush();
+    fireMessage({ type: 'doc_unknown', doc_uuid: 'back.md' });
+    await syncPromise;
+
+    const deleteCalls = mockEncode.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'back.md',
+    );
+    expect(deleteCalls.length).toBe(0);
+    const journalWrites = mockAdapter.write.mock.calls.filter(
+      (c: any[]) => typeof c[0] === 'string' && c[0].endsWith('delete-journal.json'),
+    );
+    expect(journalWrites.length).toBeGreaterThanOrEqual(1);
+    const lastPayload = journalWrites[journalWrites.length - 1][1];
+    expect(lastPayload).not.toContain('back.md');
   });
 
   // ── disjoint VV conflict after offline edit on both sides ─────────────────

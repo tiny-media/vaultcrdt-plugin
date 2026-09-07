@@ -128,20 +128,12 @@ export async function runInitialSync(
     localFileMap.set(file.path, file);
   }
 
-  // Snapshot the delete-journal BEFORE any reconcile — downstream filtering
-  // uses this stable snapshot so that even if reconcilePendingDeletes() clears
-  // an entry, we still don't re-download the path in this same run.
-  //
-  // Then resend all pending deletes (idempotent; reconcile-based semantics:
-  // the journal is an intent list and only shrinks once the server's
-  // doc_list view has confirmed the outcome — see reconcilePendingDeletes()).
-  // WS FIFO per connection guarantees the server processes the resends
-  // before answering the subsequent request_doc_list.
-  const pendingDeleteSet = new Set(push.pendingDeletePaths());
+  // Recreate snapshot BEFORE reconcile: U37 paths (pending delete + local file)
+  // must still run the recreate pass even if reconcile drops the journal entry
+  // because the server already shows a tombstone.
   const recreatePathSet = new Set(
-    [...pendingDeleteSet].filter((path) => localFileMap.has(path)),
+    push.pendingDeletePaths().filter((path) => localFileMap.has(path)),
   );
-  push.resendPendingDeletes(recreatePathSet);
 
   let tPhase = performance.now();
   const { docs: serverDocs, tombstones, tombstone_hashes } = await deps.requestDocList();
@@ -149,7 +141,11 @@ export async function runInitialSync(
   const tombstoneSet = new Set(tombstones);
   const localPathSet = new Set(localFileMap.keys());
   const serverUuidSet = new Set(serverDocs.map((d) => d.doc_uuid));
+  // Reconcile first so already-tombstoned / resurrected (acked + live) entries
+  // never generate a doc_delete replay. Then resend only what remains unacked.
   push.reconcilePendingDeletes(tombstoneSet, serverUuidSet);
+  push.resendPendingDeletes(recreatePathSet);
+  const pendingDeleteSet = new Set(push.pendingDeletePaths());
 
   // Decode server VVs from binary to JSON strings for comparison
   const serverVVStrings = new Map<string, string>();
@@ -184,8 +180,7 @@ export async function runInitialSync(
 
   // 1. Server-only docs — request delta (no local VV).
   // isSyncablePath() filters untrusted server entries (`.obsidian/*`, etc).
-  // pendingDeleteSet prevents resurrection of locally-deleted paths even if
-  // the server hasn't yet processed our just-flushed delete message.
+  // pendingDeleteSet is the post-reconcile remainder (unacked deletes we will resend).
   const serverOnlyUuids = [...serverDocMap.keys()].filter(
     (uuid) =>
       !tombstoneSet.has(uuid) &&
@@ -197,13 +192,15 @@ export async function runInitialSync(
     (f) =>
       !tombstoneSet.has(f.path) &&
       !pendingDeleteSet.has(f.path) &&
+      !recreatePathSet.has(f.path) &&
       serverDocMap.has(f.path),
   );
-  const recreateFiles = localFiles.filter((f) => pendingDeleteSet.has(f.path));
+  const recreateFiles = localFiles.filter((f) => recreatePathSet.has(f.path));
   const localOnlyFiles = localFiles.filter(
     (f) =>
       !tombstoneSet.has(f.path) &&
       !pendingDeleteSet.has(f.path) &&
+      !recreatePathSet.has(f.path) &&
       !serverDocMap.has(f.path),
   );
   deps.trace('initial-sync.partition', {
@@ -564,7 +561,7 @@ export async function runInitialSync(
 
   const localOnlyMs = performance.now() - tPhase;
 
-  // 5. Offline deletes were already flushed above, before any downloads.
+  // 5. Unacked offline deletes were resent above, after reconcile.
 
   // 6. Tombstones — trash local files (skip if server also has the doc — create-after-delete)
   // Keep-guard (T2): do not trash when local edits cannot be proven clean.
@@ -589,9 +586,9 @@ export async function runInitialSync(
     if (push.hasPendingEdits(uuid) || push.hasUnackedEdit(uuid)) {
       keep = true;
     } else {
-      // Deviation 2: content proof reads DISK content via
-      // readEffectiveLocalContent (same helper as steps 3/4), not just an
-      // open editor — stronger than the live guard.
+      // Deviation 2 (shared with the live guard in SyncEngine.onDocDeleted):
+      // content proof reads editor text if a leaf is open, otherwise DISK via
+      // readEffectiveLocalContent (same helper as steps 3/4).
       const localContent = await readEffectiveLocalContent(app, editor, f);
       const persisted = await docs.loadPersistedSnapshot(uuid);
       if (persisted !== null) {

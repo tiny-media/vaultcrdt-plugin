@@ -130,7 +130,7 @@ vi.stubGlobal('WebSocket', MockWebSocket);
 
 import { SyncEngine } from '../sync-engine';
 import { fnv1aHash64 } from '../conflict-utils';
-import { remoteDeleteTrashedNoticeMessage } from '../user-facing-copy';
+import { remoteDeleteTrashedNoticeMessage, remoteDeleteKeptNoticeMessage } from '../user-facing-copy';
 import { TFile } from 'obsidian';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -3590,6 +3590,75 @@ describe('SyncEngine', () => {
         path: 'gone.md',
         note: remoteDeleteTrashedNoticeMessage('gone.md'),
       }));
+    });
+
+    it('keeps the file when no editor is open and disk content differs from CRDT', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'kept.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('external disk edit');
+      mockDocInstance.text_matches.mockImplementation((content: string) => content !== 'external disk edit');
+      await engine.start();
+      await (engine as any).docs.getOrLoad('kept.md');
+      const add = vi.fn();
+      engine.inbox = { add };
+
+      fireMessage({ type: 'doc_deleted', doc_uuid: 'kept.md' });
+      await flush();
+
+      expect(mockFileManager.trashFile).not.toHaveBeenCalled();
+      expect(mockVault.read).toHaveBeenCalledWith(mockFile);
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'kept.md',
+        note: remoteDeleteKeptNoticeMessage('kept.md'),
+      }));
+      expect((engine as any).push.hasPendingDelete('kept.md')).toBe(true);
+    });
+
+    it('trashes when no editor is open and disk content equals CRDT text', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'gone.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('same as crdt');
+      mockDocInstance.text_matches.mockReturnValue(true);
+      await engine.start();
+      await (engine as any).docs.getOrLoad('gone.md');
+
+      fireMessage({ type: 'doc_deleted', doc_uuid: 'gone.md' });
+      await flush();
+
+      expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
+    });
+
+    it('keeps unsaved editor changes even when disk would match CRDT', async () => {
+      const mockEditor = {
+        getValue: vi.fn().mockReturnValue('unsaved editor text'),
+        setValue: vi.fn(),
+        getCursor: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        setCursor: vi.fn(),
+        lastLine: vi.fn().mockReturnValue(0),
+        getLine: vi.fn().mockReturnValue(''),
+        offsetToPos: vi.fn().mockReturnValue({ line: 0, ch: 0 }),
+        transaction: vi.fn(),
+      };
+      const leaf = {
+        view: Object.assign(Object.create(MockMarkdownView.prototype), {
+          file: { path: 'kept.md' },
+          editor: mockEditor,
+        }),
+      };
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'kept.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('disk matches crdt');
+      mockDocInstance.text_matches.mockImplementation((content: string) => content !== 'unsaved editor text');
+      engine = new SyncEngine(makeApp([leaf]), makeSettings());
+      await engine.start();
+      await (engine as any).docs.getOrLoad('kept.md');
+
+      fireMessage({ type: 'doc_deleted', doc_uuid: 'kept.md' });
+      await flush();
+
+      expect(mockFileManager.trashFile).not.toHaveBeenCalled();
+      expect(mockVault.read).not.toHaveBeenCalled();
     });
   });
 

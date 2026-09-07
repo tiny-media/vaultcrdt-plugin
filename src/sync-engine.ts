@@ -1066,9 +1066,26 @@ export class SyncEngine {
     const doc = this.docs.get(docUuid);
     const editorContent = this.editor.readCurrentContent(docUuid);
     const unackedKeep = this.push.hasUnackedEdit(docUuid);
+    // Keep-guard matches initial-sync Deviation 2 (sync-initial.ts): do not trash
+    // when local content cannot be proven clean. Editor text wins when a leaf is
+    // open; otherwise, with an in-memory CRDT, read disk (TFile via
+    // getAbstractFileByPath → vault.read) so an unwatched external/doze edit is
+    // not discarded when a remote tombstone arrives.
+    let contentDiverged = false;
+    if (doc !== undefined) {
+      if (editorContent !== null) {
+        contentDiverged = !doc.text_matches(editorContent);
+      } else {
+        const diskFile = this.app.vault.getAbstractFileByPath(docUuid);
+        if (diskFile instanceof TFile) {
+          const diskContent = await this.app.vault.read(diskFile);
+          contentDiverged = !doc.text_matches(diskContent);
+        }
+      }
+    }
     if (this.push.hasPendingEdits(docUuid) ||
         unackedKeep ||
-        (doc !== undefined && editorContent !== null && !doc.text_matches(editorContent))) {
+        contentDiverged) {
       this.forgetStartupPath(docUuid);
       this.inbox?.add({ kind: 'deleted-remote', path: docUuid, note: remoteDeleteKeptNoticeMessage(docUuid) });
       await this.docs.removeAndClean(docUuid);
@@ -1078,6 +1095,7 @@ export class SyncEngine {
       this.trace.markPath('delete.kept-local-edits', docUuid, unackedKeep ? { unacked: true } : undefined);
       return;
     }
+    this.push.ackPendingDelete(docUuid);
     this.forgetStartupPath(docUuid);
     await this.docs.removeAndClean(docUuid);
     this.lastServerVV.delete(docUuid);

@@ -1263,4 +1263,78 @@ describe('long-divergence (real CRDT)', () => {
     expect(c.fs.readText(path)).toBe(serverPayload);
     expect(c.inbox.filter((e) => e.kind === 'conflict').length).toBeGreaterThanOrEqual(1);
   }, 60_000);
+
+  it('live keep-guard: unwatched disk divergence is kept when no editor is open', async () => {
+    const path = notePath(7);
+    const a = createHarness('peer-A');
+    const b = createHarness('peer-B');
+    a.fs.writeText(path, seedText(7));
+    await startEngine(a);
+    await startEngine(b);
+    await untilQuiet();
+    b.fs.writeText(path, `${seedText(7)}\nB_DISK_ONLY`);
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    expect(b.fs.has(path), 'disk-diverged file must be kept').toBe(true);
+    expect(b.inbox.some((e) => e.kind === 'deleted-remote' && e.path === path)).toBe(true);
+  }, 60_000);
+
+  it('live keep-guard: disk equal to CRDT is trashed when no editor is open', async () => {
+    const path = notePath(8);
+    const a = createHarness('peer-A');
+    const b = createHarness('peer-B');
+    a.fs.writeText(path, seedText(8));
+    await startEngine(a);
+    await startEngine(b);
+    await untilQuiet();
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    expect(b.fs.has(path), 'unmodified file must be trashed').toBe(false);
+  }, 60_000);
+
+  it('reconnect does not resend a delete whose tombstone is already on the server', async () => {
+    const path = notePath(9);
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, seedText(9));
+    await startEngine(a);
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    expect(activeServer!.tombstones.has(path)).toBe(true);
+    activeServer!.checkpoint();
+    await a.engine.stop();
+    await startEngine(a);
+    const deletes = activeServer!.mutatingSinceCheckpoint().filter(
+      (m) => m.type === 'doc_delete' && m.docUuid === path,
+    );
+    expect(deletes, `unexpected doc_delete frames: ${JSON.stringify(deletes)}`).toEqual([]);
+  }, 60_000);
+
+  it('reconnect does not replay delete after a peer replaceTombstone resurrection', async () => {
+    const path = notePath(6);
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, seedText(6));
+    await startEngine(a);
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    await a.engine.stop();
+
+    const bLocal = new MemoryFS();
+    bLocal.writeText(path, `${seedText(6)}\nB_RESURRECT`);
+    const b = createHarness('peer-B', bLocal);
+    await startEngine(b);
+    await untilQuiet();
+    expect(activeServer!.docs.has(path), 'B should have resurrected the doc').toBe(true);
+
+    activeServer!.checkpoint();
+    await startEngine(a);
+    const deletes = activeServer!.mutatingSinceCheckpoint().filter(
+      (m) => m.type === 'doc_delete' && m.docUuid === path,
+    );
+    expect(deletes, `unexpected doc_delete frames: ${JSON.stringify(deletes)}`).toEqual([]);
+    expect(activeServer!.docs.has(path)).toBe(true);
+  }, 60_000);
 });

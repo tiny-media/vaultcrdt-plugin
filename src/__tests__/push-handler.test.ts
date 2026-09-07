@@ -240,10 +240,10 @@ describe('PushHandler persistJournal serialization', () => {
     let call = 0;
 
     const docs = {
-      saveDeleteJournal: vi.fn(async (paths: string[]) => {
+      saveDeleteJournal: vi.fn(async (entries: { path: string; acked: boolean }[]) => {
         call++;
         if (call === 1) await firstGate;
-        writes.push([...paths]);
+        writes.push(entries.map((e) => e.path));
       }),
       loadDeleteJournal: vi.fn().mockResolvedValue([]),
       movePath: vi.fn(),
@@ -356,5 +356,60 @@ describe('PushHandler excalidraw concurrent hold', () => {
     await vi.waitFor(() => expect(stubDoc.sync_from_disk).toHaveBeenCalled());
     expect(handler).not.toHaveBeenCalled();
     expect(stubDoc.sync_from_disk).toHaveBeenCalledWith('local');
+  });
+});
+
+describe('PushHandler delete journal ack and resend', () => {
+  function makePush(sendMock = vi.fn()) {
+    const docs = {
+      saveDeleteJournal: vi.fn().mockResolvedValue(undefined),
+      loadDeleteJournal: vi.fn().mockResolvedValue([]),
+      movePath: vi.fn(),
+      getOrLoad: vi.fn(),
+      persist: vi.fn(),
+      removeAndClean: vi.fn().mockResolvedValue(undefined),
+    };
+    const push = new PushHandler(
+      docs as any,
+      { readCurrentContent: () => null } as any,
+      sendMock,
+      { peerId: 'p', debounceMs: 0 } as any,
+      new Map(),
+      new Map(),
+      vi.fn(),
+      () => true,
+      '[test]',
+      vi.fn(),
+    );
+    return { push, sendMock, docs };
+  }
+
+  it('resendPendingDeletes sends only unacked entries', () => {
+    const { push, sendMock } = makePush();
+    (push as any).pendingDeletes.set('acked.md', { acked: true });
+    (push as any).pendingDeletes.set('unacked.md', { acked: false });
+    push.resendPendingDeletes();
+    const deletes = sendMock.mock.calls.filter((c) => c[0]?.type === 'doc_delete');
+    expect(deletes.map((c) => c[0].doc_uuid)).toEqual(['unacked.md']);
+  });
+
+  it('ackPendingDelete marks the journal entry acked', async () => {
+    const { push, docs } = makePush();
+    push.onFileDeleted('gone.md');
+    expect((push as any).pendingDeletes.get('gone.md')?.acked).toBe(true);
+    (push as any).pendingDeletes.set('gone.md', { acked: false });
+    push.ackPendingDelete('gone.md');
+    expect((push as any).pendingDeletes.get('gone.md')?.acked).toBe(true);
+    await vi.waitFor(() => expect(docs.saveDeleteJournal).toHaveBeenCalled());
+    const last = docs.saveDeleteJournal.mock.calls.at(-1)![0];
+    expect(last).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'gone.md', acked: true })]));
+  });
+
+  it('reconcile drops acked live paths (resurrected) and keeps unacked live paths', () => {
+    const { push } = makePush();
+    (push as any).pendingDeletes.set('acked.md', { acked: true });
+    (push as any).pendingDeletes.set('unacked.md', { acked: false });
+    push.reconcilePendingDeletes(new Set(), new Set(['acked.md', 'unacked.md']));
+    expect(push.pendingDeletePaths()).toEqual(['unacked.md']);
   });
 });

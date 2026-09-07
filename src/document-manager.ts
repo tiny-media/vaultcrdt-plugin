@@ -1,6 +1,6 @@
 import { App } from 'obsidian';
 import { createDocument, type WasmSyncDocument } from './wasm-bridge';
-import { StateStorage, type VVCacheEntry } from './state-storage';
+import { StateStorage, type VVCacheEntry, type DeleteJournalEntry } from './state-storage';
 import { error } from './logger';
 
 export class DocumentManager {
@@ -120,11 +120,11 @@ export class DocumentManager {
     return this.storage.loadVVCache();
   }
 
-  async saveDeleteJournal(paths: string[]): Promise<void> {
-    return this.storage.saveDeleteJournal(paths);
+  async saveDeleteJournal(entries: DeleteJournalEntry[]): Promise<void> {
+    return this.storage.saveDeleteJournal(entries);
   }
 
-  async loadDeleteJournal(): Promise<string[]> {
+  async loadDeleteJournal(): Promise<DeleteJournalEntry[]> {
     return this.storage.loadDeleteJournal();
   }
 }

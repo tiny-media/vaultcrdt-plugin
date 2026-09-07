@@ -174,4 +174,41 @@ describe('StateStorage', () => {
       expect.any(String),
     );
   });
+
+  it('saveDeleteJournal writes v2 entries with acked flags', async () => {
+    await storage.saveDeleteJournal([
+      { path: 'a.md', acked: false },
+      { path: 'b.md', acked: true },
+    ]);
+    const raw = await adapter.read('.obsidian/plugins/vaultcrdt/state/delete-journal.json');
+    expect(JSON.parse(raw)).toEqual({
+      _version: 2,
+      entries: [
+        { path: 'a.md', acked: false },
+        { path: 'b.md', acked: true },
+      ],
+    });
+  });
+
+  it('loadDeleteJournal reads v2 entries', async () => {
+    adapter.write.mockImplementation(async () => {});
+    const textFiles = (adapter as any)._textFiles as Map<string, string>;
+    textFiles.set(
+      '.obsidian/plugins/vaultcrdt/state/delete-journal.json',
+      JSON.stringify({
+        _version: 2,
+        entries: [{ path: 'kept.md', acked: true }],
+      }),
+    );
+    expect(await storage.loadDeleteJournal()).toEqual([{ path: 'kept.md', acked: true }]);
+  });
+
+  it('loadDeleteJournal treats v1 paths as unacked', async () => {
+    const textFiles = (adapter as any)._textFiles as Map<string, string>;
+    textFiles.set(
+      '.obsidian/plugins/vaultcrdt/state/delete-journal.json',
+      JSON.stringify({ _version: 1, paths: ['old.md'] }),
+    );
+    expect(await storage.loadDeleteJournal()).toEqual([{ path: 'old.md', acked: false }]);
+  });
 });

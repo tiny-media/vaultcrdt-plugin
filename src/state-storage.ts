@@ -8,6 +8,12 @@ export interface VVCacheEntry {
   contentHash: string;
 }
 
+/** One delete-journal entry. `acked` means we already emitted `doc_delete` (or saw confirmation); reconnects must not resend it. */
+export interface DeleteJournalEntry {
+  path: string;
+  acked: boolean;
+}
+
 /**
  * Persists CRDT snapshots as `.loro` files under `.obsidian/plugins/vaultcrdt/state/`.
  * One file per vault document — URI-encoded path ensures collision-free keys.
@@ -239,10 +245,11 @@ export class StateStorage {
   private deleteJournalPath = `${STATE_DIR}/delete-journal.json`;
 
   /**
-   * Persist the set of paths that have an outstanding (unsent or unacknowledged)
-   * delete intent. Survives plugin restart so offline deletes cannot be lost.
+   * Persist outstanding delete intents. Survives plugin restart so offline
+   * (unacked) deletes cannot be lost. Version 2 stores `{ path, acked }` so
+   * reconnects can resend only unacked entries.
    */
-  async saveDeleteJournal(paths: string[]): Promise<void> {
+  async saveDeleteJournal(entries: DeleteJournalEntry[]): Promise<void> {
     const adapter = this.app.vault.adapter;
     if (!this.dirEnsured) {
       const dirExists = await adapter.exists(STATE_DIR);
@@ -251,20 +258,34 @@ export class StateStorage {
     }
     await adapter.write(
       this.deleteJournalPath,
-      JSON.stringify({ _version: 1, paths }),
+      JSON.stringify({ _version: 2, entries }),
     );
   }
 
-  /** Load the offline delete journal. Returns [] if the file doesn't exist. */
-  async loadDeleteJournal(): Promise<string[]> {
+  /** Load the delete journal. v1 `{ paths }` is treated as all-unacked. */
+  async loadDeleteJournal(): Promise<DeleteJournalEntry[]> {
     const adapter = this.app.vault.adapter;
     try {
       const exists = await adapter.exists(this.deleteJournalPath);
       if (!exists) return [];
       const raw = await adapter.read(this.deleteJournalPath);
-      const obj = JSON.parse(raw) as { paths?: unknown };
-      if (!Array.isArray(obj.paths)) return [];
-      return obj.paths.filter((p): p is string => typeof p === 'string');
+      const obj = JSON.parse(raw) as { paths?: unknown; entries?: unknown };
+      if (Array.isArray(obj.entries)) {
+        const loaded: DeleteJournalEntry[] = [];
+        for (const item of obj.entries) {
+          if (item === null || typeof item !== 'object') continue;
+          const rec = item as { path?: unknown; acked?: unknown };
+          if (typeof rec.path !== 'string') continue;
+          loaded.push({ path: rec.path, acked: rec.acked === true });
+        }
+        return loaded;
+      }
+      if (Array.isArray(obj.paths)) {
+        return obj.paths
+          .filter((p): p is string => typeof p === 'string')
+          .map((path) => ({ path, acked: false }));
+      }
+      return [];
     } catch {
       return [];
     }
