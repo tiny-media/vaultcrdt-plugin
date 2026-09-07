@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-09-07
+
+### Added
+
+- Attachment sync, end to end. Images, PDFs and audio recordings
+  (including Android recorder formats) upload to the server's blob
+  store and download to other devices: desktop hydrates eagerly, mobile
+  hydrates lazily from the embeds of the opened note. Downloads verify
+  the content hash before writing; a failed write rolls the index back
+  so the next sync retries.
+- Attachments that already exist on disk before the plugin starts are
+  picked up by a backfill sweep after the initial sync instead of
+  being silently skipped.
+- Renames move the server-side path state without re-uploading
+  content (a case-only rename updates the display name only). Deleting
+  an attachment posts a tombstone; a remotely deleted attachment that
+  was modified locally is kept and republished instead of trashed,
+  with a review-inbox notice either way.
+- Vault storage quotas surface as one throttled notice and pause
+  uploads for a minute instead of retrying into the same rejection.
+
 ## [0.5.3] - 2026-09-07
 
 ### Fixed
