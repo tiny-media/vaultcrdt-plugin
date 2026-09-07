@@ -3567,8 +3567,10 @@ describe('SyncEngine', () => {
     it('trashes local file on doc_deleted message', async () => {
       const mockFile = Object.create(TFile.prototype);
       mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.text_matches.mockReturnValue(true);
 
       await engine.start();
+      await (engine as any).docs.getOrLoad('gone.md');
 
       fireMessage({ type: 'doc_deleted', doc_uuid: 'gone.md' });
       await flush();
@@ -3579,7 +3581,9 @@ describe('SyncEngine', () => {
     it('adds a deleted-remote inbox entry when a remote delete trashes the local file', async () => {
       const mockFile = Object.create(TFile.prototype);
       mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockDocInstance.text_matches.mockReturnValue(true);
       await engine.start();
+      await (engine as any).docs.getOrLoad('gone.md');
       const add = vi.fn();
       engine.inbox = { add };
       fireMessage({ type: 'doc_deleted', doc_uuid: 'gone.md' });
@@ -3659,6 +3663,80 @@ describe('SyncEngine', () => {
 
       expect(mockFileManager.trashFile).not.toHaveBeenCalled();
       expect(mockVault.read).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('doc_deleted keep-guard — non-resident docs', () => {
+    it('keeps when unloaded and the persisted snapshot diverges from disk', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'kept.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('offline edited content');
+      mockDocInstance.text_matches.mockImplementation((content: string) => content !== 'offline edited content');
+      await engine.start();
+      const docs = (engine as any).docs;
+      vi.spyOn(docs, 'get').mockReturnValue(undefined);
+      vi.spyOn(docs, 'loadPersistedSnapshot').mockResolvedValue(new Uint8Array([1, 2, 3]));
+      const getOrLoad = vi.spyOn(docs, 'getOrLoad').mockResolvedValue(mockDocInstance);
+      const add = vi.fn();
+      engine.inbox = { add };
+
+      await (engine as any).onDocDeleted('kept.md');
+
+      expect(getOrLoad).toHaveBeenCalledWith('kept.md');
+      expect(mockVault.read).toHaveBeenCalledWith(mockFile);
+      expect(mockFileManager.trashFile).not.toHaveBeenCalled();
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'kept.md',
+        note: remoteDeleteKeptNoticeMessage('kept.md'),
+      }));
+    });
+
+    it('trashes when unloaded and the persisted snapshot matches disk', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'gone.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('same as snapshot');
+      mockDocInstance.text_matches.mockReturnValue(true);
+      await engine.start();
+      const docs = (engine as any).docs;
+      vi.spyOn(docs, 'get').mockReturnValue(undefined);
+      vi.spyOn(docs, 'loadPersistedSnapshot').mockResolvedValue(new Uint8Array([1, 2, 3]));
+      const getOrLoad = vi.spyOn(docs, 'getOrLoad').mockResolvedValue(mockDocInstance);
+      const add = vi.fn();
+      engine.inbox = { add };
+
+      await (engine as any).onDocDeleted('gone.md');
+
+      expect(getOrLoad).toHaveBeenCalledWith('gone.md');
+      expect(mockVault.read).toHaveBeenCalledWith(mockFile);
+      expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'gone.md',
+        note: remoteDeleteTrashedNoticeMessage('gone.md'),
+      }));
+    });
+
+    it('keeps when unloaded, no persisted snapshot, and the file still exists', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'kept.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      await engine.start();
+      const docs = (engine as any).docs;
+      vi.spyOn(docs, 'get').mockReturnValue(undefined);
+      vi.spyOn(docs, 'loadPersistedSnapshot').mockResolvedValue(null);
+      const getOrLoad = vi.spyOn(docs, 'getOrLoad');
+      const add = vi.fn();
+      engine.inbox = { add };
+
+      await (engine as any).onDocDeleted('kept.md');
+
+      expect(getOrLoad).not.toHaveBeenCalled();
+      expect(mockFileManager.trashFile).not.toHaveBeenCalled();
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'kept.md',
+        note: remoteDeleteKeptNoticeMessage('kept.md'),
+      }));
     });
   });
 

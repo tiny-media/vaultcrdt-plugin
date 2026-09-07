@@ -113,7 +113,8 @@ describe('vault delete remote-write window', () => {
     const file = new TFile();
     const deleted = vi.spyOn(engine, 'onFileDeleted').mockImplementation(() => {});
     Object.assign((engine as any).docs, {
-      get: vi.fn(), removeAndClean: vi.fn().mockResolvedValue(undefined),
+      get: vi.fn().mockReturnValue({ text_matches: () => true }),
+      removeAndClean: vi.fn().mockResolvedValue(undefined),
       loadPersistedSnapshot: vi.fn().mockResolvedValue(null),
       saveVVCache: vi.fn().mockResolvedValue(undefined),
       cleanOrphans: vi.fn().mockResolvedValue(0),
@@ -151,7 +152,9 @@ describe('vault delete remote-write window', () => {
     const file = new TFile();
     engine.inbox = plugin.inbox;
     Object.assign((engine as any).docs, {
-      get: vi.fn(), removeAndClean: vi.fn().mockResolvedValue(undefined),
+      get: vi.fn().mockReturnValue({ text_matches: () => true }),
+      removeAndClean: vi.fn().mockResolvedValue(undefined),
+      loadPersistedSnapshot: vi.fn().mockResolvedValue(null),
       saveVVCache: vi.fn().mockResolvedValue(undefined),
       cleanOrphans: vi.fn().mockResolvedValue(0),
       saveDeleteJournal: vi.fn().mockResolvedValue(undefined),

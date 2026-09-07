@@ -1071,6 +1071,10 @@ export class SyncEngine {
     // open; otherwise, with an in-memory CRDT, read disk (TFile via
     // getAbstractFileByPath → vault.read) so an unwatched external/doze edit is
     // not discarded when a remote tombstone arrives.
+    // Non-resident docs (mobile unloads under memory pressure) must take the same
+    // proof path: loadPersistedSnapshot first — never getOrLoad on a missing
+    // snapshot (that mints an empty CRDT and looks falsely clean). Extra reads
+    // per tombstone are acceptable; deletes are rare.
     let contentDiverged = false;
     if (doc !== undefined) {
       if (editorContent !== null) {
@@ -1080,6 +1084,20 @@ export class SyncEngine {
         if (diskFile instanceof TFile) {
           const diskContent = await this.app.vault.read(diskFile);
           contentDiverged = !doc.text_matches(diskContent);
+        }
+      }
+    } else {
+      const persisted = await this.docs.loadPersistedSnapshot(docUuid);
+      if (persisted === null) {
+        // Live equivalent of step-6 Deviation 1: no snapshot means we cannot
+        // prove the file is unmodified, so KEEP.
+        contentDiverged = true;
+      } else {
+        const loaded = await this.docs.getOrLoad(docUuid);
+        const diskFile = this.app.vault.getAbstractFileByPath(docUuid);
+        if (diskFile instanceof TFile) {
+          const diskContent = await this.app.vault.read(diskFile);
+          contentDiverged = !loaded.text_matches(diskContent);
         }
       }
     }

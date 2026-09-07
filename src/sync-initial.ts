@@ -599,8 +599,8 @@ export async function runInitialSync(
         if (remoteHash == null) {
           // Fail-safe (T2): old server omits tombstone_hashes; pre-migration
           // tombstones send content_hash NULL. Stateless peers cannot prove
-          // unmodified, so KEEP. Deviation 1: the live guard trashes when
-          // doc is undefined; initial sync after divergence over-keeps.
+          // unmodified, so KEEP. Live equivalent: onDocDeleted KEEPs when the
+          // doc is not resident and loadPersistedSnapshot returns null.
           keep = true;
         } else {
           keep = fnv1aHash64(localContent) !== remoteHash;
