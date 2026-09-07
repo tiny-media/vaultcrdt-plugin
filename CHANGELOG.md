@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-09-08
+
+### Changed
+- The settings surface speaks plainly: three blocks (connection, sync,
+  about) plus a collapsed developer section. Sync delay is gone from the
+  interface; the edit debounce is a fixed constant.
+- The setup dialog leads with the invite link/QR (paste field included)
+  and keeps manual entry collapsed. The add-device dialog shows the
+  setup QR first and carries a short BRAT install help.
+- The developer section shows live data and real actions only:
+  attachment limits, diagnostics copy, peer/vault ids, full sync,
+  identity reset, and a folded storage view (local and server summary,
+  largest server documents). Synced devices moved into the connection
+  block.
+- README and guides rewritten for newcomers first (what it can and
+  cannot do, what you need) with a calm keyword overview for devs.
+
 ## [0.5.8] - 2026-09-08
 
 ### Fixed
