@@ -20,8 +20,8 @@ export interface BlobIndexEntry {
   seq: number;
   /** False when the server advertises content this device has not downloaded. */
   hydrated: boolean;
-  /** Hash last confirmed by the server for this path — echo suppression. */
-  lastRemoteHash: string;
+  /** Hash last confirmed by the server for this path — echo suppression. Null when never confirmed. */
+  lastRemoteHash: string | null;
   /** Set when the file exceeded the type cap and was never read. */
   skipped?: boolean;
 }
@@ -52,7 +52,9 @@ function parse(raw: unknown): BlobIndexFile {
       generation: typeof e.generation === 'number' ? e.generation : 0,
       seq: typeof e.seq === 'number' ? e.seq : 0,
       hydrated: e.hydrated !== false,
-      lastRemoteHash: typeof e.lastRemoteHash === 'string' ? e.lastRemoteHash : '',
+      lastRemoteHash: typeof e.lastRemoteHash === 'string'
+        ? e.lastRemoteHash
+        : e.lastRemoteHash === null ? null : '',
       ...(e.skipped ? { skipped: true } : {}),
     };
   }
@@ -83,6 +85,31 @@ export class BlobIndex {
   pathForKey(key: string): string | undefined {
     for (const [path, e] of Object.entries(this.file.paths)) if (e.key === key) return path;
     return undefined;
+  }
+
+  /** Snapshot of raw-path → entry. Index map keys are the vault path spelling. */
+  entries(): Array<[string, BlobIndexEntry]> {
+    return Object.entries(this.file.paths);
+  }
+
+  /** Move an entry to a new raw path (including case-only renames). */
+  move(oldPath: string, newPath: string): BlobIndexEntry | null {
+    if (oldPath === newPath) return this.file.paths[oldPath] ?? null;
+    const entry = this.file.paths[oldPath];
+    if (!entry) return null;
+    const key = this.keyFor(newPath);
+    if (!key) return null;
+    delete this.file.paths[oldPath];
+    const next: BlobIndexEntry = { ...entry, key };
+    this.file.paths[newPath] = next;
+    this.persist();
+    return next;
+  }
+
+  remove(path: string): void {
+    if (!(path in this.file.paths)) return;
+    delete this.file.paths[path];
+    this.persist();
   }
 
   /**

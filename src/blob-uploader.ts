@@ -3,7 +3,7 @@ import { blake3_hex } from '../wasm/vaultcrdt_wasm';
 import { attachmentCap } from './path-policy';
 import { toHttpBase } from './url-policy';
 import { log, error, warn } from './logger';
-import { attachmentTooLargeMessage, quotaExceededMessage } from './user-facing-copy';
+import { attachmentTooLargeMessage, quotaExceededMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage } from './user-facing-copy';
 import type { BlobIndex } from './blob-index';
 
 /** Debounce before hashing, so foreign writers (camera apps) can finish. */
@@ -36,15 +36,29 @@ export interface BlobUploaderDeps {
   now?: () => number;
   /** Injected wait — tests resolve immediately. */
   sleep?: (ms: number) => Promise<void>;
+  /** Desktop eager hydration after catch-up / wake-up. */
+  hydratePending?: () => Promise<void>;
+  /** Trash a vault file if present (remote tombstone). */
+  trashIfPresent?: (path: string) => Promise<void>;
 }
 
-interface HttpResult { status: number; json: Record<string, unknown> }
+export interface BlobHttpResult {
+  status: number;
+  json: Record<string, unknown>;
+  arrayBuffer: ArrayBuffer;
+  headers: Record<string, string>;
+}
+
+type HttpResult = BlobHttpResult;
 
 interface RemoteState {
   path_key?: unknown;
   state?: unknown;
   content_hash?: unknown;
   seq?: unknown;
+  display_path?: unknown;
+  size?: unknown;
+  generation?: unknown;
 }
 
 /**
@@ -63,6 +77,8 @@ export class BlobUploader {
   private readonly sleep: (ms: number) => Promise<void>;
   private running = new Set<Promise<void>>();
   private catchUpWork: Promise<void> | null = null;
+  /** Paths whose in-flight upload should not reference after a rename/delete. */
+  private superseded = new Set<string>();
   /** Session pause after a 413 quota_exceeded; uploads skip until this timestamp. */
   quotaExceededUntil = 0;
 
@@ -81,6 +97,105 @@ export class BlobUploader {
     this.queued.add(path);
     this.queue.push(path);
     this.pump();
+  }
+
+  isPending(path: string): boolean {
+    return this.queued.has(path);
+  }
+
+  private dropQueued(path: string): void {
+    this.queued.delete(path);
+    this.queue = this.queue.filter((p) => p !== path);
+  }
+
+  /**
+   * Rename an attachment. Case-only (same blob path key): one live POST, new
+   * display_path, generation+1. Different key: live POST at the new key then
+   * tombstone at the old key. Never-synced entries are treated as a new path.
+   */
+  async onFileRenamed(oldPath: string, newPath: string): Promise<void> {
+    const wasPending = this.isPending(oldPath);
+    this.dropQueued(oldPath);
+    this.superseded.add(oldPath);
+
+    const old = this.deps.index.get(oldPath);
+    if (!old || !old.hash) {
+      if (old) this.deps.index.remove(oldPath);
+      this.onFileChanged(newPath);
+      return;
+    }
+
+    const newKey = this.deps.index.keyFor(newPath);
+    if (!newKey) {
+      await this.onFileDeleted(oldPath);
+      return;
+    }
+
+    if (!(await this.deps.blobsEnabled())) {
+      this.deps.index.move(oldPath, newPath);
+      return;
+    }
+
+    const generation = old.generation + 1;
+    if (old.key === newKey) {
+      const resp = await this.postPath({
+        path: newPath, key: newKey, hash: old.hash, size: old.size, generation, state: 'live',
+      });
+      if (resp.json.accepted !== true) {
+        error('blob.rename case-only not accepted:', oldPath, newPath, resp.status);
+        return;
+      }
+      const seq = typeof resp.json.seq === 'number' ? resp.json.seq : old.seq;
+      this.deps.index.move(oldPath, newPath);
+      this.deps.index.update(newPath, { generation, seq, hash: old.hash, size: old.size });
+    } else {
+      const live = await this.postPath({
+        path: newPath, key: newKey, hash: old.hash, size: old.size, generation, state: 'live',
+      });
+      if (live.json.accepted !== true) {
+        error('blob.rename live not accepted:', newPath, live.status);
+        return;
+      }
+      const tomb = await this.postPath({
+        path: oldPath, key: old.key, hash: old.hash, size: old.size, generation, state: 'deleted',
+      });
+      if (tomb.json.accepted !== true) {
+        error('blob.rename tombstone not accepted:', oldPath, tomb.status);
+      }
+      const seq = typeof live.json.seq === 'number' ? live.json.seq : old.seq;
+      this.deps.index.move(oldPath, newPath);
+      this.deps.index.update(newPath, {
+        key: newKey, generation, seq, hash: old.hash, size: old.size,
+      });
+    }
+
+    if (wasPending) this.onFileChanged(newPath);
+  }
+
+  /**
+   * Local delete of an attachment. Never-synced: index.remove only. Else POST
+   * a tombstone then remove. Remote-triggered trash removes the index entry
+   * BEFORE fileManager.trashFile so this route sees no entry and no-ops
+   * (delete-echo suppression).
+   */
+  async onFileDeleted(path: string): Promise<void> {
+    this.dropQueued(path);
+    this.superseded.add(path);
+    const entry = this.deps.index.get(path);
+    if (!entry || !entry.hash) {
+      this.deps.index.remove(path);
+      return;
+    }
+    if (await this.deps.blobsEnabled()) {
+      const generation = entry.generation + 1;
+      const resp = await this.postPath({
+        path, key: entry.key, hash: entry.hash, size: entry.size, generation, state: 'deleted',
+      });
+      if (resp.json.accepted !== true) {
+        error('blob.delete tombstone not accepted:', path, resp.status);
+      }
+    }
+    this.deps.index.remove(path);
   }
 
   private pump(): void {
@@ -108,7 +223,9 @@ export class BlobUploader {
   // ── The lane ──────────────────────────────────────────────────────
 
   private async upload(path: string): Promise<void> {
+    if (this.superseded.delete(path)) return;
     if (!(await this.deps.blobsEnabled())) return;
+    if (this.superseded.delete(path)) return;
     const key = this.deps.index.keyFor(path);
     if (!key) return;
 
@@ -130,6 +247,7 @@ export class BlobUploader {
 
     const bytes = new Uint8Array(await this.deps.readBinary(path));
     const hash = blake3_hex(bytes);
+    if (this.superseded.delete(path)) return;
 
     // Echo suppression: the server already has exactly these bytes for this path.
     const entry = this.deps.index.get(path);
@@ -140,6 +258,7 @@ export class BlobUploader {
       this.deps.index.update(path, { skipped: true });
       return;
     }
+    if (this.superseded.delete(path)) return;
     await this.reference(path, key, hash, size, bytes);
   }
 
@@ -312,17 +431,152 @@ export class BlobUploader {
     let maxSeq = since;
     for (const s of states) {
       if (typeof s.seq === 'number' && s.seq > maxSeq) maxSeq = s.seq;
-      if (typeof s.path_key !== 'string' || s.state !== 'live') continue;
-      const path = this.deps.index.pathForKey(s.path_key);
-      if (!path) continue;
-      const local = this.deps.index.get(path);
-      if (!local || local.hash === s.content_hash) continue;
-      this.deps.index.update(path, { hydrated: false });
+      if (typeof s.path_key !== 'string') continue;
+      if (s.state === 'deleted') {
+        await this.applyRemoteTombstone(s);
+        continue;
+      }
+      if (s.state !== 'live') continue;
+      await this.applyRemoteLive(s);
     }
     if (typeof resp.json.max_seq === 'number' && resp.json.max_seq > maxSeq) {
       maxSeq = resp.json.max_seq;
     }
     this.deps.index.noteMaxSeq(maxSeq);
+    if (!this.deps.isMobile) await this.deps.hydratePending?.();
+  }
+
+  /** Second-device catch-up: create an index entry when the server has a live path we have never seen. */
+  private async applyRemoteLive(s: RemoteState): Promise<void> {
+    const pathKey = s.path_key;
+    if (typeof pathKey !== 'string') return;
+    const contentHash = typeof s.content_hash === 'string' ? s.content_hash : '';
+    if (!contentHash) return;
+    const size = typeof s.size === 'number' ? s.size : 0;
+    const generation = typeof s.generation === 'number' ? s.generation : 0;
+    const seq = typeof s.seq === 'number' ? s.seq : 0;
+    const display = typeof s.display_path === 'string' ? s.display_path : undefined;
+
+    let path = this.deps.index.pathForKey(pathKey);
+    if (!path) {
+      if (!display || !this.deps.index.keyFor(display)) return;
+      path = display;
+      const local = this.deps.index.get(path);
+      if (!local) {
+        const same = await this.localFileMatches(path, contentHash, size);
+        if (same === false) {
+          log('blob.catch-up.unindexed-local-modified', path);
+          return;
+        }
+        this.deps.index.update(path, {
+          hash: contentHash,
+          size,
+          generation,
+          seq,
+          hydrated: same === true,
+          lastRemoteHash: same === true ? contentHash : null,
+        });
+        return;
+      }
+    }
+
+    const local = this.deps.index.get(path);
+    if (!local) return;
+    if (local.hash === contentHash) return;
+    this.deps.index.update(path, {
+      hash: contentHash,
+      size,
+      generation,
+      seq,
+      hydrated: false,
+    });
+  }
+
+  private async localFileMatches(path: string, contentHash: string, size: number): Promise<boolean | null> {
+    const stat = await this.deps.stat(path);
+    if (!stat) return null;
+    if (size > 0 && stat.size !== size) return false;
+    const bytes = new Uint8Array(await this.deps.readBinary(path));
+    return blake3_hex(bytes) === contentHash;
+  }
+
+  private async applyRemoteTombstone(s: RemoteState): Promise<void> {
+    if (typeof s.path_key !== 'string') return;
+    const path = this.deps.index.pathForKey(s.path_key)
+      ?? (typeof s.display_path === 'string' ? s.display_path : undefined);
+    if (!path) return;
+    const local = this.deps.index.get(path);
+    if (!local) return;
+
+    const remoteGen = typeof s.generation === 'number' ? s.generation : local.generation;
+    const stat = await this.deps.stat(path);
+    if (!stat) {
+      this.deps.index.remove(path);
+      return;
+    }
+
+    const pending = this.isPending(path);
+    let locallyModified = false;
+    if (!pending) {
+      const bytes = new Uint8Array(await this.deps.readBinary(path));
+      locallyModified = blake3_hex(bytes) !== local.lastRemoteHash;
+    }
+    if (pending || locallyModified) {
+      if (!pending) await this.republishLive(path, local, remoteGen);
+      this.noticeRemote(path, remoteDeleteKeptNoticeMessage(path));
+      return;
+    }
+
+    // Echo suppression: drop the index entry BEFORE trashFile. The vault
+    // 'delete' event then hits onFileDeleted's never-synced branch and no-ops.
+    this.deps.index.remove(path);
+    await this.deps.trashIfPresent?.(path);
+    this.noticeRemote(path, remoteDeleteTrashedNoticeMessage(path));
+  }
+
+  private async republishLive(
+    path: string,
+    local: { key: string; generation: number },
+    remoteGen: number,
+  ): Promise<void> {
+    const size = (await this.deps.stat(path))?.size;
+    if (size === undefined) return;
+    const bytes = new Uint8Array(await this.deps.readBinary(path));
+    const hash = blake3_hex(bytes);
+    const uploaded = await this.ensureBlob(hash, size, bytes);
+    if (!uploaded) return;
+    const generation = Math.max(local.generation, remoteGen) + 1;
+    const resp = await this.postPath({
+      path, key: local.key, hash, size, generation, state: 'live',
+    });
+    if (resp.json.accepted !== true) return;
+    const seq = typeof resp.json.seq === 'number' ? resp.json.seq : local.generation;
+    this.deps.index.update(path, {
+      hash, size, generation, seq, hydrated: true, lastRemoteHash: hash, skipped: false,
+    });
+  }
+
+  private noticeRemote(path: string, text: string): void {
+    const last = this.capNoticeAt.get(path);
+    if (last !== undefined && this.now() - last < CAP_NOTICE_THROTTLE_MS) return;
+    this.capNoticeAt.set(path, this.now());
+    this.deps.notify(text);
+  }
+
+  private async postPath(opts: {
+    path: string; key: string; hash: string; size: number;
+    generation: number; state: 'live' | 'deleted';
+  }): Promise<HttpResult> {
+    return this.http('POST', '/vault/blob-paths', {
+      path_key: opts.key,
+      display_path: opts.path,
+      key_version: 1,
+      generation: opts.generation,
+      state: opts.state,
+      content_hash: opts.hash,
+      size: opts.size,
+      peer_id: this.deps.peerId(),
+    });
   }
 
   // ── HTTP ─────────────────────────────────────────────────────────
@@ -340,16 +594,52 @@ export class BlobUploader {
   private async request(opts: {
     method: string; path: string; body?: string | ArrayBuffer; headers?: Record<string, string>;
   }): Promise<HttpResult> {
-    const jwt = await this.deps.getJwt();
-    const resp = await requestUrl({
-      url: `${toHttpBase(this.deps.serverUrl())}${opts.path}`,
+    return blobRequest({
+      serverUrl: this.deps.serverUrl(),
+      jwt: await this.deps.getJwt(),
       method: opts.method,
-      headers: { ...opts.headers, Authorization: `Bearer ${jwt}` },
-      ...(opts.body === undefined ? {} : { body: opts.body }),
-      throw: false,
+      path: opts.path,
+      body: opts.body,
+      headers: opts.headers,
     });
-    return { status: typeof resp.status === 'number' ? resp.status : 200, json: parseResponseJson(resp) };
   }
+}
+
+/** Read a response header without assuming the server's casing. */
+export function headerValue(headers: Record<string, string> | undefined, name: string): string | undefined {
+  if (!headers) return undefined;
+  const want = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === want) return v;
+  }
+  return undefined;
+}
+
+export async function blobRequest(opts: {
+  serverUrl: string;
+  jwt: string;
+  method: string;
+  path: string;
+  body?: string | ArrayBuffer;
+  headers?: Record<string, string>;
+}): Promise<BlobHttpResult> {
+  const resp = await requestUrl({
+    url: `${toHttpBase(opts.serverUrl)}${opts.path}`,
+    method: opts.method,
+    headers: { ...opts.headers, Authorization: `Bearer ${opts.jwt}` },
+    ...(opts.body === undefined ? {} : { body: opts.body }),
+    throw: false,
+  });
+  const arrayBuffer = resp.arrayBuffer instanceof ArrayBuffer ? resp.arrayBuffer : new ArrayBuffer(0);
+  const headers = resp.headers && typeof resp.headers === 'object' && !Array.isArray(resp.headers)
+    ? resp.headers
+    : {};
+  return {
+    status: typeof resp.status === 'number' ? resp.status : 200,
+    json: parseResponseJson(resp),
+    arrayBuffer,
+    headers,
+  };
 }
 
 function parseResponseJson(resp: { json?: unknown; text?: unknown }): Record<string, unknown> {

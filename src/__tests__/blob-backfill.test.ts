@@ -65,6 +65,7 @@ async function setup() {
       onLayoutReady: vi.fn(),
       iterateAllLeaves: vi.fn(),
     },
+    metadataCache: { getFileCache: vi.fn().mockReturnValue(null) },
   } as any;
   const engine = new SyncEngine(app, { vaultId: 'test', peerId: 'test' } as any);
   const plugin = new VaultCRDTPlugin(app, {} as any);
@@ -143,5 +144,34 @@ describe('attachment rename routing', () => {
     expect(renamed).not.toHaveBeenCalled();
     expect(deletedOnly).not.toHaveBeenCalled();
     expect(push).not.toHaveBeenCalled();
+  });
+
+  it('routes attachment-to-attachment rename to onFileRenamed', async () => {
+    const { plugin, engine, handlers } = await setup();
+    const blobRenamed = vi.spyOn(plugin.blobUploader, 'onFileRenamed').mockResolvedValue(undefined);
+    const changed = vi.spyOn(plugin.blobUploader, 'onFileChanged').mockImplementation(() => {});
+    const renamed = vi.spyOn(engine, 'onFileRenamed').mockImplementation(() => {});
+
+    await handlers.get('rename')!(fileAt('Bilder/renamed.png'), 'Bilder/photo.png');
+
+    expect(blobRenamed).toHaveBeenCalledExactlyOnceWith('Bilder/photo.png', 'Bilder/renamed.png');
+    expect(changed).not.toHaveBeenCalled();
+    expect(renamed).not.toHaveBeenCalled();
+  });
+
+  it('routes attachment delete to the blob uploader, not the md branch', async () => {
+    const { plugin, engine, handlers } = await setup();
+    const blobDeleted = vi.spyOn(plugin.blobUploader, 'onFileDeleted').mockResolvedValue(undefined);
+    const deleted = vi.spyOn(engine, 'onFileDeleted').mockImplementation(() => {});
+
+    await handlers.get('delete')!(fileAt('Bilder/photo.png'));
+
+    expect(blobDeleted).toHaveBeenCalledExactlyOnceWith('Bilder/photo.png');
+    expect(deleted).not.toHaveBeenCalled();
+  });
+
+  it('registers a file-open hook for mobile lazy hydration', async () => {
+    const { app } = await setup();
+    expect(app.workspace.on).toHaveBeenCalledWith('file-open', expect.any(Function));
   });
 });

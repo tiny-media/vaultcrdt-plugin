@@ -11,7 +11,7 @@ import { ReplaceConnectionModal } from './replace-connection-modal';
 import { resetConnectionState } from './settings';
 import { SETUP_COPY, WASM_INIT_FAILED_NOTICE } from './user-facing-copy';
 import { Modal } from 'obsidian';
-import { log, error, warn, redact, setSecretProvider, getRecentIssues } from './logger';
+import { log, error, redact, setSecretProvider, getRecentIssues } from './logger';
 import { ServerFeatureCache, FEATURE_INVITE, FEATURE_BLOBS } from './server-features';
 import { buildDiagnosticsReport, assertNoSecret, type DiagnosticsInput } from './diagnostics';
 import { PROTOCOL_VERSION, jsonOf } from './protocol';
@@ -19,6 +19,7 @@ import { toHttpBase } from './url-policy';
 import { isSyncablePath, isAttachmentPath } from './path-policy';
 import { BlobIndex } from './blob-index';
 import { BlobUploader } from './blob-uploader';
+import { BlobDownloader } from './blob-downloader';
 import { StateStorage } from './state-storage';
 import { Inbox } from './inbox';
 import { InboxModal } from './inbox-modal';
@@ -42,14 +43,13 @@ export default class VaultCRDTPlugin extends Plugin {
   private pendingDeleteChecks = new Set<string>();
   private pendingSyncEngineInit: Promise<void> | null = null;
   private handlingSetupLink = false;
-  /** One warn per session for already-synced attachment renames (S3 owns move). */
-  private warnedAttachmentRename = false;
   private activeSetup: SetupModal | null = null;
   /** Cached GET /health feature list (TTL'd), shared by every SetupModal. */
   serverFeatures = new ServerFeatureCache();
   /** Attachment blob lane (design §3) — dormant unless the server has "blobs". */
   blobIndex!: BlobIndex;
   blobUploader!: BlobUploader;
+  blobDownloader!: BlobDownloader;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -76,6 +76,25 @@ export default class VaultCRDTPlugin extends Plugin {
       readBinary: (path) => this.app.vault.adapter.readBinary(path),
       notify: (text) => { new Notice(text, 8000); },
       isMobile: Platform.isMobile,
+      hydratePending: () => this.blobDownloader.hydratePending(),
+      trashIfPresent: async (path) => {
+        const f = this.app.vault.getAbstractFileByPath(path);
+        if (f instanceof TFile) await this.app.fileManager.trashFile(f);
+      },
+    });
+    this.blobDownloader = new BlobDownloader({
+      index: this.blobIndex,
+      serverUrl: () => this.settings.serverUrl,
+      getJwt: () => this.syncEngine.getJwt(),
+      blobsEnabled: () => this.blobsEnabled(),
+      exists: (path) => this.app.vault.adapter.exists(path),
+      mkdir: (path) => this.app.vault.adapter.mkdir(path),
+      writeBinary: (path, data) => this.app.vault.adapter.writeBinary(path, data),
+      readBinary: (path) => this.app.vault.adapter.readBinary(path),
+      enqueueUpload: (path) => this.blobUploader.onFileChanged(path),
+      app: this.app,
+      isMobile: Platform.isMobile,
+      getFileCache: (file) => this.app.metadataCache.getFileCache(file),
     });
     this.refreshInboxIndicators();
     // Obsidian prefixes this with the manifest id, yielding vaultcrdt:invite-device.
@@ -279,6 +298,10 @@ export default class VaultCRDTPlugin extends Plugin {
       this.app.vault.on('delete', (file) => {
         if (!(file instanceof TFile)) return;
         const path = file.path;
+        if (isAttachmentPath(path)) {
+          void this.blobUploader.onFileDeleted(path);
+          return;
+        }
         // Remote-originated trash already filed a deleted-remote inbox entry;
         // clearing here would wipe the notice for the session that saw it.
         if (this.syncEngine?.isDeletingFromRemote(path)) {
@@ -323,14 +346,16 @@ export default class VaultCRDTPlugin extends Plugin {
         if (!(file instanceof TFile)) return;
         this.inbox.onFileRenamed(oldPath, file.path);
         this.refreshInboxIndicators();
-        if (isAttachmentPath(oldPath) && this.blobIndex.get(oldPath)) {
-          if (!this.warnedAttachmentRename) {
-            this.warnedAttachmentRename = true;
-            warn('attachment rename of an already-synced file: server-side move comes with the hydration slice');
-          }
+        if (isAttachmentPath(oldPath) && isAttachmentPath(file.path)) {
+          await this.blobUploader.onFileRenamed(oldPath, file.path);
+          return;
         }
         if (isAttachmentPath(file.path)) {
           this.blobUploader.onFileChanged(file.path);
+          return;
+        }
+        if (isAttachmentPath(oldPath)) {
+          void this.blobUploader.onFileDeleted(oldPath);
           return;
         }
         if (!this.syncEngineInitialized) return; // Ignore renames before sync engine is ready
@@ -350,6 +375,13 @@ export default class VaultCRDTPlugin extends Plugin {
           const content = await this.app.vault.read(file);
           this.syncEngine.onFileChangedImmediate(file.path, content);
         }
+      })
+    );
+
+    this.registerEvent(
+      this.app.workspace.on('file-open', (file) => {
+        if (!file) return;
+        void this.blobDownloader.hydrateForOpenFile(file);
       })
     );
   }

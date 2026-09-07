@@ -52,15 +52,18 @@ vi.mock('../wasm-bridge', () => ({
 }));
 vi.stubGlobal('WebSocket', MockWebSocket);
 
-import initWasmModule, { blake3_hex } from '../../wasm/vaultcrdt_wasm';
+import initWasmModule, { blake3_hex, blob_path_key } from '../../wasm/vaultcrdt_wasm';
 import { BlobIndex } from '../blob-index';
 import { BlobUploader } from '../blob-uploader';
 import { isAttachmentPath } from '../path-policy';
 import { SyncEngine } from '../sync-engine';
 import { FEATURE_BLOBS } from '../server-features';
+import { remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage } from '../user-facing-copy';
 
 const PATH = 'Bilder/photo.png';
 const PATH_B = 'Bilder/other.png';
+const PATH_NEW = 'Bilder/renamed.png';
+const PATH_CASE = 'Bilder/Photo.png';
 const BYTES = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 const MIB = 1024 * 1024;
 
@@ -81,25 +84,41 @@ function memStorage() {
 function makeUploader(opts: {
   blobs?: boolean;
   size?: number;
+  files?: Record<string, Uint8Array>;
+  isMobile?: boolean;
+  hydratePending?: () => Promise<void>;
+  trashIfPresent?: (path: string) => Promise<void>;
   readBinary?: ((path: string) => Promise<ArrayBuffer>) & { mock?: unknown };
   now?: () => number;
 } = {}) {
   const index = new BlobIndex(memStorage());
   const notify = vi.fn();
   const readBinary: (path: string) => Promise<ArrayBuffer> =
-    opts.readBinary ?? (async () => BYTES.slice().buffer);
+    opts.readBinary ?? (async (path: string) => {
+      const f = opts.files?.[path];
+      if (f) return f.slice().buffer;
+      return BYTES.slice().buffer;
+    });
   const uploader = new BlobUploader({
     index,
     serverUrl: () => 'https://s.example.com',
     peerId: () => 'peer-1',
     getJwt: async () => 'jwt-1',
     blobsEnabled: async () => opts.blobs !== false,
-    stat: async () => ({ size: opts.size ?? BYTES.length }),
+    stat: async (path: string) => {
+      if (opts.files) {
+        const f = opts.files[path];
+        return f ? { size: f.byteLength } : null;
+      }
+      return { size: opts.size ?? BYTES.length };
+    },
     readBinary,
     notify,
-    isMobile: false,
+    isMobile: opts.isMobile ?? false,
     sleep: async () => undefined,
     now: opts.now ?? (() => 0),
+    hydratePending: opts.hydratePending,
+    trashIfPresent: opts.trashIfPresent,
   });
   return { uploader, index, notify, readBinary };
 }
@@ -479,6 +498,179 @@ describe('BlobUploader (attachment lane S2)', () => {
 
     expect(urls()).toEqual(['POST /vault/blobs/uploads']);
     expect(index.get(PATH)!.skipped).toBe(true);
+  });
+
+  it('0. catchUp creates index entries for unknown live states (second device)', async () => {
+    const hash = blake3_hex(BYTES);
+    const key = blob_path_key(PATH)!;
+    const live = {
+      path_key: key,
+      display_path: PATH,
+      state: 'live',
+      content_hash: hash,
+      size: BYTES.length,
+      generation: 4,
+      seq: 12,
+    };
+
+    const absent = makeUploader({ files: {} });
+    mockRequestUrl.mockResolvedValueOnce(resp(200, { states: [live], max_seq: 12 }));
+    await absent.uploader.catchUp();
+    expect(absent.index.get(PATH)).toMatchObject({
+      key, hash, size: BYTES.length, generation: 4, seq: 12, hydrated: false, lastRemoteHash: null,
+    });
+    expect(urls()).toEqual(['GET /vault/blob-paths?since_seq=0&limit=1000']);
+
+    mockRequestUrl.mockReset();
+    const present = makeUploader({ files: { [PATH]: BYTES } });
+    mockRequestUrl.mockResolvedValueOnce(resp(200, { states: [live], max_seq: 12 }));
+    await present.uploader.catchUp();
+    expect(present.index.get(PATH)).toMatchObject({
+      hash, hydrated: true, lastRemoteHash: hash, generation: 4, seq: 12,
+    });
+    expect(urls()).toEqual(['GET /vault/blob-paths?since_seq=0&limit=1000']);
+  });
+
+  it('does not index or hydrate an unindexed local file that differs from remote live state', async () => {
+    const local = new Uint8Array([1, 1, 1, 1, 1]);
+    const remote = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 9, 9]);
+    const files: Record<string, Uint8Array> = { [PATH]: local };
+    const box: { index: BlobIndex | null } = { index: null };
+    const { uploader, index } = makeUploader({
+      files,
+      hydratePending: async () => {
+        if (box.index?.get(PATH)) {
+          throw new Error('must not hydrate unindexed local diverge');
+        }
+      },
+    });
+    box.index = index;
+    mockRequestUrl.mockImplementation(async (opts: Call) => {
+      if (opts.method === 'GET' && opts.url.includes('/vault/blob-paths')) {
+        return resp(200, {
+          states: [{
+            path_key: blob_path_key(PATH),
+            display_path: PATH,
+            state: 'live',
+            content_hash: blake3_hex(remote),
+            size: remote.length,
+            generation: 2,
+            seq: 15,
+          }],
+          max_seq: 15,
+        });
+      }
+      throw new Error(`unexpected ${opts.method} ${opts.url}`);
+    });
+
+    await uploader.catchUp();
+
+    expect(index.get(PATH)).toBeUndefined();
+    expect(files[PATH]).toEqual(local);
+    expect(calls().filter((c) => c.url.includes('/vault/blobs/'))).toEqual([]);
+  });
+
+  it('5. rename different key: live POST + old tombstone, no re-upload, index moved', async () => {
+    const { uploader, index } = makeUploader();
+    const hash = blake3_hex(BYTES);
+    const oldKey = blob_path_key(PATH)!;
+    const newKey = blob_path_key(PATH_NEW)!;
+    expect(oldKey).not.toBe(newKey);
+    index.update(PATH, {
+      hash, size: BYTES.length, generation: 2, seq: 5, lastRemoteHash: hash, hydrated: true,
+    });
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(200, { accepted: true, seq: 8 }))
+      .mockResolvedValueOnce(resp(200, { accepted: true, seq: 9 }));
+
+    await uploader.onFileRenamed(PATH, PATH_NEW);
+
+    const posts = calls().filter((c) => c.method === 'POST');
+    expect(posts.map((c) => c.url.replace('https://s.example.com', ''))).toEqual([
+      '/vault/blob-paths', '/vault/blob-paths',
+    ]);
+    expect(calls().filter((c) => c.method === 'PUT')).toEqual([]);
+    const bodies = posts.map((c) => JSON.parse(c.body as string));
+    expect(bodies[0]).toMatchObject({
+      path_key: newKey, display_path: PATH_NEW, state: 'live', content_hash: hash, generation: 3,
+    });
+    expect(bodies[1]).toMatchObject({
+      path_key: oldKey, display_path: PATH, state: 'deleted', content_hash: hash, generation: 3,
+    });
+    expect(index.get(PATH)).toBeUndefined();
+    expect(index.get(PATH_NEW)).toMatchObject({ key: newKey, hash, generation: 3, seq: 8 });
+    expect(index.pathForKey(newKey)).toBe(PATH_NEW);
+  });
+
+  it('6. rename case-only: ONE POST, same key, display updated, gen+1', async () => {
+    const { uploader, index } = makeUploader();
+    const hash = blake3_hex(BYTES);
+    const key = blob_path_key(PATH)!;
+    expect(blob_path_key(PATH_CASE)).toBe(key);
+    index.update(PATH, {
+      hash, size: BYTES.length, generation: 2, seq: 5, lastRemoteHash: hash, hydrated: true,
+    });
+    mockRequestUrl.mockResolvedValueOnce(resp(200, { accepted: true, seq: 6 }));
+
+    await uploader.onFileRenamed(PATH, PATH_CASE);
+
+    expect(urls()).toEqual(['POST /vault/blob-paths']);
+    expect(JSON.parse(calls()[0].body as string)).toMatchObject({
+      path_key: key, display_path: PATH_CASE, state: 'live', content_hash: hash, generation: 3,
+    });
+    expect(index.get(PATH)).toBeUndefined();
+    expect(index.get(PATH_CASE)).toMatchObject({ key, hash, generation: 3, seq: 6 });
+    expect(index.pathForKey(key)).toBe(PATH_CASE);
+  });
+
+  it('7. remote tombstone: unmodified trashes; locally modified is kept and republished', async () => {
+    const hash = blake3_hex(BYTES);
+    const key = blob_path_key(PATH)!;
+    const tomb = {
+      path_key: key,
+      display_path: PATH,
+      state: 'deleted',
+      content_hash: hash,
+      generation: 3,
+      seq: 20,
+    };
+
+    const trash = vi.fn(async () => undefined);
+    const unmodified = makeUploader({ files: { [PATH]: BYTES }, trashIfPresent: trash });
+    unmodified.index.update(PATH, {
+      hash, size: BYTES.length, generation: 2, seq: 5, lastRemoteHash: hash, hydrated: true,
+    });
+    mockRequestUrl.mockResolvedValueOnce(resp(200, { states: [tomb], max_seq: 20 }));
+    await unmodified.uploader.catchUp();
+    expect(trash).toHaveBeenCalledExactlyOnceWith(PATH);
+    expect(unmodified.index.get(PATH)).toBeUndefined();
+    expect(unmodified.notify).toHaveBeenCalledWith(remoteDeleteTrashedNoticeMessage(PATH));
+    expect(urls()).toEqual(['GET /vault/blob-paths?since_seq=5&limit=1000']);
+
+    mockRequestUrl.mockReset();
+    const trash2 = vi.fn(async () => undefined);
+    const modified = makeUploader({ files: { [PATH]: BYTES }, trashIfPresent: trash2 });
+    modified.index.update(PATH, {
+      hash, size: BYTES.length, generation: 2, seq: 5, lastRemoteHash: 'old-remote', hydrated: true,
+    });
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(200, { states: [tomb], max_seq: 20 }))
+      .mockResolvedValueOnce(resp(200, { exists: true }))
+      .mockResolvedValueOnce(resp(200, { accepted: true, seq: 21 }));
+    await modified.uploader.catchUp();
+    expect(trash2).not.toHaveBeenCalled();
+    expect(modified.index.get(PATH)).toMatchObject({
+      hash, hydrated: true, lastRemoteHash: hash, generation: 4,
+    });
+    expect(modified.notify).toHaveBeenCalledWith(remoteDeleteKeptNoticeMessage(PATH));
+    expect(urls()).toEqual([
+      'GET /vault/blob-paths?since_seq=5&limit=1000',
+      'POST /vault/blobs/uploads',
+      'POST /vault/blob-paths',
+    ]);
+    expect(JSON.parse(calls()[2].body as string)).toMatchObject({
+      path_key: key, state: 'live', content_hash: hash, generation: 4,
+    });
   });
 });
 
