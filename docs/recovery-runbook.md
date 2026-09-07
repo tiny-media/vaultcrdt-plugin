@@ -1,99 +1,106 @@
-# VaultCRDT Recovery- und Konflikt-Runbook
+# VaultCRDT recovery and conflict runbook
 
-Dieses Runbook ist fuer Friend/Family-Nutzung gedacht: zuerst Inhalte sichern, dann Ursache klaeren. Keine Passwoerter, Admin Tokens oder ungepruefte Logs weitergeben.
+Preserve content first, then investigate. Do not share passwords, device keys, admin tokens, invite links or unchecked logs.
 
-## Grundregeln
+## Ground rules
 
-1. Wenn etwas ungewoehnlich aussieht: Obsidian auf dem betroffenen Geraet offen lassen und nicht hektisch Dateien loeschen.
-2. Wichtige lokale Textaenderungen sofort in eine neue Markdown-Datei mit anderem Namen kopieren.
-3. Trash/Papierkorb und das andere synchronisierte Geraet pruefen, bevor eine Datei endgueltig geloescht wird.
-4. Bei Support nur Geraet, Betriebssystem, Uhrzeit, Dateipfad und ungefaehre Aktion nennen — keine Secrets.
+1. Keep Obsidian open on the affected device. Avoid deleting files while the situation is unclear.
+2. Copy important local text into a new Markdown file with a different name.
+3. Check Trash and the other synced device before permanently deleting anything.
+4. For support, record the device, operating system, time, affected path and approximate action. Share paths only if they contain no sensitive information.
 
-## Conflict-Datei
+## Conflict copies
 
-VaultCRDT erstellt eine Datei wie:
+A file such as `Note (conflict 2026-06-06).md` means the plugin preserved text it could not safely merge or replace. The conflict inbox links to the preserved copy. Ordinary concurrent note edits with shared CRDT history can merge without a conflict file; independently created notes, external edits or missing local state may need a copy.
 
-```text
-Notiz (conflict 2026-06-06).md
-```
+1. Open the original and the conflict copy.
+2. Compare their contents and move the text you want to keep into the intended note.
+3. Delete the conflict copy only after reviewing it.
+4. Open Obsidian on a second device and check that the resolved content arrives.
 
-Das bedeutet: Zwei Stände konnten nicht sicher automatisch zusammengefuehrt werden. VaultCRDT bewahrt beide Versionen auf.
+Compressed Excalidraw Markdown files (`*.excalidraw.md`) also get conflict copies for detected concurrent changes rather than merging compressed drawing payloads. This does not add support for standalone `.excalidraw` files or Canvas files.
 
-Vorgehen:
+Attachments are whole files, not text CRDTs. Before downloading a remote replacement, the plugin can preserve a differing local attachment as a conflict copy. Do not assume this provides a complete attachment version history. Optional `.obsidian` files use last-write-wins without conflict copies; back them up before enabling their sync.
 
-1. Originaldatei und Conflict-Datei oeffnen.
-2. Inhalte vergleichen.
-3. Text, der behalten werden soll, in die gewuenschte Ziel-Datei uebernehmen.
-4. Conflict-Datei erst loeschen, wenn der Inhalt wirklich geprueft wurde.
-5. Danach Obsidian auf einem zweiten Geraet oeffnen und kontrollieren, ob der bereinigte Stand dort ankommt.
+## A note was deleted on another device
 
-## Meldung: `deleted on another device`
+Remote deletion normally moves the local note to Trash. If the plugin finds unsynced or differing local content, it keeps the note and can recreate it on the server; the inbox records the outcome.
 
-Diese Meldung bedeutet: Der Server kennt diesen Pfad als geloescht. Eine lokale Aenderung an genau diesem Pfad wurde abgelehnt und wird nicht synchronisiert.
+A `deleted on another device` refusal means the server has a tombstone for that path and rejected a local push. The plugin attempts to rename the local note to `<name> (deleted-remote).md` and sync it under that new name; the original path stays deleted.
 
-Seit 0.4.2 benennt VaultCRDT die lokale Datei in diesem Fall automatisch in `<Name> (deleted-remote).md` um und synchronisiert sie unter dem neuen Namen. Der alte Pfad bleibt geloescht. Die Schritte unten gelten, wenn diese Umbenennung nicht moeglich war (Datei bereits weg) oder die Meldung ohne Umbenennung erscheint.
+If the rename fails or the warning appears without a preserved copy:
 
-Vorgehen:
+1. Stop editing the affected path and save important text under a new filename.
+2. Check local Trash.
+3. Open the other device and let it sync.
+4. Inspect the preserved note before deliberately recreating anything at the old path.
 
-1. Nicht weiter in dieser Datei arbeiten.
-2. Wichtigen Text sofort unter einem neuen Dateinamen speichern, z. B. `Notiz gerettet.md`.
-3. Lokalen Trash/Papierkorb pruefen.
-4. Das andere Geraet oeffnen und syncen lassen.
-5. Wenn die Datei bewusst neu angelegt werden soll: nach dem Sync unter neuem Namen oder kontrolliert neu erstellen.
+## A file changed outside Obsidian
 
-## Datei wurde ausserhalb von Obsidian geaendert
+Changes from an external editor or git are observed while Obsidian is running with the plugin active. Changes made while it is closed may be missed by the startup fast path when the server version is unchanged.
 
-Aenderungen durch git pull, Syncthing oder externe Editoren werden nur erkannt, solange Obsidian mit aktivem VaultCRDT laeuft. Wurde eine Datei bei geschlossenem Obsidian extern geaendert und hat sich die Server-Version derselben Notiz seitdem nicht geaendert, gilt die Notiz beim Start als unveraendert und wird nicht hochgeladen.
+1. Preserve the current text before troubleshooting.
+2. Open the affected note in Obsidian and make an edit; the next push reconciles its current contents.
+3. Let external tools write only while Obsidian is running, and verify the result on another device.
+4. Do not run a second sync service on the same vault.
 
-1. Die betroffene Notiz in Obsidian oeffnen und eine kleine Aenderung machen (z. B. Leerzeichen einfuegen und wieder entfernen); der naechste Push uebertraegt den vollstaendigen aktuellen Inhalt.
-2. Externe Werkzeuge nur bei laufendem Obsidian auf den Vault schreiben lassen.
-3. Keinen zweiten Sync-Dienst parallel auf demselben Vault betreiben.
+## A note is missing on another device
 
-## Datei fehlt auf Geraet B
+1. Open Obsidian on the receiving device and keep it in the foreground.
+2. Check the network connection and **Open status panel**.
+3. Check the connection and protocol status in VaultCRDT settings.
+4. Leave the sending device open until its pending changes have synced.
+5. If the note was deleted, check Trash and the conflict inbox on both devices.
+6. If it remains missing, record the path, devices, time and last action before contacting support.
 
-1. Obsidian auf Geraet B aktiv oeffnen; Mobile-Hintergrundsync wird nicht garantiert.
-2. Internetverbindung pruefen.
-3. VaultCRDT Settings oeffnen und Serverstatus ansehen.
-4. Auf Geraet A Obsidian offen lassen, bis der Sync gesendet wurde.
-5. Wenn die Datei geloescht wurde: Trash auf beiden Geraeten pruefen.
-6. Wenn sie weiterhin fehlt: Dateipfad, Geraete, Uhrzeit und letzte Aktion notieren.
+## Missing attachments on mobile
 
-## Server-Restore oder Backup-Rueckspielung
+Mobile downloads attachments on demand from the opened note's links and embeds. A note arriving does not mean every attachment in the vault is already on disk. Desktop downloads pending attachments eagerly; enabled `.obsidian` settings and styles download eagerly on both device classes.
 
-Nach einem Server-Restore kann der Server aelter sein als einzelne Clients. Lange offline gewesene Clients koennen alte Loeschungen oder alte Inhalte wieder anbieten.
+1. Check that the attachment is a [supported format within its cap](install-brat.md#attachments) and has uploaded from the source device.
+2. Open the note that links to it and keep Obsidian in the foreground while it downloads.
+3. If needed, reopen the note after catch-up. The plugin also rechecks the active note as its metadata changes.
+4. Use an unambiguous vault-relative attachment path. A basename shared by several attachments is not enough for mobile lookup.
+5. Check server blob support and connectivity. Do not delete local originals to force a download.
 
-Sichere Prozedur:
+## Settings or themes did not arrive
 
-1. Clients nicht gleichzeitig wild weitereditieren lassen.
-2. Nach Restore zuerst ein bekannt gutes Geraet oeffnen und syncen lassen.
-3. Danach weitere Geraete einzeln oeffnen und kontrollieren.
-4. Bei unerwarteten Conflict-Dateien oder Tombstone-Meldungen Inhalte sichern und nicht sofort bereinigen.
-5. Restore-Befund mit Serverbetreiber klaeren.
+Check the [exact allowlist and per-device toggles](install-brat.md#optional-obsidian-settings-and-styles). Both categories default to off. A custom configuration directory, nested snippet folders, workspace state and plugin settings are not eligible. Files above 2 MiB are not uploaded.
 
-## Vault kopiert oder aus Backup wiederhergestellt
+Concurrent settings/style edits are whole-file last-write-wins, not merged by JSON key. Restore desired settings from a known-good backup if a concurrent change replaced them; no conflict copy is made for these files.
 
-Wenn ein kompletter Vault-Ordner (inklusive der versteckten Plugin-Einstellungen) auf ein zweites Geraet kopiert oder aus einem Backup wiederhergestellt wird, teilen sich danach beide Geraete dieselbe Geraete-Identitaet (Peer ID). Zwei Geraete auf derselben Peer-Linie koennen die Aenderungsreihenfolge durcheinanderbringen.
+## Server restore
 
-Sichere Prozedur:
+A restored server may be older than its clients. Devices returning after a long offline period may offer older content or deletions.
 
-1. Auf genau EINEM der beiden Geraete (dem kopierten/wiederhergestellten) VaultCRDT Settings oeffnen.
-2. Unter `Advanced` den Knopf `Reset identity` bei `Reset device identity` druecken und im Dialog bestaetigen.
-3. Das Geraet bekommt eine frische Peer ID; Notizen und lokale Historie bleiben erhalten, nur die Sync-Identitaet wechselt.
-4. Nicht auf beiden Geraeten ausfuehren — sonst entstehen zwei neue Identitaeten ohne Not. Genau ein Geraet reicht.
+1. Pause simultaneous editing across devices.
+2. After the restore, open one known-good device and let it sync.
+3. Bring the remaining devices online one at a time and inspect the result.
+4. Preserve unexpected conflict copies or tombstone-related files before cleanup.
+5. Discuss the restore with the server operator; use the server repository's backup and restore instructions.
 
-## Was an Support weitergeben?
+## Vault copied or restored from backup
 
-Weitergeben:
+Copying a complete vault, including hidden plugin settings, can duplicate its peer identity and device credentials. Two devices using the same peer identity can disrupt operation ordering.
 
-- Geraet und Betriebssystem.
-- Uhrzeit und Zeitzone.
-- Dateipfad.
-- Ob es um Start, Editieren, Loeschen, Umbenennen, Offline-Betrieb oder Restore ging.
-- Screenshot der VaultCRDT-Meldung, falls sichtbar.
+1. On exactly one device — the copied or restored one — open **Settings → VaultCRDT → Developer**.
+2. Under **Reset device identity**, select **Reset identity** and confirm.
+3. The device receives a fresh peer ID. Notes and local CRDT history remain intact.
 
-Nicht weitergeben:
+This resets the CRDT peer identity, not the authentication device key. For a new device, prefer a fresh plugin setup and invite rather than copying plugin credentials. If copied credentials need replacing, ask the operator about issuing a new invite and retiring the old credential.
 
-- Vault-Passwort.
-- Admin Token.
-- JWT/Token aus URLs.
-- komplette Logs ohne vorherige Secret-Pruefung.
+## Status and diagnostics
+
+Use **Open status panel** for connection and sync activity, and **Open conflict inbox** to review conflicts, deletions and failures. These command-palette entries also work on phones. Routine success notifications stay quiet; issues are retained for review.
+
+Under **Settings → VaultCRDT → Developer**, **Copy diagnostics report** copies a redacted report. The command **Export diagnostics bundle** writes a diagnostic bundle. Review diagnostics before sharing, and send only what is needed.
+
+Useful support information:
+
+- Device and operating system.
+- Time and timezone.
+- Affected path, if safe to disclose.
+- Whether the issue followed startup, editing, deletion, renaming, offline use or a restore.
+- A screenshot of the relevant status or inbox entry, with private details removed.
+
+Do not send vault secrets, device keys, admin tokens, authentication tokens, invite QR codes or full logs without review.

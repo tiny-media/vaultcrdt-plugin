@@ -1,79 +1,52 @@
 # VaultCRDT Plugin
 
-An Obsidian plugin that synchronises Markdown notes between your devices through a server you run yourself. Merging is done with CRDTs via the [Loro](https://loro.dev) library, so concurrent edits from several devices combine without losing text. The server is a small Rust program in a companion repository, [vaultcrdt-server](https://github.com/tiny-media/vaultcrdt-server). The intended scale is a few people — friends and family — not a public service.
+VaultCRDT synchronises Markdown notes between Obsidian vaults on desktop and mobile. You can edit offline; edits merge when devices reconnect. When text cannot be safely merged, the plugin preserves it in a `… (conflict …).md` copy and adds an inbox entry rather than silently discarding it.
 
-No cloud service is involved. The plugin talks only to the server URL you configure.
+It also syncs supported images (including SVG, sanitised on the originating device), PDFs and audio. App settings, themes and CSS snippets can optionally sync through per-device toggles, off by default. A status panel shows sync activity; a quiet-mode inbox keeps conflicts and other items for review.
 
-## What works today
+**Requirements:** an Obsidian vault, Obsidian 1.12.0 or later, and a VaultCRDT server, self-hosted by you or hosted by someone you trust.
 
-- Live sync of `.md` notes over a persistent WebSocket connection while Obsidian is open.
-- Offline edits are kept locally and merged when the connection returns.
-- Initial sync on a new device: pull if the server has notes, push if the server is empty, merge if both sides have notes.
-- Two devices creating the same note independently produce a conflict copy named `<name> (conflict <date>).md` rather than one side winning silently.
-- A note deleted on another device while it has unsynced local edits is kept and re-created on the server at the next sync.
-- A note whose server copy is tombstoned is renamed to `<name> (deleted-remote).md` and synced under the new name.
-- Startup never overwrites local text that the plugin cannot account for; such text goes to a conflict copy first.
-- `Export diagnostics bundle` command: redacted settings, server health, recent warnings and errors, state counts. The vault password is checked to be absent before the file is written.
-- Protocol version handshake: a mismatch between plugin and server closes the connection with a clear message instead of misbehaving.
-- Reset device identity (Settings → Advanced) for vaults that were copied or restored from a backup.
+**Limits:**
 
-## Limits
-
-- Markdown notes only. Images, PDFs, Canvas, Excalidraw, `.txt` and other files are ignored.
-- No end-to-end encryption. Data travels over TLS (WSS) and is stored on the server in a form the operator can read. Use only a server operator you trust.
-- Nothing inside `.obsidian/` is synchronised. Each device keeps its own settings, themes and plugins.
-- Changes made by other tools (git, Syncthing, an external editor) are picked up only while Obsidian is open with the plugin active. Do not run a second sync tool on the same vault.
-- Mobile: sync runs while Obsidian is in the foreground. Background sync is not guaranteed.
-- Plugin and server are released together. During the beta a plugin version expects a matching server version; the settings screen shows whether the protocol matches.
-- Not in the Obsidian community plugin directory. Install goes through BRAT.
-
-## Requirements
-
-- Obsidian 1.12 or later (desktop, Android, iOS).
-- A running [vaultcrdt-server](https://github.com/tiny-media/vaultcrdt-server) and its server URL, vault name and password.
+- No end-to-end encryption yet: the server sees note text. This is a trusted-operator model; use HTTPS for encryption in transit.
+- No hosting service is provided and there is no public cloud service; run the server or ask someone you trust to run it.
+- Attachments above 10 MiB for images/PDFs or 25 MiB for audio stay local. Unsupported file types, such as Canvas and `.txt`, do not sync.
+- Obsidian settings outside the exact allowlist do not sync; plugin settings, plugin secrets and workspace state are excluded.
+- Mobile sync runs while Obsidian is in the foreground; background sync is not guaranteed. Do not run another sync service on the same vault.
 
 ## Install
 
-Install with BRAT from `https://github.com/tiny-media/vaultcrdt-plugin`. Step-by-step instructions, including first setup and adding a second device, are in [docs/install-brat.md](docs/install-brat.md).
+Community-directory submission is in progress. Install with BRAT:
 
-Make a backup of the vault folder before enabling the plugin on a vault you care about.
+1. Back up your vault. In Obsidian → **Settings → Community plugins**, turn off restricted mode.
+2. Browse for **BRAT**, install it and enable it.
+3. In BRAT options, use **Beta plugin list → +**, enter `tiny-media/vaultcrdt-plugin`, and select **Add Plugin**.
+4. Enable **VaultCRDT** in Community plugins.
 
-Server setup is described in the [vaultcrdt-server](https://github.com/tiny-media/vaultcrdt-server) repository.
+See the [installation guide](docs/install-brat.md) for setup and update instructions.
 
-## Network and privacy
+## Connect
 
-The plugin connects only to the server URL you configure yourself. It is used for one purpose: synchronising your notes between your devices. The plugin collects no analytics and sends no telemetry, and it contacts no other service.
+**Invite link or QR (recommended):** on an already-connected device, open **Settings → VaultCRDT → Add another device → Add device**. On the new device, open the link or scan the QR code; alternatively paste the link into setup and select **Use link**. Check the server and vault, then select **I trust this server - Join**. A single-use invite issues a device key; the additional device does not need the shared vault secret. Your server operator can also issue an invite for the first device.
 
-Note content is stored on that server without end-to-end encryption, so whoever operates the server can read your notes in plaintext. Use a server you trust and an `https://` URL, so the traffic between your devices and the server is encrypted in transit.
+**Manual setup:** expand **Enter server details by hand**, enter the server URL, vault ID and vault secret supplied by your operator, then select **Connect**.
 
-## When something goes wrong
+Initial sync pulls server notes, uploads local notes, or merges when both sides have content. See [connection details](docs/install-brat.md#connect) before changing an existing connection.
 
-- Conflict copies, `deleted on another device` notices, missing files, server restores and duplicated vaults are covered in the [recovery runbook](docs/recovery-runbook.md). First rule: save the text you care about under a new name, then investigate.
-- Run the command `Export diagnostics bundle` (command palette) and attach the file when asking for help. It contains no password. Do not send raw logs or credentials.
+## Keyword overview
 
-## Building from source
+- **Offline-first:** local edits merge on reconnect; [recovery and external edits](docs/recovery-runbook.md).
+- **CRDT:** [Loro](https://loro.dev) in a Rust/WASM core with a TypeScript frontend; one `main.js` embeds the WASM module.
+- **Conflict copies:** preserved text and an inbox entry for review; [resolving conflicts](docs/recovery-runbook.md#conflict-copies).
+- **Device keys:** invite-based authentication without distributing the vault secret; [onboarding](docs/install-brat.md#connect).
+- **Attachments lane:** whole-file sync separate from note CRDTs; [formats, caps and mobile downloads](docs/install-brat.md#attachments).
+- **Per-device settings sync:** two opt-in categories with an exact allowlist; [settings and styles](docs/install-brat.md#optional-obsidian-settings-and-styles).
+- **Quiet-mode inbox:** review issues without routine success popups; [status and diagnostics](docs/recovery-runbook.md#status-and-diagnostics).
+- **Source build:** Bun builds the committed WASM output; [build commands](docs/install-brat.md#building-from-source).
 
-Requires [Bun](https://bun.sh).
+## Server
 
-```
-bun install
-bun run build
-bun run test
-```
-
-The WASM module in `wasm/` is committed, so the build does not need a Rust toolchain. To rebuild it from `crates/`, use `bun run wasm` (Rust stable with the `wasm32-unknown-unknown` target and the `wasm-bindgen-cli` version pinned in `Cargo.toml`); `bun run wasm:check` verifies the committed output.
-
-## Status
-
-Beta, version 0.4.x. Tested on four devices by the author; tests across more devices are ongoing. The protocol and storage format may still change between versions but shouldn't until Version 2.
-
-LLM-based agents are used for a substantial part of the coding, testing and maintenance.
-
-## Version 2 Plans
-
-End-to-End Encryption optional.
-Support for some image formats and pdf (no svg, no video).
-Support for some audio formats.
+Deployment, TLS and backups are documented in [tiny-media/vaultcrdt-server](https://github.com/tiny-media/vaultcrdt-server). The container image is `ghcr.io/tiny-media/vaultcrdt-server`; use a release compatible with the plugin's protocol. Protocol mismatches prevent connection and are shown in settings.
 
 ## License
 
