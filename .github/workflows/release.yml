@@ -80,13 +80,11 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v3.0.0
         with:
+          # Exactly three files: the wasm ships INLINE in main.js as
+          # gzip+base64 (esbuild.config.mjs) — Obsidian never delivers a
+          # sibling .wasm, so inlining is the only distributable shape.
+          # Do NOT add wasm/ assets here; a 4th asset is dead weight.
           files: |
             main.js
             manifest.json
             styles.css
-            wasm/vaultcrdt_wasm_bg.wasm
-          # The wasm ships as a SIBLING FILE (adapter.readBinary loads it next
-          # to main.js). A release without it is broken for BRAT/manual
-          # installs — the plugin shows the missing-wasm notice and cannot
-          # sync. Releases 0.5.3/0.5.4 shipped without it; devices only worked
-          # because they received the file via adb. Verified asset count: 4.
