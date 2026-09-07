@@ -275,3 +275,86 @@ describe('PushHandler persistJournal serialization', () => {
     expect(writes[1]).toEqual(expect.arrayContaining(['a.md', 'b.md']));
   });
 });
+
+describe('PushHandler excalidraw concurrent hold', () => {
+  function makePush(opts: {
+    lastServerVV?: Map<string, string>;
+    path?: string;
+    localVV?: string;
+    send?: ReturnType<typeof vi.fn>;
+  } = {}) {
+    const stubDoc = {
+      text_matches: () => false,
+      sync_from_disk: vi.fn(),
+      export_vv_json: () => opts.localVV ?? JSON.stringify({ me: 1 }),
+      export_delta_since_vv_json: () => new Uint8Array(8),
+      version: () => 1,
+    };
+    const docs = {
+      saveDeleteJournal: vi.fn().mockResolvedValue(undefined),
+      loadDeleteJournal: vi.fn().mockResolvedValue([]),
+      movePath: vi.fn(),
+      getOrLoad: vi.fn().mockResolvedValue(stubDoc),
+      persist: vi.fn().mockResolvedValue(undefined),
+      removeAndClean: vi.fn().mockResolvedValue(undefined),
+    };
+    const send = opts.send ?? vi.fn();
+    const push = new PushHandler(
+      docs as any,
+      { readCurrentContent: vi.fn(() => null) } as any,
+      send as any,
+      { peerId: 'p', debounceMs: 700 } as any,
+      new Map(),
+      opts.lastServerVV ?? new Map(),
+      vi.fn(),
+      () => true,
+      '[test]',
+      vi.fn(),
+    );
+    return { push, stubDoc, send, docs };
+  }
+
+  it('does not sync_from_disk an excalidraw edit onto unseen server ops', async () => {
+    const path = 'sketch.excalidraw.md';
+    const { push, stubDoc, send } = makePush({
+      lastServerVV: new Map([[path, JSON.stringify({ other: 4 })]]),
+      localVV: JSON.stringify({ me: 1 }),
+    });
+    const handler = vi.fn().mockResolvedValue(true);
+    push.onExcalidrawConcurrent = handler;
+    push.onFileChangedImmediate(path, 'excalidrawjson:LOCAL');
+    await vi.waitFor(() => expect(handler).toHaveBeenCalled());
+    expect(stubDoc.sync_from_disk).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(handler).toHaveBeenCalledWith(path, 'excalidrawjson:LOCAL');
+  });
+
+  it('still sync_from_disk when local VV already covers the server', async () => {
+    const path = 'sketch.excalidraw.md';
+    const vv = JSON.stringify({ me: 2, other: 4 });
+    const { push, stubDoc, send } = makePush({
+      lastServerVV: new Map([[path, vv]]),
+      localVV: vv,
+    });
+    push.onFileChangedImmediate(path, 'excalidrawjson:NEXT');
+    await vi.waitFor(() => expect(stubDoc.sync_from_disk).toHaveBeenCalled());
+    expect(stubDoc.sync_from_disk).toHaveBeenCalledWith('excalidrawjson:NEXT');
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'sync_push', doc_uuid: path, peer_id: 'p',
+    }));
+  });
+
+  it('still merges concurrent non-excalidraw markdown', async () => {
+    const path = 'note.md';
+    const { push, stubDoc } = makePush({
+      lastServerVV: new Map([[path, JSON.stringify({ other: 4 })]]),
+      localVV: JSON.stringify({ me: 1 }),
+    });
+    const handler = vi.fn().mockResolvedValue(true);
+    push.onExcalidrawConcurrent = handler;
+    push.onFileChangedImmediate(path, 'local');
+    await vi.waitFor(() => expect(stubDoc.sync_from_disk).toHaveBeenCalled());
+    expect(handler).not.toHaveBeenCalled();
+    expect(stubDoc.sync_from_disk).toHaveBeenCalledWith('local');
+  });
+});

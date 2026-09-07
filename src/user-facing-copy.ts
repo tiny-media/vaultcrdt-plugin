@@ -7,6 +7,10 @@ export function conflictNoticeMessage(conflictPath: string): string {
   return `VaultCRDT: created conflict copy ${redact(conflictPath)}. Open both files, merge the text you want to keep, and delete the conflict copy only after checking it.`;
 }
 
+export function excalidrawConflictNoticeMessage(conflictPath: string): string {
+  return `VaultCRDT: concurrent edits to this drawing were not merged. Your version was saved as ${redact(conflictPath)}. The synced file kept the other device's version. Open both files, keep the drawing you want, and delete the conflict copy only after checking it.`;
+}
+
 export function remoteDeleteKeptNoticeMessage(docUuid: string): string {
   return `VaultCRDT: "${redact(docUuid)}" was deleted on another device, but this device has unsynced edits in it. The file was kept and will be re-created on the server from this local version at the next sync. If you meant to delete it, delete it again here.`;
 }

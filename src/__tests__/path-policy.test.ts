@@ -5,6 +5,7 @@ import {
   attachmentCap,
   obsidianSyncCategory,
   obsidianSyncCategoryOf,
+  isExcalidrawPath,
   OBSIDIAN_CAP,
 } from '../path-policy';
 
@@ -114,3 +115,18 @@ describe('isAttachmentPath / attachmentCap for .obsidian',
       expect(attachmentCap('x.css')).toBe(0);
     });
   });
+
+describe('isExcalidrawPath', () => {
+  it('matches *.excalidraw.md on pathCaseKey, including a bare filename', () => {
+    expect(isExcalidrawPath('foo.excalidraw.md')).toBe(true);
+    expect(isExcalidrawPath('FOO.EXCALIDRAW.MD')).toBe(true);
+    expect(isExcalidrawPath('excalidraw.md')).toBe(true);
+    expect(isExcalidrawPath('notes/sketch.excalidraw.md')).toBe(true);
+  });
+
+  it('rejects non-drawing suffixes and blocked prefixes', () => {
+    expect(isExcalidrawPath('foo.excalidraw.png')).toBe(false);
+    expect(isExcalidrawPath('.obsidian/themes/x.excalidraw.md')).toBe(false);
+    expect(isExcalidrawPath('note.md')).toBe(false);
+  });
+});

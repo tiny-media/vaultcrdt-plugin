@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { TRUST_NOTICE_TEXT, conflictNoticeMessage, tombstoneNoticeMessage, OBSIDIAN_SYNC_COPY, SETUP_COPY, SETTINGS_COPY, vaultSecretSetting, ribbonBadgeState, authRejectedNoticeMessage } from '../user-facing-copy';
+import { TRUST_NOTICE_TEXT, conflictNoticeMessage, excalidrawConflictNoticeMessage, tombstoneNoticeMessage, OBSIDIAN_SYNC_COPY, SETUP_COPY, SETTINGS_COPY, vaultSecretSetting, ribbonBadgeState, authRejectedNoticeMessage } from '../user-facing-copy';
 import * as copy from '../user-facing-copy';
 
 describe('user-facing copy', () => {
@@ -13,6 +13,14 @@ describe('user-facing copy', () => {
     const msg = conflictNoticeMessage('Folder/Note (conflict 2026-06-06).md');
     expect(msg).toContain('Open both files');
     expect(msg).toContain('merge');
+    expect(msg).toContain('delete the conflict copy only after checking it');
+  });
+
+  it('explains that concurrent drawings are not merged', () => {
+    const msg = excalidrawConflictNoticeMessage('Folder/Draw (conflict 2026-09-07).excalidraw.md');
+    expect(msg).toContain('were not merged');
+    expect(msg).toContain('other device');
+    expect(msg).toContain('Open both files');
     expect(msg).toContain('delete the conflict copy only after checking it');
   });
 

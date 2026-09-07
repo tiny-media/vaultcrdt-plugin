@@ -1148,4 +1148,119 @@ describe('long-divergence (real CRDT)', () => {
     const mutating = activeServer!.mutatingSinceCheckpoint();
     expect(mutating, `unexpected mutating frames: ${JSON.stringify(mutating)}`).toEqual([]);
   }, 120_000);
+
+  it('concurrent excalidraw: main line is one intact payload, other side is a conflict copy', async () => {
+    const path = 'drawings/sketch.excalidraw.md';
+    const payload0 = 'excalidrawjson:AAAA_BASE';
+    const payloadA = 'excalidrawjson:AAAA_SIDE_A';
+    const payloadB = 'excalidrawjson:AAAA_SIDE_B';
+
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, payload0);
+    await startEngine(a);
+    const b = createHarness('peer-B');
+    await startEngine(b);
+    await untilQuiet();
+    expect(b.fs.readText(path)).toBe(payload0);
+
+    await b.engine.stop();
+    a.fs.writeText(path, payloadA);
+    a.engine.onFileChangedImmediate(path, payloadA);
+    await untilQuiet();
+    b.fs.writeText(path, payloadB);
+    b.engine.onFileChangedImmediate(path, payloadB);
+
+    await startEngine(b);
+    await untilQuiet();
+
+    const mainA = a.fs.readText(path);
+    const mainB = b.fs.readText(path);
+    expect(mainA, 'both devices must share one intact main line').toBe(mainB);
+    expect([payloadA, payloadB], 'main line must equal one original payload (no interleaving)').toContain(mainA);
+
+    const copies = [...new Set([...conflictCopies(a.fs, path), ...conflictCopies(b.fs, path)])];
+    expect(copies.length, 'other side must survive as a conflict copy').toBeGreaterThan(0);
+    const other = mainA === payloadA ? payloadB : payloadA;
+    const copyText = copies.map((p) => (a.fs.has(p) ? a.fs.readText(p) : b.fs.readText(p))).join('\n');
+    expect(copyText, 'conflict copy must hold the non-winning original payload').toContain(other);
+    expect(
+      [...a.inbox, ...b.inbox].some((e) => e.kind === 'conflict' && copies.includes(e.path)),
+      'inbox must record the conflict copy',
+    ).toBe(true);
+  }, 60_000);
+
+  it('sequential excalidraw edits on one device flow with no conflict copy', async () => {
+    const path = 'drawings/seq.excalidraw.md';
+    const first = 'excalidrawjson:AAAA_SEQ_1';
+    const second = 'excalidrawjson:AAAA_SEQ_2';
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, first);
+    await startEngine(a);
+    const b = createHarness('peer-B');
+    await startEngine(b);
+    await untilQuiet();
+
+    a.fs.writeText(path, second);
+    a.engine.onFileChangedImmediate(path, second);
+    await untilQuiet();
+
+    expect(a.fs.readText(path)).toBe(second);
+    expect(b.fs.readText(path)).toBe(second);
+    expect(conflictCopies(a.fs, path)).toEqual([]);
+    expect(conflictCopies(b.fs, path)).toEqual([]);
+    expect(a.inbox.filter((e) => e.kind === 'conflict')).toEqual([]);
+    expect(b.inbox.filter((e) => e.kind === 'conflict')).toEqual([]);
+  }, 60_000);
+
+  it('concurrent non-excalidraw markdown still CRDT-merges with no conflict copy', async () => {
+    const path = 'notes/plain.md';
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, 'SEED\nleft-region\nright-region\n');
+    await startEngine(a);
+    const b = createHarness('peer-B');
+    await startEngine(b);
+    await untilQuiet();
+
+    await b.engine.stop();
+    const aNext = a.fs.readText(path).replace('left-region', 'left-region A_TOK');
+    a.fs.writeText(path, aNext);
+    a.engine.onFileChangedImmediate(path, aNext);
+    await untilQuiet();
+    const bNext = b.fs.readText(path).replace('right-region', 'right-region B_TOK');
+    b.fs.writeText(path, bNext);
+    b.engine.onFileChangedImmediate(path, bNext);
+
+    await startEngine(b);
+    await untilQuiet();
+
+    const textA = a.fs.readText(path);
+    const textB = b.fs.readText(path);
+    expect(textA).toBe(textB);
+    expect(textA).toContain('A_TOK');
+    expect(textA).toContain('B_TOK');
+    expect(conflictCopies(a.fs, path)).toEqual([]);
+    expect(conflictCopies(b.fs, path)).toEqual([]);
+  }, 60_000);
+
+  it('initial-sync differing overlap covers excalidraw with a conflict copy', async () => {
+    const path = 'drawings/fresh.excalidraw.md';
+    const serverPayload = 'excalidrawjson:AAAA_SERVER';
+    const localPayload = 'excalidrawjson:AAAA_LOCAL';
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, serverPayload);
+    await startEngine(a);
+    await untilQuiet();
+
+    const cLocal = new MemoryFS();
+    cLocal.writeText(path, localPayload);
+    const c = createHarness('peer-C', cLocal);
+    await startEngine(c);
+    await untilQuiet();
+
+    const copies = conflictCopies(c.fs, path);
+    expect(copies.length, 'differing excalidraw must produce a conflict copy').toBeGreaterThan(0);
+    expect(copies.map((p) => c.fs.readText(p)).join('\n')).toContain(localPayload);
+    expect(c.fs.readText(path)).toBe(serverPayload);
+    expect(c.inbox.filter((e) => e.kind === 'conflict').length).toBeGreaterThanOrEqual(1);
+  }, 60_000);
 });

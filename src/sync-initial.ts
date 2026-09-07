@@ -6,8 +6,8 @@ import { vvCovers, hasSharedHistory, vvEquals, conflictPath, fnv1aHash64 } from 
 import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn } from './logger';
-import { isSyncablePath, pathCaseKey } from './path-policy';
-import { conflictNoticeMessage, failedDocsNoticeMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage } from './user-facing-copy';
+import { isSyncablePath, pathCaseKey, isExcalidrawPath } from './path-policy';
+import { conflictNoticeMessage, excalidrawConflictNoticeMessage, failedDocsNoticeMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage } from './user-facing-copy';
 import type { InboxSink } from './inbox';
 
 export type SyncMode = 'pull' | 'push' | 'merge';
@@ -772,6 +772,47 @@ async function syncOverlappingDoc(
   // Detect external disk changes (edits outside Obsidian while it was closed).
   const hadLocalDiskChange = !doc.text_matches(localContent) && localContent.trim() !== '';
 
+  const localVVAtStart = doc.export_vv_json();
+  const serverVVBytes = serverDocMap.get(path)?.server_vv;
+  const currentServerVV = serverVVBytes && serverVVBytes.length > 0
+    ? new TextDecoder().decode(serverVVBytes)
+    : null;
+  if (
+    isExcalidrawPath(path) &&
+    currentServerVV !== null &&
+    !vvCovers(localVVAtStart, currentServerVV) &&
+    (hadLocalDiskChange || push.hasPendingEdits(path) || !vvCovers(currentServerVV, localVVAtStart))
+  ) {
+    deps.tracePath('overlap.excalidraw-concurrent', path, {
+      localLen: localContent.length,
+    });
+    push.cancelPendingEdits(path);
+    const probe = await deps.requestSyncStart(path, null);
+    if (probe && probe.delta.length > 0) {
+      const tempDoc = createDocument(PROBE_DOC_UUID, PROBE_PEER_ID);
+      tempDoc.import_snapshot(probe.delta);
+      const serverText = tempDoc.get_text();
+      const textsDiffer = serverText !== localContent;
+      if (textsDiffer && localContent.trim() !== '') {
+        const cPath = conflictPath(app, path);
+        warn(`${tag} excalidraw concurrent conflict`, { path, conflictPath: cPath });
+        await app.vault.create(cPath, localContent);
+        deps.inbox?.add({
+          kind: 'conflict', path: cPath, relatedPath: path,
+          note: excalidrawConflictNoticeMessage(cPath),
+        });
+      }
+      await docs.removeAndClean(path);
+      const freshDoc = await docs.getOrLoad(path);
+      freshDoc.import_snapshot(probe.delta);
+      lastServerVV.set(path, probe.serverVV);
+      deps.tracePath('overlap.excalidraw-write-to-vault', path, { textLen: serverText.length });
+      await writeServerText(deps, path, serverText, localContent);
+      await docs.persist(path);
+      return { keepDirty };
+    }
+  }
+
   // Sync local disk changes into CRDT before computing VV
   if (hadLocalDiskChange) {
     deps.tracePath('overlap.local-disk-change', path, { localLen: localContent.length });
@@ -865,7 +906,7 @@ async function syncOverlappingDoc(
     const isActiveEditorDoc = editor.getActiveEditorPath() === path;
     deps.tracePath('overlap.editor-mode', path, { isActiveEditorDoc });
     if (isActiveEditorDoc && result.delta.length > 0) {
-      await push.flushPendingEdits(path);
+      if (await push.flushPendingEdits(path)) return { keepDirty };
     }
 
     // Import server delta — for active editor doc, use import_and_diff

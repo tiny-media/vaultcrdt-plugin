@@ -3,8 +3,8 @@ import type { DocumentManager } from './document-manager';
 import type { EditorIntegration } from './editor-integration';
 import type { WasmSyncDocument } from './wasm-bridge';
 import { log, warn, error } from './logger';
-import { isCaseOnlyPathRename } from './path-policy';
-import { fnv1aHash64 } from './conflict-utils';
+import { isCaseOnlyPathRename, isExcalidrawPath } from './path-policy';
+import { fnv1aHash64, vvCovers } from './conflict-utils';
 
 /**
  * Delete-Journal invariant (see the 2026-04-07 delete-journal audit follow-up (local)):
@@ -47,6 +47,11 @@ export class PushHandler {
   private sentUnacked = new Set<string>();
   /** Serialize journal writes so an older snapshot cannot overwrite a newer one. */
   private journalPersistChain: Promise<void> = Promise.resolve();
+  /**
+   * SyncEngine: conflict-copy the local drawing and adopt the remote doc.
+   * Return true when the local edit must not enter the CRDT.
+   */
+  onExcalidrawConcurrent: ((path: string, localContent: string) => Promise<boolean>) | null = null;
 
   constructor(
     private docs: DocumentManager,
@@ -217,14 +222,15 @@ export class PushHandler {
     this.pushFirstChangeAt.delete(path);
   }
 
-  /** Flush pending debounce edits into CRDT before merging broadcast. */
-  async flushPendingEdits(path: string): Promise<void> {
+  /** Flush pending debounce edits into CRDT before merging broadcast.
+   *  Returns true when an excalidraw concurrent conflict was adopted (caller must abort the merge). */
+  async flushPendingEdits(path: string): Promise<boolean> {
     // Read first: a null leaf walk (plausible on mobile) must not drop a
     // still-scheduled fire, and with no timer armed we still fold if the
     // editor differs from the CRDT (debounce already fired, getOrLoad still
     // in flight).
     const freshContent = this.editor.readCurrentContent(path);
-    if (freshContent === null) return;
+    if (freshContent === null) return false;
     const timer = this.pushDebounceTimers.get(path);
     if (timer !== undefined) window.clearTimeout(timer);
     this.pushDebounceTimers.delete(path);
@@ -234,32 +240,34 @@ export class PushHandler {
       contentLen: freshContent.length,
     });
     const doc = await this.docs.getOrLoad(path);
-    if (!doc.text_matches(freshContent)) {
-      const vvBefore = doc.export_vv_json();
-      doc.sync_from_disk(freshContent);
-      // Push flushed ops to server immediately — otherwise these local ops
-      // never reach the server, breaking the causal chain for subsequent deltas.
-      try {
-        const delta = doc.export_delta_since_vv_json(vvBefore);
-        if (delta.length > 0) {
-          const wsOpen = this.isWsOpen();
-          if (wsOpen) {
-            this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
-            this.sentUnacked.add(path);
-            this.tracePath('push.flush.sent', path, { deltaLen: delta.length });
-            log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
-          } else {
-            this.tracePath('push.flush.deferred-offline', path, { deltaLen: delta.length });
-            log(`${this.tag} flushed pending edits locally (WS closed)`, { path, deltaLen: delta.length });
-          }
-        }
-      } catch (err) {
-        this.tracePath('push.flush.error', path, { message: err instanceof Error ? err.message : String(err) });
-        warn(`${this.tag} flush push failed`, { path, err });
-      }
-    } else {
+    if (doc.text_matches(freshContent)) {
       this.tracePath('push.flush.skip-text-match', path);
+      return false;
     }
+    if (await this.holdExcalidrawConcurrent(path, doc, freshContent)) return true;
+    const vvBefore = doc.export_vv_json();
+    doc.sync_from_disk(freshContent);
+    // Push flushed ops to server immediately — otherwise these local ops
+    // never reach the server, breaking the causal chain for subsequent deltas.
+    try {
+      const delta = doc.export_delta_since_vv_json(vvBefore);
+      if (delta.length > 0) {
+        const wsOpen = this.isWsOpen();
+        if (wsOpen) {
+          this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
+          this.sentUnacked.add(path);
+          this.tracePath('push.flush.sent', path, { deltaLen: delta.length });
+          log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+        } else {
+          this.tracePath('push.flush.deferred-offline', path, { deltaLen: delta.length });
+          log(`${this.tag} flushed pending edits locally (WS closed)`, { path, deltaLen: delta.length });
+        }
+      }
+    } catch (err) {
+      this.tracePath('push.flush.error', path, { message: err instanceof Error ? err.message : String(err) });
+      warn(`${this.tag} flush push failed`, { path, err });
+    }
+    return false;
   }
 
   pushDocCreate(filePath: string, doc: WasmSyncDocument, options: { replaceTombstone?: boolean } = {}): void {
@@ -360,6 +368,29 @@ export class PushHandler {
 
   // ── Private ──────────────────────────────────────────────────────────────────
 
+  /**
+   * Concurrent excalidraw: the server VV has ops this doc has not seen.
+   * Do not sync_from_disk — that would CRDT-merge compressed payloads.
+   * Returns true when the caller must skip the local edit / abort the merge.
+   */
+  private async holdExcalidrawConcurrent(
+    path: string,
+    doc: WasmSyncDocument,
+    content: string,
+  ): Promise<boolean> {
+    if (!isExcalidrawPath(path)) return false;
+    const serverVV = this.lastServerVV.get(path);
+    if (serverVV === undefined) return false;
+    if (vvCovers(doc.export_vv_json(), serverVV)) return false;
+    this.cancelPendingEdits(path);
+    this.tracePath('push.excalidraw-concurrent', path);
+    if (this.onExcalidrawConcurrent) {
+      return await this.onExcalidrawConcurrent(path, content);
+    }
+    warn(`${this.tag} excalidraw concurrent edit held out of CRDT`, { path });
+    return true;
+  }
+
   private pushFileDelta(path: string, content: string): void {
     void this.pushFileDeltaAsync(path, content);
   }
@@ -389,6 +420,8 @@ export class PushHandler {
       this.tracePath('push.delta.skip-text-match', path, { contentLen: content.length });
       return;
     }
+
+    if (await this.holdExcalidrawConcurrent(path, doc, content)) return;
 
     const recreatePendingDelete = this.pendingDeletes.has(path);
 

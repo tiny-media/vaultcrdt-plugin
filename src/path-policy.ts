@@ -156,6 +156,20 @@ export function attachmentCap(
   return 0;
 }
 
+/**
+ * Compressed Excalidraw drawings (`*.excalidraw.md`). Concurrent CRDT merges
+ * interleave the LZString payload; sequential single-editor diffs are safe.
+ * Blocked prefixes (`.obsidian/`, `.trash/`) win over the suffix.
+ */
+export function isExcalidrawPath(path: string): boolean {
+  if (!path || typeof path !== 'string') return false;
+  const key = pathCaseKey(path);
+  for (const prefix of BLOCKED_PREFIXES) {
+    if (key.startsWith(pathCaseKey(prefix))) return false;
+  }
+  return key === 'excalidraw.md' || key.endsWith('.excalidraw.md');
+}
+
 export function isSyncablePath(path: string): boolean {
   if (!path || typeof path !== 'string') return false;
 

@@ -9,7 +9,7 @@ import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn, error, redact } from './logger';
 import { PROTOCOL_VERSION, jsonOf } from './protocol';
-import { isSyncablePath } from './path-policy';
+import { isSyncablePath, isExcalidrawPath } from './path-policy';
 import { validateServerUrl, toHttpBase, toWsBase } from './url-policy';
 import { runInitialSync, type SyncMode } from './sync-initial';
 import { SyncTrace } from './sync-trace';
@@ -18,7 +18,7 @@ import { StartupDirtyTracker } from './startup-dirty-tracker';
 import type { InboxSink } from './inbox';
 import { FEATURE_BLOBS } from './server-features';
 import type { BlobUploader } from './blob-uploader';
-import { authRejectedNoticeMessage, protocolMismatchNoticeMessage, conflictNoticeMessage, tombstoneNoticeMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage, tombstoneRenamedNoticeMessage } from './user-facing-copy';
+import { authRejectedNoticeMessage, protocolMismatchNoticeMessage, conflictNoticeMessage, excalidrawConflictNoticeMessage, tombstoneNoticeMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage, tombstoneRenamedNoticeMessage } from './user-facing-copy';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
 export { type SyncMode } from './sync-initial';
@@ -163,6 +163,7 @@ export class SyncEngine {
       this.tag,
       (event, path, data) => this.trace.markPath(event, path, data),
     );
+    this.push.onExcalidrawConcurrent = (path, content) => this.resolveExcalidrawConcurrent(path, content);
   }
 
   // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -740,10 +741,12 @@ export class SyncEngine {
 
     const doc = await this.docs.getOrLoad(docUuid);
     const localVV = doc.export_vv_json();
+    const incomingRaw = msg.server_vv;
+    const incomingServerVV = incomingRaw instanceof Uint8Array && incomingRaw.length > 0
+      ? new TextDecoder().decode(incomingRaw)
+      : null;
     if (localVV !== '{}') {
-      const raw = msg.server_vv;
-      const serverVV = raw instanceof Uint8Array && raw.length > 0 ? new TextDecoder().decode(raw) : null;
-      if (serverVV === null || !hasSharedHistory(localVV, serverVV)) {
+      if (incomingServerVV === null || !hasSharedHistory(localVV, incomingServerVV)) {
         this.trace.markPath('broadcast.disjoint-history', docUuid);
         warn(`${this.tag} broadcast has disjoint or unknown history`, { docUuid });
         await this.resolveDisjointHistory(docUuid, 'broadcast');
@@ -751,7 +754,32 @@ export class SyncEngine {
       }
     }
 
-    await this.push.flushPendingEdits(docUuid);
+    if (
+      isExcalidrawPath(docUuid) &&
+      incomingServerVV !== null &&
+      !vvCovers(localVV, incomingServerVV)
+    ) {
+      let localText = this.editor.readCurrentContent(docUuid);
+      if (localText === null) {
+        const file = this.app.vault.getAbstractFileByPath(docUuid);
+        localText = file instanceof TFile ? await this.app.vault.read(file) : doc.get_text();
+      }
+      const localExtras =
+        this.push.hasPendingEdits(docUuid) ||
+        localText !== doc.get_text() ||
+        !vvCovers(incomingServerVV, localVV);
+      if (localExtras) {
+        this.trace.markPath('broadcast.excalidraw-concurrent', docUuid);
+        await this.resolveExcalidrawConcurrent(docUuid, localText);
+        return;
+      }
+    }
+
+    if (incomingServerVV !== null) this.lastServerVV.set(docUuid, incomingServerVV);
+    if (await this.push.flushPendingEdits(docUuid)) {
+      this.trace.markPath('broadcast.excalidraw-concurrent-flush', docUuid);
+      return;
+    }
     this.trace.markPath('broadcast.after-flush', docUuid);
 
     const textBefore = doc.get_text();
@@ -799,7 +827,7 @@ export class SyncEngine {
         if (!this.catchUpInProgress.has(docUuid)) {
           this.catchUpInProgress.add(docUuid);
           try {
-            await this.push.flushPendingEdits(docUuid);
+            if (await this.push.flushPendingEdits(docUuid)) return;
             const result = await this.requestSyncStart(docUuid, localVVStr);
             if (result && result.delta.length > 0) {
               // Use surgical diff for active editor doc to preserve typing
@@ -876,7 +904,7 @@ export class SyncEngine {
       // text: a fold can add local ops the server has not confirmed.
       const preFoldText = doc.get_text();
       try {
-        await this.push.flushPendingEdits(docUuid);
+        if (await this.push.flushPendingEdits(docUuid)) return;
       } catch (err) {
         this.trace.markPath('broadcast.fold-error', docUuid, {
           message: err instanceof Error ? err.message : String(err),
@@ -932,6 +960,55 @@ export class SyncEngine {
     const text = tombstoneNoticeMessage(docUuid);
     this.inbox?.add({ kind: 'tombstone-edit', path: docUuid, note: text });
     new Notice(redact(text), 8000);
+  }
+
+  /**
+   * Concurrent excalidraw: keep the local drawing as a conflict copy, drop
+   * pending edits, and adopt the remote snapshot as the main line. Do not
+   * push the local edit into the CRDT. Always write the remote text to the
+   * working file so a later FileWatcher scan cannot re-ingest it as a local change.
+   */
+  private async resolveExcalidrawConcurrent(path: string, localContent: string): Promise<boolean> {
+    if (this.catchUpInProgress.has(path)) {
+      log(`${this.tag} excalidraw conflict already in progress`, { path });
+      return true;
+    }
+    this.catchUpInProgress.add(path);
+    try {
+      this.push.cancelPendingEdits(path);
+      const result = await this.requestSyncStart(path, null);
+      if (result === null || result.delta.length === 0) {
+        warn(`${this.tag} excalidraw concurrent adopt has no server snapshot`, { path });
+        this.trace.markPath('excalidraw.no-snapshot', path);
+        return true;
+      }
+      const tempDoc = createDocument('__probe__', '__probe__');
+      tempDoc.import_snapshot(result.delta);
+      const serverText = tempDoc.get_text();
+      const textsDiffer = serverText !== localContent;
+      if (textsDiffer && localContent.trim() !== '') {
+        const cPath = conflictPath(this.app, path);
+        await this.app.vault.create(cPath, localContent);
+        this.inbox?.add({
+          kind: 'conflict', path: cPath, relatedPath: path,
+          note: excalidrawConflictNoticeMessage(cPath),
+        });
+        warn(`${this.tag} excalidraw concurrent conflict`, { path, conflictPath: cPath });
+        this.trace.markPath('excalidraw.conflict', path, { conflictPath: cPath });
+      } else {
+        log(`${this.tag} excalidraw concurrent adopt (blank or identical local)`, { path });
+      }
+      await this.docs.removeAndClean(path);
+      const freshDoc = await this.docs.getOrLoad(path);
+      freshDoc.import_snapshot(result.delta);
+      this.lastServerVV.set(path, result.serverVV);
+      await this.editor.writeToVault(path, serverText);
+      await this.docs.persist(path);
+      this.rememberVVCache(path, result.serverVV, freshDoc.get_text());
+      return true;
+    } finally {
+      this.catchUpInProgress.delete(path);
+    }
   }
 
   private async resolveDisjointHistory(docUuid: string, reason: 'create_conflict' | 'broadcast'): Promise<void> {
