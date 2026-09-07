@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-09-07
+
+### Fixed
+- Mobile: embeds that arrive in an already-open note (typed locally or
+  delivered by a remote edit) now hydrate without switching notes. The
+  lazy hydration pass gains a `metadataCache 'changed'` trigger for the
+  active note (2 s trailing debounce), re-arms a single pending request
+  when a pass is busy, and re-checks the active note right after the
+  blob index caught up — closing the ordering race where the note text
+  arrives before the index knows the hash.
+
 ## [0.5.6] - 2026-09-07
 
 ### Fixed
