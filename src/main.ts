@@ -55,6 +55,11 @@ export default class VaultCRDTPlugin extends Plugin {
   blobDownloader!: BlobDownloader;
   obsidianSync!: ObsidianSync;
   private obsidianRawRef: EventRef | null = null;
+  /** Single-slot trailing debounce for mobile re-hydration of the active note. */
+  private hydrateTimer: ReturnType<typeof setTimeout> | null = null;
+  private hydrateGeneration = 0;
+  /** Set on shutdown: no NEW hydration timers may be armed after teardown. */
+  private hydrationDestroyed = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -90,6 +95,8 @@ export default class VaultCRDTPlugin extends Plugin {
       removeFile: (path) => this.app.vault.adapter.remove(path),
       obsidianSyncEnabled: () => this.settings?.obsidianSync ?? { settings: false, styles: false },
       sweepObsidian: () => this.obsidianSync.sweep(),
+      // Index is fresh right after catch-up: no 2 s guard needed here.
+      hydrateActiveFile: () => this.scheduleActiveFileHydration(0),
     });
     this.blobDownloader = new BlobDownloader({
       index: this.blobIndex,
@@ -410,6 +417,33 @@ export default class VaultCRDTPlugin extends Plugin {
         void this.blobDownloader.hydrateForOpenFile(file);
       })
     );
+
+    // Mobile: embeds that arrive in an ALREADY-OPEN note (typed locally or
+    // delivered by a remote CRDT edit) never fire 'file-open'. metadataCache
+    // 'changed' does fire in that case (measured on legacy WebView too).
+    this.registerEvent(
+      this.app.metadataCache.on('changed', (file) => {
+        if (!Platform.isMobile || !this.syncEngineInitialized) return;
+        if (!file || file.path !== this.app.workspace.getActiveFile()?.path) return;
+        // 2000 ms, not less: BLOB_CATCHUP_DEBOUNCE_MS means the blob index may
+        // learn the new hash up to 2 s after the note text arrived.
+        this.scheduleActiveFileHydration(2000);
+      })
+    );
+  }
+
+  /** Trailing debounce, single slot: latest active file wins, one pass. */
+  private scheduleActiveFileHydration(delayMs: number): void {
+    if (!Platform.isMobile || this.hydrationDestroyed) return;
+    if (this.hydrateTimer !== null) clearTimeout(this.hydrateTimer);
+    const generation = ++this.hydrateGeneration;
+    this.hydrateTimer = setTimeout(() => {
+      this.hydrateTimer = null;
+      if (generation !== this.hydrateGeneration) return;
+      const active = this.app.workspace.getActiveFile();
+      if (!active) return;
+      void this.blobDownloader.hydrateForOpenFile(active);
+    }, delayMs);
   }
 
   private async initializeSyncEngine(): Promise<void> {
@@ -837,6 +871,14 @@ export default class VaultCRDTPlugin extends Plugin {
 
   private async shutdown(): Promise<void> {
     this.clearActivityTimer();
+    if (this.hydrateTimer !== null) {
+      clearTimeout(this.hydrateTimer);
+      this.hydrateTimer = null;
+    }
+    // Invalidate any callback that already left the timer queue, and bar any
+    // late catchUp tail from arming a NEW timer after teardown.
+    this.hydrateGeneration += 1;
+    this.hydrationDestroyed = true;
     // note: pending deletes are not flushed on unload; startup reconciles.
     this.pendingDeleteChecks.clear();
     // Wait for pending initialization before stopping

@@ -47,6 +47,13 @@ export interface BlobUploaderDeps {
   obsidianSyncEnabled?: () => ObsidianSyncEnabled;
   /** Backstop adapter sweep for .obsidian category files. */
   sweepObsidian?: () => Promise<void>;
+  /**
+   * Mobile only: re-run lazy hydration for the currently active note after
+   * catch-up learned new server blob states. Closes the ordering race where
+   * the note text (and its metadata-cache event) arrives before the blob
+   * index knows the hash. Wired to the debounced scheduler in main.ts.
+   */
+  hydrateActiveFile?: () => void;
 }
 
 export interface BlobHttpResult {
@@ -504,15 +511,18 @@ export class BlobUploader {
     const since = this.deps.index.maxSeq();
     const resp = await this.http('GET', `/vault/blob-paths?since_seq=${since}&limit=1000`);
     const states = Array.isArray(resp.json.states) ? (resp.json.states as RemoteState[]) : [];
+    let applied = 0;
     let maxSeq = since;
     for (const s of states) {
       if (typeof s.seq === 'number' && s.seq > maxSeq) maxSeq = s.seq;
       if (typeof s.path_key !== 'string') continue;
       if (s.state === 'deleted') {
+        applied += 1;
         await this.applyRemoteTombstone(s);
         continue;
       }
       if (s.state !== 'live') continue;
+      applied += 1;
       await this.applyRemoteLive(s);
     }
     if (typeof resp.json.max_seq === 'number' && resp.json.max_seq > maxSeq) {
@@ -523,6 +533,7 @@ export class BlobUploader {
     // mobile to .obsidian paths. Sweep is the required backstop (raw is undocumented).
     await this.deps.hydratePending?.();
     await this.deps.sweepObsidian?.();
+    if (applied > 0 && this.deps.isMobile) this.deps.hydrateActiveFile?.();
   }
 
   /** Second-device catch-up: create an index entry when the server has a live path we have never seen. */

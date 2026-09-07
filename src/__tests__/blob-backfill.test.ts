@@ -66,7 +66,7 @@ async function setup() {
       onLayoutReady: vi.fn(),
       iterateAllLeaves: vi.fn(),
     },
-    metadataCache: { getFileCache: vi.fn().mockReturnValue(null) },
+    metadataCache: { getFileCache: vi.fn().mockReturnValue(null), on: vi.fn() },
   } as any;
   const engine = new SyncEngine(app, { vaultId: 'test', peerId: 'test' } as any);
   const plugin = new VaultCRDTPlugin(app, {} as any);

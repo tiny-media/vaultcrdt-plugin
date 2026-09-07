@@ -103,7 +103,13 @@ function makeApp(files: Map<string, Uint8Array>): App {
   } as App;
 }
 
-function makePair(opts: { isMobile?: boolean; cache?: { embeds?: { link: string }[]; links?: { link: string }[] } | null; enabled?: { settings: boolean; styles: boolean } } = {}) {
+function makePair(opts: {
+  isMobile?: boolean;
+  cache?: { embeds?: { link: string }[]; links?: { link: string }[] } | null;
+  cacheFor?: (file: TFile) => { embeds?: { link: string }[]; links?: { link: string }[] } | null;
+  enabled?: { settings: boolean; styles: boolean };
+  hydrateActiveFile?: () => void;
+} = {}) {
   const vault = makeVault();
   const index = new BlobIndex(memStorage());
   const enqueue = vi.fn();
@@ -119,7 +125,7 @@ function makePair(opts: { isMobile?: boolean; cache?: { embeds?: { link: string 
     enqueueUpload: enqueue,
     app: makeApp(vault.files),
     isMobile: opts.isMobile ?? false,
-    getFileCache: () => opts.cache ?? null,
+    getFileCache: (file) => (opts.cacheFor ? opts.cacheFor(file) : opts.cache ?? null),
   });
   const uploader = new BlobUploader({
     index,
@@ -136,6 +142,7 @@ function makePair(opts: { isMobile?: boolean; cache?: { embeds?: { link: string 
     now: () => 0,
     hydratePending: () => downloader.hydratePending(),
     obsidianSyncEnabled: () => opts.enabled ?? { settings: false, styles: false },
+    hydrateActiveFile: opts.hydrateActiveFile,
   });
   return { vault, index, downloader, uploader, enqueue };
 }
@@ -566,5 +573,97 @@ describe('hydration vs sweep (data-loss class)', () => {
     await downloader.hydratePending();
     expect(index.get(CFG)!.hydrated).toBe(true);
     expect(vault.files.get(CFG)).toEqual(BYTES);
+  });
+});
+
+describe('BlobDownloader busy-pass re-arm (mobile)', () => {
+  it('a request during a running pass is re-armed once and then stops', async () => {
+    const first = new Uint8Array([1, 1, 1]);
+    const second = new Uint8Array([2, 2, 2]);
+    const noteA = new TFile();
+    noteA.path = 'a.md';
+    const noteB = new TFile();
+    noteB.path = 'b.md';
+    const { index, downloader, uploader, vault } = makePair({
+      isMobile: true,
+      cacheFor: (f) => (f.path === 'a.md'
+        ? { embeds: [{ link: 'first.png' }] }
+        : { embeds: [{ link: 'second.png' }] }),
+    });
+    index.update('Bilder/first.png', {
+      hash: blake3_hex(first), size: first.length, hydrated: false, seq: 1, generation: 1,
+    });
+    index.update('Bilder/second.png', {
+      hash: blake3_hex(second), size: second.length, hydrated: false, seq: 2, generation: 1,
+    });
+
+    let release!: () => void;
+    const blocked = new Promise<void>((r) => { release = r; });
+    mockRequestUrl.mockImplementation(async (opts: Call) => {
+      const hash = opts.url.split('/').pop() ?? '';
+      if (hash === blake3_hex(first)) {
+        await blocked;
+        return serveRange(first, opts);
+      }
+      if (hash === blake3_hex(second)) return serveRange(second, opts);
+      throw new Error(`unexpected hash ${hash}`);
+    });
+
+    const pass = downloader.hydrateForOpenFile(noteA);
+    await Promise.resolve();
+    await Promise.resolve();
+    // Accepted as pending while the first pass is blocked (old code dropped it).
+    await downloader.hydrateForOpenFile(noteB);
+    expect(index.get('Bilder/second.png')!.hydrated).toBe(false);
+
+    release();
+    await pass;
+    await downloader.whenIdle();
+    await downloader.whenIdle();
+    expect(index.get('Bilder/first.png')!.hydrated).toBe(true);
+    expect(index.get('Bilder/second.png')!.hydrated).toBe(true);
+
+    // No perpetual re-arm: the follow-up pass issues no further GETs.
+    mockRequestUrl.mockClear();
+    await downloader.whenIdle();
+    expect(blobGets()).toEqual([]);
+
+    // Echo: the vault 'create' from the re-arm write uploads nothing.
+    expect(vault.files.get('Bilder/second.png')).toEqual(second);
+    uploader.onFileChanged('Bilder/second.png');
+    await uploader.flush();
+    expect(puts()).toEqual([]);
+    expect(calls().filter((c) => c.url.includes('/vault/blobs/uploads'))).toEqual([]);
+  });
+});
+
+describe('post-catch-up active-file hydration', () => {
+  it('mobile: runs once after catch-up applied new server states', async () => {
+    const hydrateActiveFile = vi.fn();
+    const { uploader } = makePair({ isMobile: true, hydrateActiveFile });
+    mockRequestUrl.mockImplementation(async (opts: Call) => {
+      if (opts.method === 'GET' && opts.url.includes('/vault/blob-paths')) {
+        return catchUpLive(PATH, BYTES);
+      }
+      throw new Error(`unexpected ${opts.method} ${opts.url}`);
+    });
+    await uploader.catchUp();
+    expect(hydrateActiveFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('desktop invariance: never called', async () => {
+    const hydrateActiveFile = vi.fn();
+    const { uploader } = makePair({ isMobile: false, hydrateActiveFile });
+    mockRequestUrl.mockImplementation(async (opts: Call) => {
+      if (opts.method === 'GET' && opts.url.includes('/vault/blob-paths')) {
+        return catchUpLive(PATH, BYTES);
+      }
+      if (opts.method === 'GET' && opts.url.includes('/vault/blobs/')) {
+        return serveRange(BYTES, opts);
+      }
+      throw new Error(`unexpected ${opts.method} ${opts.url}`);
+    });
+    await uploader.catchUp();
+    expect(hydrateActiveFile).not.toHaveBeenCalled();
   });
 });

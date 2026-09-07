@@ -43,6 +43,15 @@ export interface BlobDownloaderDeps {
  */
 export class BlobDownloader {
   private pass: Promise<void> | null = null;
+  /**
+   * Single-slot re-arm (latest wins, no queue): a hydrate request that
+   * arrives WHILE a pass runs is remembered and started once that pass
+   * settles. It does NOT rescue a permanently hung pass — a never-settling
+   * GET never reaches the `finally`. Accepted: no watchdog/timeout is built
+   * on purpose, because a timeout short enough to protect a fast device
+   * would kill legitimate large downloads on slow devices.
+   */
+  private retriggerFile: TFile | null = null;
   private idleWaiters: Array<() => void> = [];
   private readonly inflight = new Set<string>();
 
@@ -64,6 +73,14 @@ export class BlobDownloader {
       if (this.pass === run) this.pass = null;
       const waiters = this.idleWaiters.splice(0);
       for (const w of waiters) w();
+      const retrigger = this.retriggerFile;
+      if (retrigger && !this.pass) {
+        // Clear before starting: the follow-up pass only re-checks pending
+        // links, so `hydrated`/`skipped` short-circuits make it a no-op when
+        // nothing is new — no perpetual re-arm loop.
+        this.retriggerFile = null;
+        void this.hydrateForOpenFile(retrigger);
+      }
     });
     this.pass = run;
     return run;
@@ -88,9 +105,9 @@ export class BlobDownloader {
    */
   async hydrateForOpenFile(file: TFile): Promise<void> {
     if (!this.deps.isMobile) return;
-    if (this.pass) return;
+    if (this.pass) { this.retriggerFile = file; return; }
     if (!(await this.deps.blobsEnabled())) return;
-    if (this.pass) return;
+    if (this.pass) { this.retriggerFile = file; return; }
     return this.beginPass(() => this.runHydrateForOpenFile(file));
   }
 
