@@ -1611,6 +1611,74 @@ describe('SyncEngine', () => {
       );
       expect(createCalls.length).toBe(0);
     });
+
+    it('keeps and re-publishes when tombstone hash mismatches even if CRDT matches disk', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'kept.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'kept.md' }]);
+      mockVault.read.mockResolvedValue('offline watcher edit');
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.get_text.mockReturnValue('offline watcher edit');
+      await engine.start();
+      const add = vi.fn();
+      engine.inbox = { add };
+      const syncPromise = engine.initialSync();
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [],
+        tombstones: ['kept.md'],
+        tombstone_hashes: [{ doc_uuid: 'kept.md', content_hash: fnv1aHash64('old server text') }],
+      });
+      await syncPromise;
+
+      expect(mockFileManager.trashFile).not.toHaveBeenCalled();
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'kept.md',
+        note: remoteDeleteKeptNoticeMessage('kept.md'),
+      }));
+      const createCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_create' && c[0]?.doc_uuid === 'kept.md',
+      );
+      expect(createCalls.length).toBe(1);
+      expect(createCalls[0][0]).toMatchObject({
+        type: 'doc_create',
+        doc_uuid: 'kept.md',
+        replace_tombstone: true,
+      });
+    });
+
+    it('trashes when tombstone hash matches local content even if CRDT-vs-disk diverges', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'gone.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'gone.md' }]);
+      mockVault.read.mockResolvedValue('same as tombstone');
+      mockDocInstance.text_matches.mockReturnValue(false);
+      await engine.start();
+      const add = vi.fn();
+      engine.inbox = { add };
+      const syncPromise = engine.initialSync();
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [],
+        tombstones: ['gone.md'],
+        tombstone_hashes: [{ doc_uuid: 'gone.md', content_hash: fnv1aHash64('same as tombstone') }],
+      });
+      await syncPromise;
+
+      expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'gone.md',
+        note: remoteDeleteTrashedNoticeMessage('gone.md'),
+      }));
+      const createCalls = mockEncode.mock.calls.filter(
+        (c: any[]) => c[0]?.type === 'doc_create'
+      );
+      expect(createCalls.length).toBe(0);
+    });
   });
 
   // ── onFileChanged (debounced) — sends delta not snapshot ──────────────────
@@ -3663,6 +3731,67 @@ describe('SyncEngine', () => {
 
       expect(mockFileManager.trashFile).not.toHaveBeenCalled();
       expect(mockVault.read).not.toHaveBeenCalled();
+    });
+
+    it('keeps when an offline watcher edit was absorbed into the CRDT and the tombstone hash mismatches', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'kept.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      const localEdited = 'offline watcher edit';
+      mockVault.read.mockResolvedValue(localEdited);
+      // Watcher path: absorb into CRDT while disconnected (no direct CRDT write).
+      mockDocInstance.text_matches.mockReturnValue(false);
+      await engine.start();
+      mockWsInstance.readyState = 3;
+      engine.onFileChangedImmediate('kept.md', localEdited);
+      await flush();
+      expect(mockDocInstance.sync_from_disk).toHaveBeenCalledWith(localEdited);
+      expect((engine as any).push.hasPendingEdits('kept.md')).toBe(false);
+      expect((engine as any).push.hasUnackedEdit('kept.md')).toBe(false);
+      // After absorb, CRDT == disk — old heuristics would trash.
+      mockDocInstance.text_matches.mockReturnValue(true);
+      mockDocInstance.get_text.mockReturnValue(localEdited);
+      const add = vi.fn();
+      engine.inbox = { add };
+
+      fireMessage({
+        type: 'doc_deleted',
+        doc_uuid: 'kept.md',
+        content_hash: fnv1aHash64('old server text'),
+      });
+      await flush();
+
+      expect(mockFileManager.trashFile).not.toHaveBeenCalled();
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'kept.md',
+        note: remoteDeleteKeptNoticeMessage('kept.md'),
+      }));
+      expect((engine as any).push.hasPendingDelete('kept.md')).toBe(true);
+    });
+
+    it('trashes when doc_deleted content_hash matches local content even if CRDT-vs-disk diverges', async () => {
+      const mockFile = Object.assign(Object.create(TFile.prototype), { path: 'gone.md' });
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.read.mockResolvedValue('same as tombstone');
+      mockDocInstance.text_matches.mockReturnValue(false);
+      await engine.start();
+      await (engine as any).docs.getOrLoad('gone.md');
+      const add = vi.fn();
+      engine.inbox = { add };
+
+      fireMessage({
+        type: 'doc_deleted',
+        doc_uuid: 'gone.md',
+        content_hash: fnv1aHash64('same as tombstone'),
+      });
+      await flush();
+
+      expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'gone.md',
+        note: remoteDeleteTrashedNoticeMessage('gone.md'),
+      }));
     });
   });
 

@@ -564,7 +564,8 @@ export async function runInitialSync(
   // 5. Unacked offline deletes were resent above, after reconcile.
 
   // 6. Tombstones — trash local files (skip if server also has the doc — create-after-delete)
-  // Keep-guard (T2): do not trash when local edits cannot be proven clean.
+  // Keep-guard (T2): pending/unacked keep; then tombstone content_hash is the
+  // authoritative proof (mismatch KEEP, match Trash). CRDT-vs-disk only if no hash.
   tPhase = performance.now();
   const tombstoneHashByUuid = new Map<string, string | null>();
   for (const entry of tombstone_hashes ?? []) {
@@ -586,24 +587,28 @@ export async function runInitialSync(
     if (push.hasPendingEdits(uuid) || push.hasUnackedEdit(uuid)) {
       keep = true;
     } else {
-      // Deviation 2 (shared with the live guard in SyncEngine.onDocDeleted):
-      // content proof reads editor text if a leaf is open, otherwise DISK via
-      // readEffectiveLocalContent (same helper as steps 3/4).
+      // Content proof reads editor text if a leaf is open, otherwise DISK via
+      // readEffectiveLocalContent (same helper as steps 3/4). Shared with the
+      // live guard in SyncEngine.onDocDeleted.
       const localContent = await readEffectiveLocalContent(app, editor, f);
-      const persisted = await docs.loadPersistedSnapshot(uuid);
-      if (persisted !== null) {
-        const doc = await docs.getOrLoad(uuid);
-        keep = !doc.text_matches(localContent);
+      const remoteHash = tombstoneHashByUuid.get(uuid);
+      if (typeof remoteHash === 'string') {
+        // Authoritative (T2) for every peer with a present hash — not only
+        // stateless. Server captured fnv1aHash64 of the deleted content.
+        // Mismatch ⇒ unsynced local value (even when CRDT already absorbed
+        // the offline edit, so CRDT == disk). Match ⇒ provably clean ⇒ Trash.
+        keep = fnv1aHash64(localContent) !== remoteHash;
       } else {
-        const remoteHash = tombstoneHashByUuid.get(uuid);
-        if (remoteHash == null) {
-          // Fail-safe (T2): old server omits tombstone_hashes; pre-migration
-          // tombstones send content_hash NULL. Stateless peers cannot prove
-          // unmodified, so KEEP. Live equivalent: onDocDeleted KEEPs when the
-          // doc is not resident and loadPersistedSnapshot returns null.
-          keep = true;
+        // Fallback when hash is absent (old server omits tombstone_hashes;
+        // pre-migration tombstones send content_hash NULL).
+        // Deviation 1: no persisted snapshot ⇒ cannot prove unmodified ⇒ KEEP.
+        // Deviation 2: snapshot present ⇒ CRDT-vs-disk (or editor) only.
+        const persisted = await docs.loadPersistedSnapshot(uuid);
+        if (persisted !== null) {
+          const doc = await docs.getOrLoad(uuid);
+          keep = !doc.text_matches(localContent);
         } else {
-          keep = fnv1aHash64(localContent) !== remoteHash;
+          keep = true;
         }
       }
     }

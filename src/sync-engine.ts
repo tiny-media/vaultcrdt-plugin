@@ -38,6 +38,11 @@ function fieldText(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
+/** Tombstone content_hash from a doc_deleted frame. Absent/null on old servers. */
+function optionalContentHash(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
 /**
  * Max silence from the server before the socket is treated as a zombie.
  * Checked on each heartbeat tick, so a dead connection is force-closed
@@ -509,7 +514,10 @@ export class SyncEngine {
             if (type === 'delta_broadcast') {
               await this.onDeltaBroadcast(queued);
             } else if (type === 'doc_deleted') {
-              await this.onDocDeleted(queued.doc_uuid as string);
+              await this.onDocDeleted(
+                queued.doc_uuid as string,
+                optionalContentHash(queued.content_hash),
+              );
             } else if (type === 'create_conflict') {
               await this.resolveDisjointHistory(queued.doc_uuid as string, 'create_conflict');
             }
@@ -650,7 +658,10 @@ export class SyncEngine {
           log(`${this.tag} delete queued (initialSync running)`, { doc: msg.doc_uuid });
           this.queueBroadcast(msg);
         } else {
-          void this.onDocDeleted(msg.doc_uuid as string);
+          void this.onDocDeleted(
+            msg.doc_uuid as string,
+            optionalContentHash(msg.content_hash),
+          );
         }
         break;
 
@@ -1058,7 +1069,7 @@ export class SyncEngine {
     }
   }
 
-  private async onDocDeleted(docUuid: string): Promise<void> {
+  private async onDocDeleted(docUuid: string, contentHash?: string): Promise<void> {
     if (!isSyncablePath(docUuid)) {
       warn(`${this.tag} rejected delete for invalid path`, { docUuid });
       return;
@@ -1066,44 +1077,57 @@ export class SyncEngine {
     const doc = this.docs.get(docUuid);
     const editorContent = this.editor.readCurrentContent(docUuid);
     const unackedKeep = this.push.hasUnackedEdit(docUuid);
-    // Keep-guard matches initial-sync Deviation 2 (sync-initial.ts): do not trash
-    // when local content cannot be proven clean. Editor text wins when a leaf is
-    // open; otherwise, with an in-memory CRDT, read disk (TFile via
-    // getAbstractFileByPath → vault.read) so an unwatched external/doze edit is
-    // not discarded when a remote tombstone arrives.
-    // Non-resident docs (mobile unloads under memory pressure) must take the same
-    // proof path: loadPersistedSnapshot first — never getOrLoad on a missing
-    // snapshot (that mints an empty CRDT and looks falsely clean). Extra reads
-    // per tombstone are acceptable; deletes are rare.
-    let contentDiverged = false;
-    if (doc !== undefined) {
-      if (editorContent !== null) {
-        contentDiverged = !doc.text_matches(editorContent);
-      } else {
+    // Keep-guard (T2), shared with initial-sync step 6:
+    // 1. pending/unacked edits always KEEP.
+    // 2. tombstone content_hash present: fnv1aHash64(local content) vs hash is
+    //    authoritative (editor if a leaf is open, otherwise disk via TFile/
+    //    vault.read). Mismatch ⇒ unsynced local value ⇒ KEEP, even when the
+    //    watcher already folded the offline edit into the CRDT (CRDT == disk).
+    //    Match ⇒ provably clean ⇒ Trash. Skips CRDT-vs-disk heuristics.
+    // 3. hash absent (old server): previous heuristics — CRDT vs editor/disk,
+    //    or persisted snapshot vs disk; no snapshot cannot prove clean ⇒ KEEP.
+    let keep: boolean;
+    if (this.push.hasPendingEdits(docUuid) || unackedKeep) {
+      keep = true;
+    } else if (typeof contentHash === 'string') {
+      let localContent = editorContent;
+      if (localContent === null) {
         const diskFile = this.app.vault.getAbstractFileByPath(docUuid);
         if (diskFile instanceof TFile) {
-          const diskContent = await this.app.vault.read(diskFile);
-          contentDiverged = !doc.text_matches(diskContent);
+          localContent = await this.app.vault.read(diskFile);
         }
       }
+      keep = localContent !== null && fnv1aHash64(localContent) !== contentHash;
     } else {
-      const persisted = await this.docs.loadPersistedSnapshot(docUuid);
-      if (persisted === null) {
-        // Live equivalent of step-6 Deviation 1: no snapshot means we cannot
-        // prove the file is unmodified, so KEEP.
-        contentDiverged = true;
+      let contentDiverged = false;
+      if (doc !== undefined) {
+        if (editorContent !== null) {
+          contentDiverged = !doc.text_matches(editorContent);
+        } else {
+          const diskFile = this.app.vault.getAbstractFileByPath(docUuid);
+          if (diskFile instanceof TFile) {
+            const diskContent = await this.app.vault.read(diskFile);
+            contentDiverged = !doc.text_matches(diskContent);
+          }
+        }
       } else {
-        const loaded = await this.docs.getOrLoad(docUuid);
-        const diskFile = this.app.vault.getAbstractFileByPath(docUuid);
-        if (diskFile instanceof TFile) {
-          const diskContent = await this.app.vault.read(diskFile);
-          contentDiverged = !loaded.text_matches(diskContent);
+        const persisted = await this.docs.loadPersistedSnapshot(docUuid);
+        if (persisted === null) {
+          // Live equivalent of step-6 Deviation 1: no snapshot means we cannot
+          // prove the file is unmodified, so KEEP.
+          contentDiverged = true;
+        } else {
+          const loaded = await this.docs.getOrLoad(docUuid);
+          const diskFile = this.app.vault.getAbstractFileByPath(docUuid);
+          if (diskFile instanceof TFile) {
+            const diskContent = await this.app.vault.read(diskFile);
+            contentDiverged = !loaded.text_matches(diskContent);
+          }
         }
       }
+      keep = contentDiverged;
     }
-    if (this.push.hasPendingEdits(docUuid) ||
-        unackedKeep ||
-        contentDiverged) {
+    if (keep) {
       this.forgetStartupPath(docUuid);
       this.inbox?.add({ kind: 'deleted-remote', path: docUuid, note: remoteDeleteKeptNoticeMessage(docUuid) });
       await this.docs.removeAndClean(docUuid);
