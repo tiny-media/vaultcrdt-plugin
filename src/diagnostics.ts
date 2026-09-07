@@ -24,7 +24,7 @@ export function buildDiagnosticsReport(i: DiagnosticsInput): string {
   const settings: Record<string, string | number | boolean> = {
     vaultSecret: '(redacted)', deviceKey: '(redacted)',
   };
-  for (const key of ['serverUrl', 'vaultId', 'peerId', 'deviceName', 'debounceMs', 'showSyncStatus', 'onboardingComplete']) {
+  for (const key of ['serverUrl', 'vaultId', 'peerId', 'deviceName', 'showSyncStatus', 'onboardingComplete']) {
     const value = i.settings[key];
     if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') settings[key] = value;
   }

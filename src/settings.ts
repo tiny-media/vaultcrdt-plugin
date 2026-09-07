@@ -2,7 +2,14 @@ import { App, Modal, Platform, PluginSettingTab, Setting, requestUrl, Notice } f
 import type VaultCRDTPlugin from './main';
 import { validateServerUrl, toHttpBase, normalizeServerUrl } from './url-policy';
 import { SetupModal } from './setup-modal';
-import { TRUST_NOTICE_TEXT, protocolHealthText, SETUP_COPY, OBSIDIAN_SYNC_COPY, SETTINGS_COPY, vaultSecretSetting } from './user-facing-copy';
+import { TRUST_NOTICE_TEXT, protocolHealthText, SETUP_COPY, OBSIDIAN_SYNC_COPY, SETTINGS_COPY, vaultSecretSetting, PLUGIN_REPO } from './user-facing-copy';
+import { EDIT_DEBOUNCE_MS } from './push-handler';
+
+/**
+ * Guard before re-hydrating the active file after catch-up (main.ts). Lives
+ * here so the settings tab can display it without importing main.ts (cycle).
+ */
+export const HYDRATION_DEBOUNCE_MS = 2000;
 import { PROTOCOL_VERSION, jsonOf } from './protocol';
 import { redact } from './logger';
 import type { ObsidianSyncEnabled } from './path-policy';
@@ -19,7 +26,6 @@ export interface VaultCRDTSettings {
   peerId: string;
   vaultId: string;
   deviceName: string;
-  debounceMs: number;
   showSyncStatus: boolean;
   onboardingComplete: boolean;
   /** Per-device .obsidian blob-lane categories. Defaults OFF (data.json is per-device). */
@@ -33,7 +39,6 @@ export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   peerId: '',
   vaultId: '',
   deviceName: '',
-  debounceMs: 300,
   showSyncStatus: true,
   onboardingComplete: false,
   obsidianSync: { settings: false, styles: false },
@@ -263,32 +268,8 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
     // Note: peerId and deviceName are guaranteed to exist by main.ts
     // loadSettings() — this tab is view/edit only, never the source of truth.
 
-    const pluginVersion: string = this.plugin.manifest.version;
-
-    // ── Status ────────────────────────────────────────────────────────────
-    new Setting(containerEl).setName('Status').setHeading();
-
-    new Setting(containerEl)
-      .setName('Plugin version')
-      .setDesc(`v${pluginVersion}`);
-
-    const healthSetting = new Setting(containerEl)
-      .setName('Server status')
-      .setDesc('Checking...');
-    void this.checkServerHealth(healthSetting);
-
-    // ── Storage Info ──────────────────────────────────────────────────────
-    const storageDetails = containerEl.createEl('details');
-    storageDetails.createEl('summary', { text: 'Storage Info', cls: 'setting-item-heading' });
-    const storageContainer = storageDetails.createDiv();
-    void this.loadStorageInfo(storageContainer);
-
     // ── Connection ────────────────────────────────────────────────────────
-    new Setting(containerEl).setName('Connection').setHeading();
-
-    new Setting(containerEl)
-      .setName('Privacy and trust')
-      .setDesc(TRUST_NOTICE_TEXT);
+    new Setting(containerEl).setName(SETTINGS_COPY.connection).setHeading();
 
     new Setting(containerEl)
       .setName('Server')
@@ -315,11 +296,10 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
-      .setName(SETUP_COPY.vault)
-      .setDesc(this.plugin.settings.vaultId
-        ? `Connected to: ${this.plugin.settings.vaultId}`
-        : 'Not configured — enable the plugin to run Setup');
+    const statusSetting = new Setting(containerEl)
+      .setName(SETTINGS_COPY.statusName)
+      .setDesc(SETTINGS_COPY.statusChecking);
+    void this.showConnectionStatus(statusSetting);
 
     {
       const secret = vaultSecretSetting(this.plugin.settings.deviceKey);
@@ -357,6 +337,16 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           })
       );
 
+    // Visible entry point for the existing `invite-device` command.
+    new Setting(containerEl)
+      .setName(SETTINGS_COPY.addDevice)
+      .setDesc(SETTINGS_COPY.addDeviceDesc)
+      .addButton((btn) =>
+        btn.setButtonText(SETTINGS_COPY.addDeviceButton).setCta().onClick(() => {
+          this.plugin.openInviteModal();
+        })
+      );
+
     new Setting(containerEl)
       .setName(SETTINGS_COPY.joinDifferentVault)
       .setDesc('Run setup again — useful when switching to a new vault or registering one with an admin token.')
@@ -366,14 +356,8 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
         })
       );
 
-    // ── Synced Devices ────────────────────────────────────────────────────
-    const devicesDetails = containerEl.createEl('details');
-    devicesDetails.createEl('summary', { text: 'Synced Devices', cls: 'setting-item-heading' });
-    const devicesContainer = devicesDetails.createDiv();
-    void this.loadPeers(devicesContainer);
-
     // ── Sync ──────────────────────────────────────────────────────────────
-    new Setting(containerEl).setName('Sync').setHeading();
+    new Setting(containerEl).setName(SETTINGS_COPY.sync).setHeading();
 
     new Setting(containerEl)
       .setName('Status bar indicator')
@@ -387,17 +371,31 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Sync delay')
-      .setDesc('How long to wait after your last keystroke before sending changes (100–2000 ms)')
-      .addSlider((slider) =>
-        slider
-          .setLimits(100, 2000, 50)
-          .setValue(this.plugin.settings.debounceMs)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            this.plugin.settings.debounceMs = value;
-            await this.plugin.saveSettings();
-          })
+      .setName(SETTINGS_COPY.keepSettings)
+      .setDesc(`${OBSIDIAN_SYNC_COPY.settingsDesc} ${OBSIDIAN_SYNC_COPY.neverSyncs}`)
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.obsidianSync?.settings ?? false).onChange(async (value) => {
+          this.plugin.settings.obsidianSync = {
+            settings: value,
+            styles: this.plugin.settings.obsidianSync?.styles ?? false,
+          };
+          await this.plugin.saveSettings();
+          await this.plugin.applyObsidianSyncToggle('settings', value);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(SETTINGS_COPY.carryStyles)
+      .setDesc(OBSIDIAN_SYNC_COPY.stylesDesc)
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.obsidianSync?.styles ?? false).onChange(async (value) => {
+          this.plugin.settings.obsidianSync = {
+            settings: this.plugin.settings.obsidianSync?.settings ?? false,
+            styles: value,
+          };
+          await this.plugin.saveSettings();
+          await this.plugin.applyObsidianSyncToggle('styles', value);
+        })
       );
 
     const syncSetting = new Setting(containerEl)
@@ -412,7 +410,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
               syncSetting.setDesc(`${done} / ${total}`);
             });
             syncSetting.setDesc(SETTINGS_COPY.fullSyncDesc);
-            btn.setButtonText('Done!');
+            btn.setButtonText('Done');
           } catch {
             btn.setButtonText('Failed');
           } finally {
@@ -424,48 +422,65 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
         })
       );
 
-    // ── .obsidian sync ─────────────────────────────────────────────────────
-    new Setting(containerEl).setName(OBSIDIAN_SYNC_COPY.heading).setHeading();
+    // ── About ─────────────────────────────────────────────────────────────
+    new Setting(containerEl).setName(SETTINGS_COPY.about).setHeading();
 
     new Setting(containerEl)
-      .setName(OBSIDIAN_SYNC_COPY.settingsName)
-      .setDesc(OBSIDIAN_SYNC_COPY.settingsDesc)
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.obsidianSync?.settings ?? false).onChange(async (value) => {
-          this.plugin.settings.obsidianSync = {
-            settings: value,
-            styles: this.plugin.settings.obsidianSync?.styles ?? false,
-          };
-          await this.plugin.saveSettings();
-          await this.plugin.applyObsidianSyncToggle('settings', value);
+      .setName('Plugin version')
+      .setDesc(`v${this.plugin.manifest.version}`);
+
+    const serverSetting = new Setting(containerEl)
+      .setName('Server')
+      .setDesc(SETTINGS_COPY.statusChecking);
+    void this.showServerAbout(serverSetting);
+
+    new Setting(containerEl)
+      .setName(SETTINGS_COPY.documentation)
+      .setDesc(SETTINGS_COPY.documentationDesc)
+      .addButton((btn) =>
+        btn.setButtonText('Open').onClick(() => {
+          window.open(`https://github.com/${PLUGIN_REPO}`, '_blank');
         })
       );
 
     new Setting(containerEl)
-      .setName(OBSIDIAN_SYNC_COPY.stylesName)
-      .setDesc(OBSIDIAN_SYNC_COPY.stylesDesc)
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.obsidianSync?.styles ?? false).onChange(async (value) => {
-          this.plugin.settings.obsidianSync = {
-            settings: this.plugin.settings.obsidianSync?.settings ?? false,
-            styles: value,
-          };
-          await this.plugin.saveSettings();
-          await this.plugin.applyObsidianSyncToggle('styles', value);
+      .setName('Privacy and trust')
+      .setDesc(TRUST_NOTICE_TEXT);
+
+    // ── Developer ─────────────────────────────────────────────────────────
+    const dev = containerEl.createEl('details');
+    dev.addClass('vcrdt-developer');
+    dev.createEl('summary', { text: SETTINGS_COPY.developer, cls: 'setting-item-heading' });
+    const devContainer = dev.createDiv();
+
+    new Setting(devContainer)
+      .setName(SETTINGS_COPY.copyDiagnostics)
+      .setDesc(SETTINGS_COPY.copyDiagnosticsDesc)
+      .addButton((btn) =>
+        btn.setButtonText(SETUP_COPY.copy).onClick(async () => {
+          btn.setDisabled(true);
+          try {
+            const report = await this.plugin.collectDiagnosticsReport();
+            await navigator.clipboard.writeText(report);
+            btn.setButtonText(SETUP_COPY.copied);
+          } catch {
+            btn.setButtonText(SETUP_COPY.copyFailed);
+          } finally {
+            btn.setDisabled(false);
+          }
         })
       );
 
-    new Setting(containerEl)
-      .setName(OBSIDIAN_SYNC_COPY.neverSyncs)
-      .setDesc(OBSIDIAN_SYNC_COPY.configDirNote);
+    // Read-only constants — displayed, never editable.
+    new Setting(devContainer).setName(SETTINGS_COPY.activeConstants).setHeading();
+    new Setting(devContainer).setName(SETTINGS_COPY.editDebounce).setDesc(`${EDIT_DEBOUNCE_MS} ms`);
+    new Setting(devContainer).setName(SETTINGS_COPY.hydrationDebounce).setDesc(`${HYDRATION_DEBOUNCE_MS} ms`);
+    new Setting(devContainer).setName(SETTINGS_COPY.attachmentCaps).setDesc(SETTINGS_COPY.attachmentCapsValue);
+    new Setting(devContainer)
+      .setName(SETTINGS_COPY.protocolVersionName)
+      .setDesc(protocolHealthText(this.plugin.serverFeatures.protocolVersion(), PROTOCOL_VERSION));
 
-    // ── Advanced ────────────────────────────────────────────────────────────
-    const details = containerEl.createEl('details');
-    details.createEl('summary', { text: 'Advanced', cls: 'setting-item-heading' });
-
-    const advancedContainer = details.createDiv();
-
-    new Setting(advancedContainer)
+    new Setting(devContainer)
       .setName('Peer ID')
       .setDesc(`Unique identifier for this device: ${this.plugin.settings.peerId}`)
       .addButton((btn) =>
@@ -475,7 +490,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
         })
       );
 
-    new Setting(advancedContainer)
+    new Setting(devContainer)
       .setName(SETUP_COPY.vault)
       .setDesc(
         this.plugin.settings.vaultId
@@ -489,8 +504,15 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
         })
       );
 
-    // ── Danger Zone ─────────────────────────────────────────────────────────
-    new Setting(advancedContainer)
+    const storageDetails = devContainer.createEl('details');
+    storageDetails.createEl('summary', { text: 'Storage info', cls: 'setting-item-heading' });
+    void this.loadStorageInfo(storageDetails.createDiv());
+
+    const devicesDetails = devContainer.createEl('details');
+    devicesDetails.createEl('summary', { text: 'Synced devices', cls: 'setting-item-heading' });
+    void this.loadPeers(devicesDetails.createDiv());
+
+    new Setting(devContainer)
       .setName('Reset device identity')
       .setDesc(
         'Give this device a fresh peer identity. Use after copying or restoring '
@@ -512,6 +534,38 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           }
         })
       );
+  }
+
+  /** Plain-language connection line; same /health source as the About block. */
+  private async showConnectionStatus(setting: Setting): Promise<void> {
+    if (!this.plugin.settings.serverUrl || !this.plugin.settings.vaultId) {
+      setting.setDesc('Not connected — no server configured yet.');
+      return;
+    }
+    try {
+      const httpBase = toHttpBase(this.plugin.settings.serverUrl);
+      await requestUrl({ url: `${httpBase}/health`, method: 'GET' });
+      const host = new URL(httpBase).host;
+      setting.setDesc(redact(`Server reachable (${host})`));
+    } catch {
+      setting.setDesc('Not connected — the server did not answer.');
+    }
+  }
+
+  /** About block: server version, protocol state and advertised features. */
+  private async showServerAbout(setting: Setting): Promise<void> {
+    try {
+      const httpBase = toHttpBase(this.plugin.settings.serverUrl);
+      const resp = await requestUrl({ url: `${httpBase}/health`, method: 'GET' });
+      const health = jsonOf<{ version: string; protocol_version: number }>(resp);
+      const version = typeof health.version === 'string' ? health.version : '?';
+      const pv = typeof health.protocol_version === 'number' ? health.protocol_version : undefined;
+      const features = await this.plugin.serverFeatures.get(this.plugin.settings.serverUrl);
+      const featureLine = features.length > 0 ? ` · features: ${features.join(', ')}` : '';
+      setting.setDesc(redact(`v${version} — ${protocolHealthText(pv, PROTOCOL_VERSION)}${featureLine}`));
+    } catch {
+      setting.setDesc('Server not reachable');
+    }
   }
 
   private async loadStorageInfo(container: HTMLElement): Promise<void> {
@@ -679,16 +733,4 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
     }
   }
 
-  private async checkServerHealth(setting: Setting): Promise<void> {
-    try {
-      const httpBase = toHttpBase(this.plugin.settings.serverUrl);
-      const resp = await requestUrl({ url: `${httpBase}/health`, method: 'GET' });
-      const health = jsonOf<{ version: string; protocol_version: number }>(resp);
-      const version = typeof health.version === 'string' ? health.version : '?';
-      const pv = typeof health.protocol_version === 'number' ? health.protocol_version : undefined;
-      setting.setDesc(redact(`Server reachable (server v${version}) — ${protocolHealthText(pv, PROTOCOL_VERSION)}`));
-    } catch {
-      setting.setDesc('Server not reachable');
-    }
-  }
 }

@@ -2,7 +2,7 @@ import { App, Modal, Setting } from 'obsidian';
 import qrcode from 'qrcode-generator';
 import type { VaultCRDTSettings } from './settings';
 import { createSetupUri } from './setup-link';
-import { PLUGIN_REPO, SETUP_COPY as C } from './user-facing-copy';
+import { NEW_DEVICE_HELP, PLUGIN_REPO, SETUP_COPY as C } from './user-facing-copy';
 
 export function renderQr(parent: HTMLElement, value: string): void {
   try {
@@ -42,15 +42,20 @@ export class InviteModal extends Modal {
         catch { b.setButtonText(C.copyFailed); }
       }));
     };
-    el.createEl('h3', { text: C.help });
-    el.createEl('p', { text: C.step1 });
-    el.createEl('p', { text: C.step2 });
-    const brat = `obsidian://brat?plugin=${PLUGIN_REPO}`;
-    copy(el, C.bratLabel, brat);
-    renderQr(el, brat);
-    el.createEl('p', { text: C.step3 });
+    // Option 1 first: the setup link / QR the new device actually needs.
+    el.createEl('p', { text: C.scanFirst, cls: 'setting-item-description' });
     renderQr(el, uri);
     copy(el, C.uriLabel, uri);
+    // Self-contained BRAT help block — delete wholesale once the plugin is in
+    // the community directory.
+    const help = el.createEl('details');
+    help.createEl('summary', { text: NEW_DEVICE_HELP.summary });
+    for (const step of NEW_DEVICE_HELP.steps) {
+      help.createEl('p', { text: step, cls: 'setting-item-description' });
+    }
+    const brat = `obsidian://brat?plugin=${PLUGIN_REPO}`;
+    copy(help, C.bratLabel, brat);
+    renderQr(help, brat);
     if (invite) {
       el.createEl('p', { text: C.inviteActive.replace('{minutes}', minutesLeft(invite.expires_at)) });
     } else {

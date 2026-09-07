@@ -25,9 +25,12 @@ import { fnv1aHash64, vvCovers } from './conflict-utils';
  *   are retried after reconcile, never before request_doc_list.
  * - Recreate intents (local file still present) are never resent as deletes.
  */
-/** Lower bound for the editor push debounce; keeps a misconfigured slider
- * from turning every keystroke into its own push. */
-const MIN_DEBOUNCE_MS = 100;
+/**
+ * How long an editor keystroke burst is held before the push is sent.
+ * Replaces the former user-facing `debounceMs` setting (same value, 300 ms):
+ * the timing is a product decision, not a knob.
+ */
+export const EDIT_DEBOUNCE_MS = 300;
 
 /** Upper bound on how long an unsynced burst of edits may sit locally.
  * Without it, a trailing debounce that resets on every keystroke never fires
@@ -74,7 +77,7 @@ export class PushHandler {
     this.pushFirstChangeAt.set(path, firstChange);
     const existing = this.pushDebounceTimers.get(path);
     if (existing) window.clearTimeout(existing);
-    const debounceMs = Math.max(this.settings.debounceMs, MIN_DEBOUNCE_MS);
+    const debounceMs = EDIT_DEBOUNCE_MS;
     // Never hold an edit longer than PUSH_MAX_WAIT_MS after the first unsynced
     // change of the burst, even while typing keeps resetting the debounce.
     const delayMs = Math.min(

@@ -15,8 +15,8 @@ vi.mock('obsidian', async () => {
 });
 
 import { SetupModal, type SetupResult } from '../setup-modal';
-import { TRUST_NOTICE_TEXT } from '../user-facing-copy';
-import { App } from 'obsidian';
+import { TRUST_NOTICE_TEXT, SETUP_COPY } from '../user-facing-copy';
+import { App, Setting } from 'obsidian';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -26,7 +26,6 @@ const makeSettings = () => ({
   peerId: 'peer-x',
   vaultId: '',
   deviceName: 'test',
-  debounceMs: 700,
   showSyncStatus: true,
   onboardingComplete: false,
 });
@@ -224,5 +223,47 @@ describe('prefilled join', () => {
     expect(mockRequestUrl.mock.calls[0][0].url).toBe('https://sync.example.com/auth/verify');
     expect(JSON.parse(mockRequestUrl.mock.calls[0][0].body)).toEqual({ vault_id: 'friends', api_key: 'pasted-secret' });
     expect(await pending).toMatchObject({ vaultId: 'friends', invite: 'a'.repeat(22), deviceName: 'device' });
+  });
+});
+
+describe('fresh install (no prefill)', () => {
+  it('leads with the invite link and keeps manual entry collapsed', async () => {
+    const modal = new SetupModal(new App(), makeSettings());
+    const pending = modal.prompt();
+    const el = modal.contentEl as unknown as { children: any[] };
+
+    const text = elementText(modal.contentEl);
+    expect(text).toContain(SETUP_COPY.pasteLinkDesc);
+    expect(text).toContain(SETUP_COPY.pasteLinkLabel);
+    // Option 1 text comes before any manual field.
+    expect(text.indexOf(SETUP_COPY.pasteLinkDesc)).toBeLessThan(text.indexOf('Must match on every device'));
+
+    // Manual entry lives in a collapsed <details> block (option 2).
+    const details = el.children.filter((c) => c.tag === 'details');
+    expect(details).toHaveLength(1);
+    expect(elementText(details[0])).toContain(SETUP_COPY.manualSection);
+    expect(elementText(details[0])).toContain('Must match on every device');
+    expect(details[0].attrs.open).toBeUndefined();
+
+    modal.close();
+    await pending;
+  });
+
+  it('adopts a pasted setup link as the prefilled join flow', async () => {
+    const rec = Setting as unknown as { allButtons: Array<{ label: string; click: () => void }> };
+    rec.allButtons.length = 0;
+    const modal = new SetupModal(new App(), makeSettings());
+    const pending = modal.prompt();
+    (modal as unknown as { pastedLink: string }).pastedLink =
+      'obsidian://vaultcrdt/setup?v=1&server=https%3A%2F%2Fsync.example.com&vaultId=friends';
+    rec.allButtons.find((b) => b.label === 'Use link')!.click();
+
+    const text = elementText(modal.contentEl);
+    expect(text).toContain('Join vault friends');
+    expect(text).toContain('Invited to sync.example.com');
+    expect((modal as unknown as { serverUrl: string }).serverUrl).toBe('https://sync.example.com');
+
+    modal.close();
+    await pending;
   });
 });

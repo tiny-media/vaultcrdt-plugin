@@ -20,7 +20,7 @@ vi.mock('obsidian', () => ({
   apiVersion: 'test',
   normalizePath: (p: string) => p,
 }));
-vi.mock('../settings', () => ({ VaultCRDTSettingsTab: class {} }));
+vi.mock('../settings', () => ({ VaultCRDTSettingsTab: class {}, HYDRATION_DEBOUNCE_MS: 2000 }));
 vi.mock('../setup-modal', () => ({ SetupModal: class {} }));
 vi.mock('../wasm-bridge', () => ({ createDocument: vi.fn(), initWasm: vi.fn() }));
 vi.mock('../document-manager', () => ({ DocumentManager: class {} }));

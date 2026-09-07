@@ -140,7 +140,6 @@ function makeSettings(peerId: string): VaultCRDTSettings {
     peerId,
     vaultId: VAULT_ID,
     deviceName: `device-${peerId}`,
-    debounceMs: 300,
     showSyncStatus: false,
     onboardingComplete: true,
   };

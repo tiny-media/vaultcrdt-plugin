@@ -173,7 +173,6 @@ function makeEngineSettings() {
     peerId: 'peer-test',
     vaultId: 'vault-abc',
     deviceName: 'test-device',
-    debounceMs: 300,
     showSyncStatus: true,
     onboardingComplete: false,
   } as any;

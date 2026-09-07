@@ -1,6 +1,6 @@
 import { Modal, App, Setting, requestUrl } from 'obsidian';
 import { defaultDeviceName, type VaultCRDTSettings } from './settings';
-import { VAULT_NAME_RE, type SetupPrefill } from './setup-link';
+import { VAULT_NAME_RE, parseSetupUri, type SetupPrefill } from './setup-link';
 import { validateServerUrl, normalizeServerUrl, toHttpBase } from './url-policy';
 import { SETUP_COPY, joinTitle, invitedHost, TRUST_NOTICE_TEXT } from './user-facing-copy';
 import { FEATURE_INVITE, type ServerFeatureCache } from './server-features';
@@ -35,10 +35,14 @@ export class SetupModal extends Modal {
   private deviceName: string;
   private errorEl: HTMLElement | null = null;
   private peerId: string;
+  /** Text currently in the invite-link paste field (option 1). */
+  private pastedLink = '';
   /** undefined = /health not answered yet, true/false = invite feature known. */
   private inviteSupported: boolean | undefined = undefined;
   /** Set after a rejected redeem: reveals the secret field with a reason. */
   private inviteFallbackReason: string | null = null;
+  /** Error under the paste field when a pasted link could not be parsed. */
+  private linkError: string | null = null;
 
   constructor(
     app: App,
@@ -81,7 +85,9 @@ export class SetupModal extends Modal {
 
     contentEl.createEl('h2', { text: this.prefill && !this.expert ? joinTitle(this.vaultId) : 'VaultCRDT — Setup' });
     contentEl.createEl('p', {
-      text: this.prefill && !this.expert ? invitedHost(new URL(this.serverUrl).host) : 'Enter the details your server admin gave you.',
+      text: this.prefill && !this.expert
+        ? invitedHost(new URL(this.serverUrl).host)
+        : 'Connect this vault to your sync server.',
       cls: 'setting-item-description',
     });
 
@@ -94,6 +100,7 @@ export class SetupModal extends Modal {
     if (this.prefill?.invite && !this.inviteMode()) contentEl.createEl('p', { text: SETUP_COPY.invite });
     if (this.inviteFallbackReason) contentEl.createEl('p', { text: this.inviteFallbackReason, cls: 'setting-item-description' });
     if (this.prefill?.invite && this.features && this.inviteSupported === undefined) void this.loadFeatures();
+    if (!this.prefill) this.renderInviteLink(contentEl);
     if (this.prefill && !this.expert) {
       new Setting(contentEl).setName(SETUP_COPY.server).addText(t => {
         t.setValue(this.serverUrl); t.inputEl.readOnly = true;
@@ -116,8 +123,12 @@ export class SetupModal extends Modal {
         });
       }
     } else {
+    // Option 2: manual entry — collapsed by default, clearly secondary.
+    const manual = contentEl.createEl('details');
+    manual.createEl('summary', { text: SETUP_COPY.manualSection });
+    if (this.expert) manual.setAttribute('open', 'true');
     // Server URL
-    new Setting(contentEl)
+    new Setting(manual)
       .setName('Server')
       .setDesc('Address of your sync server')
       .addText((text) =>
@@ -128,7 +139,7 @@ export class SetupModal extends Modal {
       );
 
     // Vault ID
-    new Setting(contentEl)
+    new Setting(manual)
       .setName(SETUP_COPY.vault)
       .setDesc('Must match on every device that syncs this vault')
       .addText((text) =>
@@ -139,7 +150,7 @@ export class SetupModal extends Modal {
       );
 
     // Vault secret
-    new Setting(contentEl)
+    new Setting(manual)
       .setName(SETUP_COPY.secretLabel)
       .setDesc('Shared secret for this vault — same on every device')
       .addText((text) => {
@@ -154,7 +165,7 @@ export class SetupModal extends Modal {
     // Creating a new vault? — collapsible, default-collapsed so existing
     // users are never confronted with the admin token field unless they
     // actively opt in to registering a new vault.
-    const advanced = contentEl.createEl('details');
+    const advanced = manual.createEl('details');
     advanced.createEl('summary', { text: 'Creating a new vault?' });
     new Setting(advanced)
       .setName('Admin Token')
@@ -187,6 +198,49 @@ export class SetupModal extends Modal {
           void this.submit(btn);
         })
       );
+  }
+
+  /**
+   * Option 1 on a fresh install: the invite link. Shown before any manual
+   * field so a user arriving from BRAT reads "get the link first".
+   */
+  private renderInviteLink(contentEl: HTMLElement): void {
+    contentEl.createEl('p', { text: SETUP_COPY.pasteLinkDesc, cls: 'setting-item-description' });
+    const apply = (raw: string): void => {
+      const value = raw.trim();
+      if (!value) return;
+      try {
+        const parsed = parseSetupUri(value);
+        this.prefill = parsed;
+        this.expert = false;
+        this.serverUrl = parsed.serverUrl;
+        this.vaultId = parsed.vaultId;
+        this.vaultSecret = '';
+        this.deviceName = defaultDeviceName();
+        // A pasted invite can still be redeemed when the caller handed us a
+        // feature cache; without one we fall back to the secret form.
+        this.inviteSupported = parsed.invite && this.features ? undefined : false;
+        this.linkError = null;
+      } catch {
+        this.linkError = SETUP_COPY.pasteLinkInvalid;
+      }
+      this.onOpen();
+    };
+    new Setting(contentEl)
+      .setName(SETUP_COPY.pasteLinkLabel)
+      .addText((t) => {
+        t.setPlaceholder(SETUP_COPY.pasteLinkPlaceholder)
+          .setValue('')
+          .onChange((v) => { this.pastedLink = v; });
+      })
+      .addButton((b) => b.setButtonText(SETUP_COPY.paste).onClick(async () => {
+        try { apply(await navigator.clipboard.readText()); }
+        catch { this.linkError = SETUP_COPY.pasteFailed; this.onOpen(); }
+      }))
+      .addButton((b) => b.setButtonText('Use link').onClick(() => { apply(this.pastedLink); }));
+    if (this.linkError) {
+      contentEl.createEl('p', { text: this.linkError, cls: 'setting-item-description' });
+    }
   }
 
   private showError(msg: string): void {

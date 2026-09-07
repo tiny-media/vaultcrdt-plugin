@@ -125,16 +125,33 @@ export const SETUP_COPY = {
   copyFailed: 'Could not copy. Please copy manually.', copySecret: 'Copy vault secret',
   bratLabel: 'Plugin install link', uriLabel: 'Setup link', secretLabel: 'Vault secret',
   secretQr: 'Show secret as QR', secretAdvice: 'Send the secret as a disappearing message / delete after joining.',
-  help: 'Install help',
-  step1: '1. Install Obsidian, then install BRAT from Community plugins.',
-  step2: '2. Tap this link on the phone to install VaultCRDT:',
-  step3: '3. Then scan the setup QR below.',
+  scanFirst: 'Scan this code on the new device, or send the link.',
+  pasteLinkLabel: 'Invite link',
+  pasteLinkDesc: 'The easiest way: get an invite link or QR code from your admin or from an already-set-up device. Paste the link here.',
+  pasteLinkPlaceholder: 'obsidian://vaultcrdt/setup?...',
+  pasteLinkInvalid: 'That does not look like a VaultCRDT invite link.',
+  manualSection: 'Enter server details by hand',
   configure: 'VaultCRDT: open Settings to configure sync',
   failed: 'VaultCRDT: setup failed — check Settings',
   qrFailed: 'This link is too long for a QR. Copy the link instead.',
   inviteActive: 'One-use invite active for about {minutes} min — the other device only needs to scan it. No secret required.',
   setupLinkOnly: 'This server does not support invites yet: the link prefills the form, but the vault secret must still be sent separately.',
 };
+/**
+ * BRAT install walkthrough for the person guiding a new device. Self-contained
+ * block: once the plugin is in the community directory, delete this constant
+ * and its single use in InviteModal.
+ */
+export const NEW_DEVICE_HELP = {
+  summary: 'Installing on the new device',
+  steps: [
+    '1. Install Obsidian, open your vault, and leave restricted mode: "Community plugins" → "Turn on community plugins".',
+    '2. In "Community plugins" → "Browse", search for "brat", install it, and enable it.',
+    '3. In the BRAT options: "Beta plugin list" → "+" → repository tiny-media/vaultcrdt-plugin → "Add Plugin".',
+    '4. VaultCRDT appears — open it and scan or paste the invite link from above.',
+  ],
+};
+
 export const joinTitle = (vault: string): string => `Join vault ${vault}`;
 export const invitedHost = (host: string): string => `Invited to ${host}`;
 export const replaceConnectionText = (vault: string): string =>
@@ -164,6 +181,27 @@ export const SETTINGS_COPY = {
   vaultIdSwitch: 'Switching vaults runs setup again',
   joinDifferentVault: 'Join a different vault',
   openSetup: 'Open setup…',
+  connection: 'Connection',
+  sync: 'Sync',
+  about: 'About',
+  developer: 'Developer',
+  addDevice: 'Add another device',
+  addDeviceDesc: 'Shows an invite link and a QR code for the new device.',
+  addDeviceButton: 'Add device',
+  statusName: 'Status',
+  statusChecking: 'Checking…',
+  keepSettings: 'Keep app settings the same on all devices',
+  carryStyles: 'Carry themes & CSS snippets over',
+  documentation: 'Documentation',
+  documentationDesc: 'Setup, troubleshooting and server notes.',
+  copyDiagnostics: 'Copy diagnostics report',
+  copyDiagnosticsDesc: 'Copies a report without secrets to the clipboard.',
+  activeConstants: 'Active constants',
+  editDebounce: 'Edit debounce',
+  hydrationDebounce: 'Hydration debounce',
+  attachmentCaps: 'Attachment limits',
+  attachmentCapsValue: 'images 10 MiB · PDF 10 MiB · audio 25 MiB · .obsidian files 2 MiB',
+  protocolVersionName: 'Protocol version',
   fullSync: 'Full sync',
   fullSyncDesc: 'Pull all documents from the server and push all local files',
   runFullSync: 'Run full sync',

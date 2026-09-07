@@ -50,9 +50,10 @@ describe('onboarding UI', () => {
     try {
       const modal = new InviteModal(new App(), settings); modal.open();
       expect(ui.qr).toHaveBeenCalledTimes(2);
-      expect(ui.qr.mock.calls[0][0]).toBe('obsidian://brat?plugin=tiny-media/vaultcrdt-plugin');
+      // Setup link first (option 1), BRAT install link inside the help block.
+      expect(ui.qr.mock.calls[1][0]).toBe('obsidian://brat?plugin=tiny-media/vaultcrdt-plugin');
       for (const [data] of ui.qr.mock.calls) assertNoSecret(data, settings.vaultSecret);
-      expect(ui.qr.mock.calls[1][0]).not.toContain('invite=');
+      expect(ui.qr.mock.calls[0][0]).not.toContain('invite=');
       expect(ui.toggles[0].value).toBe(false);
       expect(writeText).not.toHaveBeenCalled();
       await ui.buttons.find(b => b.label === 'Copy vault secret').click();
@@ -63,11 +64,11 @@ describe('onboarding UI', () => {
       // wrap-friendly <code> (long URIs overflowed the tablet modal).
       const copyRows = ui.rows.filter(r => r.descEl.codes.length > 0);
       expect(copyRows.map(r => [r.name, r.descEl.codes[0].tag, r.descEl.codes[0].cls])).toEqual([
-        ['Plugin install link', 'code', 'vcrdt-copy-code'],
         ['Setup link', 'code', 'vcrdt-copy-code'],
+        ['Plugin install link', 'code', 'vcrdt-copy-code'],
         ['Vault secret', 'code', 'vcrdt-copy-code'],
       ]);
-      expect(copyRows[1].descEl.codes[0].text).toContain('vaultcrdt');
+      expect(copyRows[0].descEl.codes[0].text).toContain('vaultcrdt');
       ui.toggles[0].change(false);
       const secretContainer = Array.from(modal.contentEl.children).filter((e: any) => e.tag === 'div').at(-1)!;
       expect(secretContainer.children.length).toBe(0);

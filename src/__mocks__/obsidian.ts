@@ -21,6 +21,7 @@ export class Setting {
   }
   setName(name: string) { this.nameEl.textContent = name; return this; }
   setDesc(desc: string) { this.descEl.textContent = desc; return this; }
+  setHeading() { this.settingEl.addClass('setting-item-heading'); return this; }
   addText(cb?: (_: unknown) => unknown) {
     if (cb) {
       const fake = {
@@ -35,14 +36,21 @@ export class Setting {
   }
   addSlider(_: (_: unknown) => unknown) { return this; }
   addToggle(_: (_: unknown) => unknown) { return this; }
+  /** Recorded buttons (label + handler) so tests can drive clicks. */
+  buttons: Array<{ label: string; click: () => void }> = [];
+  /** Every button created since the last reset, in creation order. */
+  static allButtons: Array<{ label: string; click: () => void }> = [];
   addButton(cb?: (_: unknown) => unknown) {
     if (cb) {
+      const entry = { label: '', click: () => {} };
+      this.buttons.push(entry);
+      Setting.allButtons.push(entry);
       const fake = {
-        setButtonText() { return this; },
+        setButtonText(text: string) { entry.label = text; return this; },
         setCta() { return this; },
         setWarning() { return this; },
         setDisabled() { return this; },
-        onClick(_fn: () => void) { return this; },
+        onClick(fn: () => void) { entry.click = fn; return this; },
       };
       cb(fake);
     }

@@ -141,7 +141,6 @@ const makeSettings = (overrides: Record<string, unknown> = {}) => ({
   peerId: 'peer-test',
   vaultId: 'vault-abc',
   deviceName: 'test-device',
-  debounceMs: 300,
   showSyncStatus: true,
   onboardingComplete: false,
   ...overrides,
@@ -2898,7 +2897,7 @@ describe('SyncEngine', () => {
       const leaf = makeStaleEditorLeaf('startup-merge.md', 'EDITOR fresh');
       const app = makeApp([leaf]);
       app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
-      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+      engine = new SyncEngine(app, makeSettings());
 
       mockVault.getMarkdownFiles.mockReturnValue([{ path: 'startup-merge.md' }]);
       mockVault.read.mockResolvedValue('DISK stale');
@@ -3009,7 +3008,7 @@ describe('SyncEngine', () => {
       const leaf = makeStaleEditorLeaf('tc1.md', 'MERGED text');
       const app = makeApp([leaf]);
       app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
-      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+      engine = new SyncEngine(app, makeSettings());
 
       mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc1.md' }]);
       mockVault.read.mockResolvedValue('DISK stale');
@@ -3055,7 +3054,7 @@ describe('SyncEngine', () => {
       const app = makeApp([leaf]);
       // Active view is null → not the active editor doc
       app.workspace.getActiveViewOfType.mockReturnValue(null);
-      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+      engine = new SyncEngine(app, makeSettings());
 
       mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc3.md' }]);
       mockVault.read.mockResolvedValue('DISK stale');
@@ -3143,7 +3142,7 @@ describe('SyncEngine', () => {
       const leaf = makeStaleEditorLeaf('tc5.md', 'MERGED text');
       const app = makeApp([leaf]);
       app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
-      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+      engine = new SyncEngine(app, makeSettings());
 
       mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc5.md' }]);
       mockVault.read.mockResolvedValue('DISK stale');
@@ -3189,7 +3188,7 @@ describe('SyncEngine', () => {
       const leaf = makeStaleEditorLeaf('tc6.md', 'MERGED text');
       const app = makeApp([leaf]);
       app.workspace.getActiveViewOfType.mockReturnValue(leaf.view);
-      engine = new SyncEngine(app, makeSettings({ debounceMs: 1250 }));
+      engine = new SyncEngine(app, makeSettings());
 
       mockVault.getMarkdownFiles.mockReturnValue([{ path: 'tc6.md' }]);
       mockVault.read.mockResolvedValue('DISK stale');

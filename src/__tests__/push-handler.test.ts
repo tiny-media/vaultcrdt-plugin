@@ -35,7 +35,7 @@ describe('PushHandler push debounce maxWait', () => {
       docs as any,
       { readCurrentContent: vi.fn(() => 'x') } as any,
       sendMock,
-      { peerId: 'p', debounceMs: 700 } as any,
+      { peerId: 'p' } as any,
       new Map(),
       new Map(),
       vi.fn(),
@@ -51,7 +51,7 @@ describe('PushHandler push debounce maxWait', () => {
   it('single edit waits the full debounce', () => {
     const { push, fire } = makePush();
     push.onFileChanged('a.md');
-    vi.advanceTimersByTime(699);
+    vi.advanceTimersByTime(299);
     expect(fire).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(fire).toHaveBeenCalledTimes(1);
@@ -85,7 +85,7 @@ describe('PushHandler push debounce maxWait', () => {
     await push.flushPendingEdits('a.md');
 
     push.onFileChanged('a.md');
-    vi.advanceTimersByTime(699);
+    vi.advanceTimersByTime(299);
     expect(fire).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(fire).toHaveBeenCalledTimes(1);
@@ -93,16 +93,16 @@ describe('PushHandler push debounce maxWait', () => {
 
   it('cancelPendingEdits resets the burst window too', () => {
     const { push, fire } = makePush();
-    // Keep the burst window open (typing) up to t = 1500, then cancel.
+    // Keep the burst window open (typing) up to t = 1000, then cancel.
     for (let i = 0; i < 5; i++) {
       push.onFileChanged('a.md');
-      vi.advanceTimersByTime(300);
+      vi.advanceTimersByTime(200);
     }
     expect(fire).not.toHaveBeenCalled();
     push.cancelPendingEdits('a.md');
 
     push.onFileChanged('a.md');
-    vi.advanceTimersByTime(699);
+    vi.advanceTimersByTime(299);
     expect(fire).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(fire).toHaveBeenCalledTimes(1);
@@ -128,7 +128,7 @@ describe('PushHandler push debounce maxWait', () => {
       docs as any,
       { readCurrentContent: vi.fn(() => 'abXY') } as any,
       send,
-      { peerId: 'p', debounceMs: 700 } as any,
+      { peerId: 'p' } as any,
       new Map(),
       new Map(),
       vi.fn(),
@@ -163,7 +163,7 @@ describe('PushHandler push debounce maxWait', () => {
       docs as any,
       { readCurrentContent: vi.fn(() => null) } as any,
       vi.fn(),
-      { peerId: 'p', debounceMs: 700 } as any,
+      { peerId: 'p' } as any,
       new Map(),
       new Map(),
       vi.fn(),
@@ -196,7 +196,7 @@ describe('PushHandler push debounce maxWait', () => {
       docs as any,
       { readCurrentContent: read } as any,
       vi.fn(),
-      { peerId: 'p', debounceMs: 700 } as any,
+      { peerId: 'p' } as any,
       new Map(),
       new Map(),
       vi.fn(),
@@ -211,7 +211,7 @@ describe('PushHandler push debounce maxWait', () => {
     await push.flushPendingEdits('a.md');
     expect(fire).not.toHaveBeenCalled();
     read.mockReturnValue('x');
-    vi.advanceTimersByTime(700);
+    vi.advanceTimersByTime(300);
     expect(fire).toHaveBeenCalledTimes(1);
   });
 
@@ -219,14 +219,12 @@ describe('PushHandler push debounce maxWait', () => {
     const { push, fire } = makePush();
     push.onFileChanged('a.md');
     push.onFileChanged('b.md');
-    for (let i = 0; i < 3; i++) {
-      vi.advanceTimersByTime(200);
-      push.onFileChanged('a.md');
-    }
-    // t = 600: nothing yet
+    vi.advanceTimersByTime(200);
+    push.onFileChanged('a.md');
+    // t = 200: nothing yet
     expect(fire).not.toHaveBeenCalled();
     vi.advanceTimersByTime(100);
-    // t = 700: b.md fired at its debounce, a.md's window is still open
+    // t = 300: b.md fired at its debounce, a.md's window is still open
     expect(fire).toHaveBeenCalledTimes(1);
     expect(fire).toHaveBeenCalledWith('b.md', 'x');
   });
@@ -256,7 +254,7 @@ describe('PushHandler persistJournal serialization', () => {
       docs as any,
       { readCurrentContent: () => null } as any,
       vi.fn(),
-      { peerId: 'p', debounceMs: 0 } as any,
+      { peerId: 'p' } as any,
       new Map(),
       new Map(),
       vi.fn(),
@@ -303,7 +301,7 @@ describe('PushHandler excalidraw concurrent hold', () => {
       docs as any,
       { readCurrentContent: vi.fn(() => null) } as any,
       send as any,
-      { peerId: 'p', debounceMs: 700 } as any,
+      { peerId: 'p' } as any,
       new Map(),
       opts.lastServerVV ?? new Map(),
       vi.fn(),
@@ -373,7 +371,7 @@ describe('PushHandler delete journal ack and resend', () => {
       docs as any,
       { readCurrentContent: () => null } as any,
       sendMock,
-      { peerId: 'p', debounceMs: 0 } as any,
+      { peerId: 'p' } as any,
       new Map(),
       new Map(),
       vi.fn(),

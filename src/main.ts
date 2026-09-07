@@ -9,7 +9,7 @@ import { SetupModal } from './setup-modal';
 import { parseSetupParams } from './setup-link';
 import { InviteModal } from './invite-modal';
 import { ReplaceConnectionModal } from './replace-connection-modal';
-import { resetConnectionState } from './settings';
+import { resetConnectionState, HYDRATION_DEBOUNCE_MS } from './settings';
 import { SETUP_COPY, WASM_INIT_FAILED_NOTICE, ribbonBadgeState } from './user-facing-copy';
 import { Modal } from 'obsidian';
 import { log, error, redact, setSecretProvider, getRecentIssues } from './logger';
@@ -429,7 +429,7 @@ export default class VaultCRDTPlugin extends Plugin {
         if (!file || file.path !== this.app.workspace.getActiveFile()?.path) return;
         // 2000 ms, not less: BLOB_CATCHUP_DEBOUNCE_MS means the blob index may
         // learn the new hash up to 2 s after the note text arrived.
-        this.scheduleActiveFileHydration(2000);
+        this.scheduleActiveFileHydration(HYDRATION_DEBOUNCE_MS);
       })
     );
   }
@@ -811,7 +811,12 @@ export default class VaultCRDTPlugin extends Plugin {
     new Notice(redact(`VaultCRDT: trace exported to ${path}`), 8000);
   }
 
-  private async exportDiagnostics(): Promise<void> {
+  /**
+   * Diagnostics report text (secrets gated by buildDiagnosticsReport +
+   * assertNoSecret). Shared by the file export and the settings-tab
+   * "Copy diagnostics report" button.
+   */
+  async collectDiagnosticsReport(): Promise<string> {
     const t0 = Date.now();
     let health: DiagnosticsInput['health'];
     try {
@@ -846,10 +851,16 @@ export default class VaultCRDTPlugin extends Plugin {
       inboxCount: this.inbox?.count() ?? 0,
       lastInitialSyncAt: this.syncEngineInitialized ? this.syncEngine.getPanelStats().lastInitialSyncAt : 0,
     });
+    assertNoSecret(report, this.settings.vaultSecret, this.settings.deviceKey ?? '');
+    return report;
+  }
+
+  private async exportDiagnostics(): Promise<void> {
+    const report = await this.collectDiagnosticsReport();
+    const dir = 'VaultCRDT Debug';
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const path = `${dir}/diagnostics-${stamp}.md`;
     await this.ensureDir(dir);
-    assertNoSecret(report, this.settings.vaultSecret, this.settings.deviceKey ?? '');
     await this.app.vault.create(path, report);
     const f = this.app.vault.getAbstractFileByPath(path);
     if (!(f instanceof TFile)) throw new Error('diagnostics file could not be read back');
