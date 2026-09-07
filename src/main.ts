@@ -388,6 +388,8 @@ export default class VaultCRDTPlugin extends Plugin {
     this.fileWatcher = new FileWatcher(this.app, this.syncEngine);
     // Wire up initial sync (auto-detect pull/push/merge)
     this.syncEngine.inbox = this.inbox;
+    this.syncEngine.getServerFeatures = () => this.serverFeatures.get(this.settings.serverUrl);
+    this.syncEngine.blobUploader = this.blobUploader;
     this.syncEngine.onInitialSync = (engine) => {
       void this.handleInitialSync(engine);
     };

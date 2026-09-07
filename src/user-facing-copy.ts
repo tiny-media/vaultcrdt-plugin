@@ -42,6 +42,11 @@ export function attachmentTooLargeMessage(path: string, capBytes: number): strin
   return `VaultCRDT: "${redact(path)}" is larger than the ${Math.round(capBytes / (1024 * 1024))} MB attachment limit and will not sync.`;
 }
 
+/** Vault-wide quota pause (design §3): same MB rounding as the per-file cap notice. */
+export function quotaExceededMessage(quotaBytes: number): string {
+  return `VaultCRDT: this vault is over the ${Math.round(quotaBytes / (1024 * 1024))} MB storage limit and attachments will not sync.`;
+}
+
 export const INBOX_COPY = {
   discovery: 'VaultCRDT: 1 new item in inbox',
   title: 'VaultCRDT inbox',

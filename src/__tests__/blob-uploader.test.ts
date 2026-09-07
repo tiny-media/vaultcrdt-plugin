@@ -1,18 +1,68 @@
-import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 
-const { mockRequestUrl } = vi.hoisted(() => ({ mockRequestUrl: vi.fn() }));
+const {
+  mockRequestUrl,
+  mockEncode,
+  mockDecode,
+  mockCreateDocument,
+  MockWebSocket,
+  mockWsInstance,
+} = vi.hoisted(() => {
+  const mockWsInstance = {
+    readyState: 1,
+    binaryType: '',
+    send: vi.fn(),
+    close: vi.fn(),
+    onopen: null as ((ev: Event) => void) | null,
+    onmessage: null as ((ev: MessageEvent) => void) | null,
+    onclose: null as ((ev: CloseEvent) => void) | null,
+    onerror: null as ((ev: Event) => void) | null,
+  };
+  const MockWebSocket = vi.fn(function () {
+    return mockWsInstance;
+  });
+  (MockWebSocket as unknown as { OPEN: number }).OPEN = 1;
+  return {
+    mockRequestUrl: vi.fn(),
+    mockEncode: vi.fn().mockImplementation((obj: unknown) =>
+      new TextEncoder().encode(JSON.stringify(obj)),
+    ),
+    mockDecode: vi.fn(),
+    mockCreateDocument: vi.fn().mockReturnValue({
+      get_text: vi.fn().mockReturnValue(''),
+      export_snapshot: vi.fn().mockReturnValue(new Uint8Array(0)),
+      import_snapshot: vi.fn(),
+      export_vv_json: vi.fn().mockReturnValue('{}'),
+    }),
+    MockWebSocket,
+    mockWsInstance,
+  };
+});
 vi.mock('obsidian', async () => {
   const base = await vi.importActual<Record<string, unknown>>('../__mocks__/obsidian');
   return { ...base, requestUrl: mockRequestUrl };
 });
+vi.mock('@msgpack/msgpack', () => ({
+  encode: mockEncode,
+  decode: mockDecode,
+}));
+vi.mock('../wasm-bridge', () => ({
+  createDocument: mockCreateDocument,
+}));
+vi.stubGlobal('WebSocket', MockWebSocket);
 
 import initWasmModule, { blake3_hex } from '../../wasm/vaultcrdt_wasm';
 import { BlobIndex } from '../blob-index';
 import { BlobUploader } from '../blob-uploader';
+import { isAttachmentPath } from '../path-policy';
+import { SyncEngine } from '../sync-engine';
+import { FEATURE_BLOBS } from '../server-features';
 
 const PATH = 'Bilder/photo.png';
+const PATH_B = 'Bilder/other.png';
 const BYTES = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+const MIB = 1024 * 1024;
 
 interface Call { url: string; method: string; headers?: Record<string, string>; body?: unknown }
 const calls = (): Call[] => mockRequestUrl.mock.calls.map((c) => c[0] as Call);
@@ -56,11 +106,67 @@ function makeUploader(opts: {
 
 const resp = (status: number, json: Record<string, unknown> = {}) => ({ status, json });
 
+function makeEngineApp() {
+  const adapter = {
+    exists: vi.fn().mockResolvedValue(false),
+    read: vi.fn().mockResolvedValue(''),
+    readBinary: vi.fn().mockResolvedValue(new ArrayBuffer(0)),
+    write: vi.fn().mockResolvedValue(undefined),
+    writeBinary: vi.fn().mockResolvedValue(undefined),
+    mkdir: vi.fn().mockResolvedValue(undefined),
+    remove: vi.fn().mockResolvedValue(undefined),
+    list: vi.fn().mockResolvedValue({ files: [], folders: [] }),
+  };
+  return {
+    vault: {
+      adapter,
+      getMarkdownFiles: vi.fn().mockReturnValue([]),
+      read: vi.fn().mockResolvedValue(''),
+      getAbstractFileByPath: vi.fn().mockReturnValue(null),
+      on: vi.fn(),
+    },
+    fileManager: { trashFile: vi.fn().mockResolvedValue(undefined), renameFile: vi.fn() },
+    workspace: {
+      on: vi.fn(),
+      getActiveViewOfType: vi.fn(() => null),
+      iterateAllLeaves: vi.fn(),
+    },
+  } as any;
+}
+
+function makeEngineSettings() {
+  return {
+    serverUrl: 'http://localhost:3737',
+    vaultSecret: 'test-api-key',
+    peerId: 'peer-test',
+    vaultId: 'vault-abc',
+    deviceName: 'test-device',
+    debounceMs: 300,
+    showSyncStatus: true,
+    onboardingComplete: false,
+  } as any;
+}
+
+const flush = async (n = 20) => {
+  for (let i = 0; i < n; i++) await Promise.resolve();
+};
+
 beforeAll(async () => {
   const bytes = readFileSync(new URL('../../wasm/vaultcrdt_wasm_bg.wasm', import.meta.url));
   await initWasmModule({ module_or_path: bytes });
 });
-beforeEach(() => { mockRequestUrl.mockReset(); });
+beforeEach(() => {
+  mockRequestUrl.mockReset();
+  mockEncode.mockClear();
+  mockDecode.mockReset();
+  MockWebSocket.mockClear();
+  mockWsInstance.readyState = 1;
+  mockWsInstance.onopen = null;
+  mockWsInstance.onmessage = null;
+  mockWsInstance.onclose = null;
+  mockWsInstance.onerror = null;
+  mockWsInstance.send.mockClear();
+});
 
 describe('BlobUploader (attachment lane S2)', () => {
   it('uploads before it references, and never references a failed transfer', async () => {
@@ -206,5 +312,265 @@ describe('BlobUploader (attachment lane S2)', () => {
     await uploader.flush();
     await uploader.catchUp();
     expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+
+  it('whitelist: voice.webm and rec.3gp pass; video.mp4 does not', () => {
+    expect(isAttachmentPath('voice.webm')).toBe(true);
+    expect(isAttachmentPath('rec.3gp')).toBe(true);
+    expect(isAttachmentPath('video.mp4')).toBe(false);
+  });
+
+  it('skips oversized webm/3gp before reading (audio cap), but 11 MiB webm is under the cap', async () => {
+    const readOversized = vi.fn(async () => new ArrayBuffer(0));
+    const oversized = makeUploader({ size: 26 * MIB, readBinary: readOversized });
+    oversized.uploader.onFileChanged('voice.webm');
+    await oversized.uploader.flush();
+    expect(readOversized).not.toHaveBeenCalled();
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+    expect(oversized.index.get('voice.webm')!.skipped).toBe(true);
+
+    const readOk = vi.fn(async () => BYTES.slice().buffer);
+    const under = makeUploader({ size: 11 * MIB, readBinary: readOk });
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(200, { exists: true }))
+      .mockResolvedValueOnce(resp(200, { accepted: true, seq: 1 }));
+    under.uploader.onFileChanged('rec.3gp');
+    await under.uploader.flush();
+    expect(readOk).toHaveBeenCalled();
+    expect(urls()[0]).toBe('POST /vault/blobs/uploads');
+  });
+
+  it('uses the local next generation and never reads resp.json.generation', async () => {
+    const { uploader, index } = makeUploader();
+    index.update(PATH, { generation: 3, hash: 'old' });
+    const json: Record<string, unknown> = { accepted: true, seq: 5 };
+    Object.defineProperty(json, 'generation', {
+      get() { throw new Error('generation must not be read'); },
+    });
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(200, { exists: true }))
+      .mockResolvedValueOnce({ status: 200, json });
+
+    uploader.onFileChanged(PATH);
+    await uploader.flush();
+
+    expect(index.get(PATH)!.generation).toBe(4);
+    expect(index.get(PATH)!.seq).toBe(5);
+  });
+
+  it('putSegment sends slice().buffer of a copy (own buffer, exact segment length)', async () => {
+    const { uploader } = makeUploader();
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(201, { upload_id: 'u1', next_offset: 0, segment_bytes: 4 }))
+      .mockResolvedValueOnce(resp(202, { next_offset: 4 }))
+      .mockResolvedValueOnce(resp(202, { next_offset: 8 }))
+      .mockResolvedValueOnce(resp(201, { hash: blake3_hex(BYTES) }))
+      .mockResolvedValueOnce(resp(200, { accepted: true, seq: 1 }));
+
+    uploader.onFileChanged(PATH);
+    await uploader.flush();
+
+    const putBodies = calls().filter((c) => c.method === 'PUT').map((c) => c.body);
+    expect(putBodies).toHaveLength(3);
+    for (const [i, body] of putBodies.entries()) {
+      expect(body).toBeInstanceOf(ArrayBuffer);
+      const expected = i < 2 ? 4 : 2;
+      expect((body as ArrayBuffer).byteLength).toBe(expected);
+    }
+  });
+
+  it.each([
+    [
+      'throwing json getter',
+      () => ({
+        status: 413,
+        get json(): Record<string, unknown> { throw new Error('axum guard'); },
+        text: JSON.stringify({ error: 'quota_exceeded', quota_bytes: 50 * MIB }),
+      }),
+    ],
+    [
+      'undefined json',
+      () => ({
+        status: 413,
+        json: undefined,
+        text: JSON.stringify({ error: 'quota_exceeded', quota_bytes: 50 * MIB }),
+      }),
+    ],
+  ])('quota 413 notices once vault-wide and skips other POSTs until the TTL (%s)', async (_label, makeQuota) => {
+    let now = 0;
+    const { uploader, notify, index } = makeUploader({ now: () => now });
+    mockRequestUrl.mockResolvedValueOnce(makeQuota());
+
+    uploader.onFileChanged(PATH);
+    await uploader.flush();
+
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain('50 MB');
+    expect(uploader.quotaExceededUntil).toBe(60_000);
+    expect(index.get(PATH)!.skipped).toBe(true);
+
+    mockRequestUrl.mockClear();
+    uploader.onFileChanged(PATH_B);
+    await uploader.flush();
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+    expect(index.get(PATH_B)!.skipped).toBe(true);
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    now = 60_000;
+    mockRequestUrl.mockResolvedValueOnce(makeQuota());
+    uploader.onFileChanged(PATH_B);
+    await uploader.flush();
+    expect(calls().some((c) => c.method === 'POST' && c.url.includes('/vault/blobs/uploads'))).toBe(true);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(uploader.quotaExceededUntil).toBe(120_000);
+  });
+
+  it('quota 413 without quota_bytes still pauses and does not throw', async () => {
+    const { uploader, notify, index } = makeUploader();
+    mockRequestUrl.mockResolvedValueOnce(resp(413, {}));
+
+    uploader.onFileChanged(PATH);
+    await uploader.flush();
+
+    expect(uploader.quotaExceededUntil).toBe(60_000);
+    expect(index.get(PATH)!.skipped).toBe(true);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+
+    mockRequestUrl.mockClear();
+    uploader.onFileChanged(PATH_B);
+    await uploader.flush();
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+
+  it('quota 413 on blob-paths pauses without throwing (dedup path)', async () => {
+    const { uploader, notify, index } = makeUploader();
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(200, { exists: true }))
+      .mockResolvedValueOnce(resp(413, { error: 'quota_exceeded', quota_bytes: 50 * MIB }));
+
+    uploader.onFileChanged(PATH);
+    await uploader.flush();
+
+    expect(urls()).toEqual(['POST /vault/blobs/uploads', 'POST /vault/blob-paths']);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain('50 MB');
+    expect(uploader.quotaExceededUntil).toBe(60_000);
+    expect(index.get(PATH)!.skipped).toBe(true);
+
+    mockRequestUrl.mockClear();
+    uploader.onFileChanged(PATH_B);
+    await uploader.flush();
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+
+  it('does not POST blob-paths while quotaExceededUntil is already in the future', async () => {
+    const { uploader, index } = makeUploader();
+    mockRequestUrl.mockImplementation(async (opts: Call) => {
+      if (opts.method === 'POST' && opts.url.includes('/vault/blobs/uploads')) {
+        uploader.quotaExceededUntil = 60_000;
+        return resp(200, { exists: true });
+      }
+      return resp(200, { accepted: true, seq: 1 });
+    });
+
+    uploader.onFileChanged(PATH);
+    await uploader.flush();
+
+    expect(urls()).toEqual(['POST /vault/blobs/uploads']);
+    expect(index.get(PATH)!.skipped).toBe(true);
+  });
+});
+
+describe('SyncEngine blob auth frame and wake-up', () => {
+  let engine: SyncEngine;
+
+  beforeEach(() => {
+    mockRequestUrl.mockResolvedValue({ json: { token: 'test-token' } });
+    engine = new SyncEngine(makeEngineApp(), makeEngineSettings());
+  });
+
+  afterEach(async () => {
+    await engine.stop();
+    vi.useRealTimers();
+  });
+
+  it('sends features:[blobs] on start and reconnect iff health advertised it', async () => {
+    const getServerFeatures = vi.fn(async () => [FEATURE_BLOBS]);
+    engine.getServerFeatures = getServerFeatures;
+
+    await engine.start();
+    expect(getServerFeatures).toHaveBeenCalled();
+    expect(MockWebSocket).toHaveBeenCalled();
+    mockEncode.mockClear();
+    mockWsInstance.onopen!({} as Event);
+    expect(mockEncode.mock.calls[0][0]).toEqual({
+      type: 'auth',
+      token: 'test-token',
+      protocol_version: 1,
+      features: ['blobs'],
+    });
+
+    vi.useFakeTimers();
+    mockWsInstance.onclose!({} as CloseEvent);
+    await flush();
+    vi.advanceTimersByTime(1_000);
+    await flush();
+    mockEncode.mockClear();
+    mockWsInstance.onopen!({} as Event);
+    expect(mockEncode.mock.calls[0][0]).toEqual({
+      type: 'auth',
+      token: 'test-token',
+      protocol_version: 1,
+      features: ['blobs'],
+    });
+  });
+
+  it('omits features on the auth frame when health did not advertise blobs', async () => {
+    engine.getServerFeatures = async () => ['invite'];
+    await engine.start();
+    mockEncode.mockClear();
+    mockWsInstance.onopen!({} as Event);
+    expect(mockEncode.mock.calls[0][0]).toEqual({
+      type: 'auth',
+      token: 'test-token',
+      protocol_version: 1,
+    });
+  });
+
+  it('resolves getServerFeatures before constructing the WebSocket', async () => {
+    let resolveFeatures!: (v: string[]) => void;
+    engine.getServerFeatures = () => new Promise((r) => { resolveFeatures = r; });
+    const started = engine.start();
+    await flush();
+    expect(MockWebSocket).not.toHaveBeenCalled();
+    resolveFeatures([FEATURE_BLOBS]);
+    await started;
+    expect(MockWebSocket).toHaveBeenCalled();
+  });
+
+  it('debounces three blob_path_changed into one catchUp and clears the timer on stop', async () => {
+    const catchUp = vi.fn(async () => undefined);
+    engine.blobUploader = { catchUp } as any;
+    await engine.start();
+    vi.useFakeTimers();
+
+    const fire = (seq: number) => {
+      mockDecode.mockReturnValueOnce({ type: 'blob_path_changed', path_key: 'notes/voice.webm', seq });
+      mockWsInstance.onmessage!({ data: new ArrayBuffer(4) } as MessageEvent);
+    };
+    fire(1);
+    fire(2);
+    fire(3);
+    expect(catchUp).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(catchUp).toHaveBeenCalledTimes(1);
+
+    fire(4);
+    expect((engine as any).blobCatchUpTimer).not.toBeNull();
+    await engine.stop();
+    expect((engine as any).blobCatchUpTimer).toBeNull();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(catchUp).toHaveBeenCalledTimes(1);
   });
 });

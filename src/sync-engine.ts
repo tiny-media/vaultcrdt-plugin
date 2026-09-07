@@ -16,6 +16,8 @@ import { SyncTrace } from './sync-trace';
 import type { VVCacheEntry } from './state-storage';
 import { StartupDirtyTracker } from './startup-dirty-tracker';
 import type { InboxSink } from './inbox';
+import { FEATURE_BLOBS } from './server-features';
+import type { BlobUploader } from './blob-uploader';
 import { authRejectedNoticeMessage, protocolMismatchNoticeMessage, conflictNoticeMessage, tombstoneNoticeMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage, tombstoneRenamedNoticeMessage } from './user-facing-copy';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
@@ -59,6 +61,8 @@ const PARALLEL_DOWNLOADS = 5;
  */
 const MAX_QUEUED_BROADCASTS = 2_000;
 const MAX_QUEUED_BROADCAST_BYTES = 32 * 1024 * 1024;
+/** Trailing debounce for blob_path_changed → catchUp (not this.sleep — tests no-op that). */
+const BLOB_CATCHUP_DEBOUNCE_MS = 2_000;
 
 // ── SyncEngine ───────────────────────────────────────────────────────────────
 
@@ -114,6 +118,8 @@ export class SyncEngine {
   /** Paths we have already shown a tombstone Notice for in this session. */
   private notifiedTombstones = new Set<string>();
   private trace = new SyncTrace();
+  private advertisedFeatures: string[] = [];
+  private blobCatchUpTimer: number | null = null;
   /**
    * One-shot admin token sent with the next /auth/verify call to register
    * a new vault. Cleared after the first successful auth. Never persisted.
@@ -122,6 +128,10 @@ export class SyncEngine {
 
   /** Quiet-mode inbox sink (design §E): set by main.ts after construction. */
   inbox: InboxSink | null = null;
+  /** Feature probe used to populate the WS auth frame; default is old-server (no features). */
+  getServerFeatures: () => Promise<string[]> = async () => [];
+  /** Attachment lane; catchUp is scheduled from blob_path_changed. */
+  blobUploader: BlobUploader | null = null;
   /** Wall-clock ms of the last completed initial sync (0 = none this session). */
   private lastInitialSyncAt = 0;
 
@@ -197,7 +207,7 @@ export class SyncEngine {
 
     await this.auth();
     this.trace.mark('start.auth-ok');
-    this.connect();
+    await this.connect();
     this.trace.mark('start.connect-called');
   }
 
@@ -210,6 +220,10 @@ export class SyncEngine {
     this.stopped = true;
     if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) window.clearInterval(this.heartbeatTimer);
+    if (this.blobCatchUpTimer !== null) {
+      window.clearTimeout(this.blobCatchUpTimer);
+      this.blobCatchUpTimer = null;
+    }
     this.push.stopAllTimers();
     this.lastRemoteWrite.clear();
     this.startupEditedPaths.clear();
@@ -324,7 +338,9 @@ export class SyncEngine {
     return toWsBase(this.settings.serverUrl) + '/ws';
   }
 
-  private connect(): void {
+  private async connect(): Promise<void> {
+    this.advertisedFeatures = await this.getServerFeatures();
+    if (this.stopped) return;
     const device = encodeURIComponent(this.settings.deviceName || 'unknown');
     const peerId = encodeURIComponent(this.settings.peerId || '');
     const url = `${this.wsUrl()}?vault_id=${encodeURIComponent(this.settings.vaultId)}&device=${device}&peer_id=${peerId}`;
@@ -335,7 +351,15 @@ export class SyncEngine {
     ws.onopen = () => {
       this.trace.mark('ws.open');
       this.authedThisSocket = false;
-      this.send({ type: 'auth', token: this.token ?? '', protocol_version: PROTOCOL_VERSION });
+      const frame: Record<string, unknown> = {
+        type: 'auth',
+        token: this.token ?? '',
+        protocol_version: PROTOCOL_VERSION,
+      };
+      if (this.advertisedFeatures.includes(FEATURE_BLOBS)) {
+        frame.features = ['blobs'];
+      }
+      this.send(frame);
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -381,6 +405,17 @@ export class SyncEngine {
         .catch(() => this.scheduleReconnect());
     }, this.backoffMs);
     this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
+  }
+
+  private scheduleBlobCatchUp(): void {
+    if (this.blobCatchUpTimer !== null) window.clearTimeout(this.blobCatchUpTimer);
+    this.blobCatchUpTimer = window.setTimeout(() => {
+      this.blobCatchUpTimer = null;
+      if (this.stopped) return;
+      const uploader = this.blobUploader;
+      if (!uploader) return;
+      void uploader.catchUp().catch((err) => error(`${this.tag} blob catch-up failed:`, err));
+    }, BLOB_CATCHUP_DEBOUNCE_MS);
   }
 
   private startHeartbeat(): void {
@@ -633,6 +668,10 @@ export class SyncEngine {
         break;
 
       case 'pong':
+        break;
+
+      case 'blob_path_changed':
+        this.scheduleBlobCatchUp();
         break;
 
       case 'error':

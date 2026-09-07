@@ -36,7 +36,7 @@ describe('blob_path_key (WASM)', () => {
 describe('isAttachmentPath', () => {
   const accepted = [
     'a.jpg', 'a.jpeg', 'a.png', 'a.webp', 'a.gif', 'a.heic', 'a.heif', 'a.avif',
-    'a.pdf', 'a.mp3', 'a.m4a', 'a.ogg', 'a.opus', 'a.flac', 'a.wav',
+    'a.pdf', 'a.mp3', 'a.m4a', 'a.ogg', 'a.oga', 'a.opus', 'a.flac', 'a.wav', 'a.webm', 'a.3gp',
     'Bilder/Übersicht.PNG', 'nested/dir/x.JPG',
   ];
   it.each(accepted)('accepts %s', (p) => expect(isAttachmentPath(p)).toBe(true));

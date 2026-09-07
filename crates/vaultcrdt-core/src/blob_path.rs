@@ -10,9 +10,9 @@ use unicode_normalization::UnicodeNormalization;
 
 /// Allowed attachment extensions (lowercased, without dot). Must stay in sync
 /// with `ATTACHMENT_EXTENSIONS` in `src/path-policy.ts`.
-pub const ATTACHMENT_EXTENSIONS: [&str; 15] = [
-    "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "pdf", "mp3", "m4a", "ogg",
-    "opus", "flac", "wav",
+pub const ATTACHMENT_EXTENSIONS: [&str; 18] = [
+    "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "pdf", "mp3", "m4a", "ogg", "oga",
+    "opus", "flac", "wav", "webm", "3gp",
 ];
 
 const BLOCKED_PREFIXES: [&str; 2] = [".obsidian/", ".trash/"];
@@ -137,5 +137,12 @@ mod tests {
         assert_eq!(blob_path_key(&long), None, "over 1024 bytes must reject");
         assert!(blob_path_key(&long[1..]).is_some(), "exactly 1024 bytes is fine");
     }
-}
 
+    #[test]
+    fn accepts_webm_and_3gp_audio() {
+        assert_eq!(blob_path_key("Notes/voice.webm").as_deref(), Some("notes/voice.webm"));
+        assert_eq!(blob_path_key("rec.3gp").as_deref(), Some("rec.3gp"));
+        assert_eq!(blob_path_key("voice.oga").as_deref(), Some("voice.oga"));
+        assert_eq!(blob_path_key("video.mp4"), None);
+    }
+}

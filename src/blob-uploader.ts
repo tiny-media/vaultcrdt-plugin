@@ -3,13 +3,17 @@ import { blake3_hex } from '../wasm/vaultcrdt_wasm';
 import { attachmentCap } from './path-policy';
 import { toHttpBase } from './url-policy';
 import { log, error, warn } from './logger';
-import { attachmentTooLargeMessage } from './user-facing-copy';
+import { attachmentTooLargeMessage, quotaExceededMessage } from './user-facing-copy';
 import type { BlobIndex } from './blob-index';
 
 /** Debounce before hashing, so foreign writers (camera apps) can finish. */
 export const UPLOAD_DEBOUNCE_MS = 2000;
 /** One cap notice per path per 5 minutes, like the inbox discovery notice. */
 export const CAP_NOTICE_THROTTLE_MS = 5 * 60_000;
+/** After a 413 quota_exceeded, skip new POSTs for this long. */
+const QUOTA_RETRY_MS = 60_000;
+/** Sentinel key in capNoticeAt: one quota notice per vault per throttle window. */
+const QUOTA_NOTICE_KEY = 'quota';
 /** Fallback segment size when the server does not name one. */
 const DEFAULT_SEGMENT_BYTES = 4 * 1024 * 1024;
 /** How often a size may still change before we give up on this event. */
@@ -58,6 +62,9 @@ export class BlobUploader {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private running = new Set<Promise<void>>();
+  private catchUpWork: Promise<void> | null = null;
+  /** Session pause after a 413 quota_exceeded; uploads skip until this timestamp. */
+  quotaExceededUntil = 0;
 
   constructor(private deps: BlobUploaderDeps) {
     this.now = deps.now ?? (() => Date.now());
@@ -98,12 +105,17 @@ export class BlobUploader {
     await this.deps.index.flush();
   }
 
-  // ── The lane ──────────────────────────────────────────────────────────────
+  // ── The lane ──────────────────────────────────────────────────────
 
   private async upload(path: string): Promise<void> {
     if (!(await this.deps.blobsEnabled())) return;
     const key = this.deps.index.keyFor(path);
     if (!key) return;
+
+    if (this.now() < this.quotaExceededUntil) {
+      this.deps.index.update(path, { skipped: true });
+      return;
+    }
 
     const size = await this.stableSize(path);
     if (size === null) return;
@@ -123,7 +135,11 @@ export class BlobUploader {
     const entry = this.deps.index.get(path);
     if (entry && entry.lastRemoteHash === hash) return;
 
-    await this.ensureBlob(hash, size, bytes);
+    const uploaded = await this.ensureBlob(hash, size, bytes);
+    if (!uploaded) {
+      this.deps.index.update(path, { skipped: true });
+      return;
+    }
     await this.reference(path, key, hash, size, bytes);
   }
 
@@ -148,12 +164,34 @@ export class BlobUploader {
     this.deps.notify(attachmentTooLargeMessage(path, cap));
   }
 
-  /** Upload the bytes unless the server already stores this hash. */
-  private async ensureBlob(hash: string, size: number, bytes: Uint8Array): Promise<void> {
+  private noticeQuota(quotaBytes?: number): void {
+    const last = this.capNoticeAt.get(QUOTA_NOTICE_KEY);
+    if (last !== undefined && this.now() - last < CAP_NOTICE_THROTTLE_MS) return;
+    this.capNoticeAt.set(QUOTA_NOTICE_KEY, this.now());
+    this.deps.notify(
+      typeof quotaBytes === 'number'
+        ? quotaExceededMessage(quotaBytes)
+        : 'VaultCRDT: this vault is over the storage limit and attachments will not sync.',
+    );
+  }
+
+  /** Pause the upload lane after a 413. quota_bytes only feeds the notice text. */
+  private applyQuotaPause(json: Record<string, unknown>): void {
+    this.quotaExceededUntil = this.now() + QUOTA_RETRY_MS;
+    const quotaBytes = json.quota_bytes;
+    this.noticeQuota(typeof quotaBytes === 'number' ? quotaBytes : undefined);
+  }
+
+  /** Upload the bytes unless the server already stores this hash. Returns false on quota. */
+  private async ensureBlob(hash: string, size: number, bytes: Uint8Array): Promise<boolean> {
     const start = await this.http('POST', '/vault/blobs/uploads', { hash, size });
+    if (start.status === 413) {
+      this.applyQuotaPause(start.json);
+      return false;
+    }
     if (start.json.exists === true) {
       log('blob.dedup', { size });
-      return;
+      return true;
     }
     const uploadId = typeof start.json.upload_id === 'string' ? start.json.upload_id : '';
     if (!uploadId) throw new Error(`blob upload not started (status ${start.status})`);
@@ -181,9 +219,10 @@ export class BlobUploader {
       }
       // 409 carries the offset the server actually has — jump there (resume).
       const next = typeof resp.json.next_offset === 'number' ? resp.json.next_offset : end;
-      if (resp.status === 201) return;
+      if (resp.status === 201) return true;
       offset = next;
     }
+    return true;
   }
 
   private async putSegment(
@@ -206,6 +245,10 @@ export class BlobUploader {
     path: string, key: string, hash: string, size: number, bytes: Uint8Array,
     retriedUpload = false,
   ): Promise<void> {
+    if (this.now() < this.quotaExceededUntil) {
+      this.deps.index.update(path, { skipped: true });
+      return;
+    }
     const prev = this.deps.index.get(path);
     const generation = (prev?.generation ?? 0) + 1;
     const resp = await this.http('POST', '/vault/blob-paths', {
@@ -219,10 +262,15 @@ export class BlobUploader {
       peer_id: this.deps.peerId(),
     });
 
+    if (resp.status === 413) {
+      this.applyQuotaPause(resp.json);
+      this.deps.index.update(path, { skipped: true });
+      return;
+    }
     if (resp.status === 412) {
       // Server garbage-collected the blob between upload and reference.
       if (retriedUpload) throw new Error(`blob-path rejected: hash ${hash} missing on server`);
-      await this.ensureBlob(hash, size, bytes);
+      if (!await this.ensureBlob(hash, size, bytes)) return;
       await this.reference(path, key, hash, size, bytes, true);
       return;
     }
@@ -235,13 +283,12 @@ export class BlobUploader {
     if (resp.json.accepted !== true) throw new Error(`blob-path not accepted (status ${resp.status})`);
 
     const seq = typeof resp.json.seq === 'number' ? resp.json.seq : (prev?.seq ?? 0);
-    const serverGen = typeof resp.json.generation === 'number' ? resp.json.generation : generation;
     this.deps.index.update(path, {
-      hash, size, generation: serverGen, seq, hydrated: true, lastRemoteHash: hash, skipped: false,
+      hash, size, generation, seq, hydrated: true, lastRemoteHash: hash, skipped: false,
     });
   }
 
-  // ── Catch-up ──────────────────────────────────────────────────────────────
+  // ── Catch-up ──────────────────────────────────────────────────────
 
   /**
    * After a successful connect (doc_list complete): fetch blob-path states the
@@ -249,6 +296,15 @@ export class BlobUploader {
    * is only recorded as `hydrated: false` here.
    */
   async catchUp(): Promise<void> {
+    if (this.catchUpWork) return this.catchUpWork;
+    const run = this.runCatchUp().finally(() => {
+      if (this.catchUpWork === run) this.catchUpWork = null;
+    });
+    this.catchUpWork = run;
+    return run;
+  }
+
+  private async runCatchUp(): Promise<void> {
     if (!(await this.deps.blobsEnabled())) return;
     const since = this.deps.index.maxSeq();
     const resp = await this.http('GET', `/vault/blob-paths?since_seq=${since}&limit=1000`);
@@ -269,7 +325,7 @@ export class BlobUploader {
     this.deps.index.noteMaxSeq(maxSeq);
   }
 
-  // ── HTTP ──────────────────────────────────────────────────────────────────
+  // ── HTTP ─────────────────────────────────────────────────────────
 
   private async http(method: string, path: string, body?: unknown): Promise<HttpResult> {
     return this.request({
@@ -292,7 +348,30 @@ export class BlobUploader {
       ...(opts.body === undefined ? {} : { body: opts.body }),
       throw: false,
     });
-    const json = (resp.json ?? {}) as Record<string, unknown>;
-    return { status: typeof resp.status === 'number' ? resp.status : 200, json };
+    return { status: typeof resp.status === 'number' ? resp.status : 200, json: parseResponseJson(resp) };
   }
+}
+
+function parseResponseJson(resp: { json?: unknown; text?: unknown }): Record<string, unknown> {
+  let raw: unknown;
+  try {
+    raw = resp.json;
+  } catch {
+    raw = undefined;
+  }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>;
+  if (raw === undefined || raw === null) {
+    try {
+      const text = typeof resp.text === 'string' ? resp.text : '';
+      if (text) {
+        const parsed: unknown = JSON.parse(text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      }
+    } catch {
+      return {};
+    }
+  }
+  return {};
 }

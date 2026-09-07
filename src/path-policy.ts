@@ -19,10 +19,10 @@ export function isCaseOnlyPathRename(oldPath: string, newPath: string): boolean 
  * Attachment extensions eligible for blob sync (lowercase, without dot).
  * Must stay in sync with ATTACHMENT_EXTENSIONS in crates/vaultcrdt-core/src/blob_path.rs.
  */
-const ATTACHMENT_EXTENSIONS = [
-  'jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif', 'avif',
-  'pdf', 'mp3', 'm4a', 'ogg', 'opus', 'flac', 'wav',
-];
+const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif', 'avif'];
+const PDF_EXTENSIONS = ['pdf'];
+const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'ogg', 'oga', 'opus', 'flac', 'wav', 'webm', '3gp'];
+const ATTACHMENT_EXTENSIONS = [...IMAGE_EXTENSIONS, ...PDF_EXTENSIONS, ...AUDIO_EXTENSIONS];
 
 /**
  * Cheap gate for routing attachment events. Structure rules mirror
@@ -48,17 +48,23 @@ export function isAttachmentPath(path: string): boolean {
   return ATTACHMENT_EXTENSIONS.includes(pathKey.slice(dot + 1));
 }
 
-const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'ogg', 'opus', 'flac', 'wav'];
 const MIB = 1024 * 1024;
+const IMAGE_CAP = 10 * MIB;
+const PDF_CAP = 10 * MIB;
+const AUDIO_CAP = 25 * MIB;
 
 /**
- * Per-type upload size cap (design §3): images/pdf 10 MiB, audio 25 MiB.
- * Returns 0 for paths that are not attachments at all.
+ * Per-type upload size cap: images 10 MiB, pdf 10 MiB, audio 25 MiB.
+ * Extension groups match the server (jpg jpeg png webp gif heic heif avif /
+ * pdf / mp3 m4a ogg oga opus flac wav webm 3gp). Returns 0 for non-attachments.
  */
 export function attachmentCap(path: string): number {
   if (!isAttachmentPath(path)) return 0;
   const ext = pathCaseKey(path).slice(pathCaseKey(path).lastIndexOf('.') + 1);
-  return AUDIO_EXTENSIONS.includes(ext) ? 25 * MIB : 10 * MIB;
+  if (AUDIO_EXTENSIONS.includes(ext)) return AUDIO_CAP;
+  if (PDF_EXTENSIONS.includes(ext)) return PDF_CAP;
+  if (IMAGE_EXTENSIONS.includes(ext)) return IMAGE_CAP;
+  return 0;
 }
 
 export function isSyncablePath(path: string): boolean {
