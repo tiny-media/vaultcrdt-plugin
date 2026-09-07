@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-09-07
+
+### Fixed
+
+- A note edited on one device while another deletes it remotely
+  survives the reconnect, in the live path and initial sync alike. The
+  server's tombstone content hash is the authoritative proof: a local
+  file whose hash differs from the deleted server version holds
+  unsynced value and is kept and re-published (the edit propagates back
+  to the deleting device — verified on hardware). Local heuristics
+  (pending edits, editor text, CRDT-versus-disk) remain as the fallback
+  for servers without hashes, now also covering non-resident documents.
+- Delete intents remember their acknowledgement; reconnects resend
+  only unacked deletes and never replay a delete over a resurrected
+  document. A delete lost to a dying socket returns as a visibly
+  reappeared file instead of destroying data.
+
+
 ## [0.5.5] - 2026-09-07
 
 ### Added
