@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-09-07
+
+### Added
+
+- SVG attachments sync through a sanitizing lane: files are sanitized
+  with svg-hush (protocol-pinned 0.9.7) before hashing, the sanitized
+  bytes are canonical everywhere including the local file, and the
+  server rejects unsanitized SVGs at upload and attach.
+- Initial sync no longer trashes local files at tombstoned paths unless
+  they provably hold no unsynced value: pending or unacked edits keep,
+  a matching CRDT snapshot is clean, and stateless peers compare the
+  file hash against the server's new tombstone content hashes (absent
+  hash keeps, fail-safe). Kept files re-publish via replace-tombstone.
+- .obsidian sync S1: two per-device category toggles (defaults off)
+  sync app.json, appearance.json, CSS snippets and themes through the
+  blob lane as whole-file last-write-wins. Discovery is adapter-based
+  with a mandatory backstop sweep; category downloads hydrate eagerly
+  on every device. workspace files and plugin folders never sync.
+- Excalidraw drawings diverge to conflict copies instead of CRDT
+  merges (compressed payloads cannot survive interleaving); sequential
+  editing is unchanged.
+
+### Changed
+
+- Settings audit: the vault identity under Advanced is read-only
+  (inline edits skipped device-key reset and state cleanup; setup is
+  the guided path), changing the server URL resets connection state,
+  the vault secret field only appears in secret mode, terminology
+  unifies to Vault ID and Vault secret, and the ribbon shows a muted
+  counter badge instead of a warning tint.
+
+
 ## [0.5.4] - 2026-09-07
 
 ### Added
