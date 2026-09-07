@@ -745,6 +745,57 @@ describe('BlobUploader (attachment lane S2)', () => {
     expect(notify).toHaveBeenCalledTimes(1);
     expect(notify.mock.calls[0][0]).toContain('sanitize mismatch');
   });
+
+  it('parks with notice on upload finalize 422 and does not throw', async () => {
+    const { uploader, index, notify } = makeUploader({ files: { [SVG_PATH]: SVG_BYTES } });
+    mockRequestUrl.mockResolvedValueOnce(resp(422, { error: 'bytes rejected' }));
+    uploader.onFileChanged(SVG_PATH);
+    await expect(uploader.flush()).resolves.toBeUndefined();
+    expect(index.get(SVG_PATH)!.skipped).toBe(true);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain('bytes rejected');
+    expect(urls()).toEqual(['POST /vault/blobs/uploads']);
+  });
+
+  it('republishLive uploads sanitized svg bytes, not raw disk bytes', async () => {
+    mockSanitizeSvg.mockReturnValue(FIXED);
+    const writeBinary = vi.fn(async (_path: string, _data: ArrayBuffer) => undefined);
+    const key = blob_path_key(SVG_PATH)!;
+    const tomb = {
+      path_key: key,
+      display_path: SVG_PATH,
+      state: 'deleted',
+      content_hash: blake3_hex(SVG_BYTES),
+      generation: 3,
+      seq: 20,
+    };
+    const { uploader, index } = makeUploader({
+      files: { [SVG_PATH]: SVG_BYTES },
+      writeBinary,
+      trashIfPresent: vi.fn(async () => undefined),
+    });
+    index.update(SVG_PATH, {
+      hash: blake3_hex(SVG_BYTES),
+      size: SVG_BYTES.length,
+      generation: 2,
+      seq: 5,
+      lastRemoteHash: 'old-remote',
+      hydrated: true,
+    });
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(200, { states: [tomb], max_seq: 20 }))
+      .mockResolvedValueOnce(resp(201, { upload_id: 'u1', next_offset: 0, segment_bytes: 1024 }))
+      .mockResolvedValueOnce(resp(201, { hash: blake3_hex(FIXED) }))
+      .mockResolvedValueOnce(resp(200, { accepted: true, seq: 21 }));
+    await uploader.catchUp();
+    const start = calls().find((c) => c.method === 'POST' && c.url.includes('/vault/blobs/uploads'));
+    expect(JSON.parse(start!.body as string).hash).toBe(blake3_hex(FIXED));
+    expect(JSON.parse(start!.body as string).size).toBe(FIXED.byteLength);
+    const put = calls().find((c) => c.method === 'PUT');
+    expect(new Uint8Array(put!.body as ArrayBuffer)).toEqual(FIXED);
+    expect(writeBinary).toHaveBeenCalledTimes(1);
+    expect(new Uint8Array(writeBinary.mock.calls[0][1] as ArrayBuffer)).toEqual(FIXED);
+  });
 });
 
 describe('SyncEngine blob auth frame and wake-up', () => {

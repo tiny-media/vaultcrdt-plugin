@@ -247,23 +247,10 @@ export class BlobUploader {
     }
 
     let bytes: Uint8Array = new Uint8Array(await this.deps.readBinary(path));
-    const ext = pathCaseKey(path).slice(pathCaseKey(path).lastIndexOf('.') + 1);
-    if (ext === 'svg') {
-      const before = bytes.byteLength;
-      try {
-        const sanitized = sanitize_svg(bytes);
-        if (!uint8Equal(bytes, sanitized)) {
-          await this.deps.writeBinary(path, bufferOf(sanitized));
-        }
-        bytes = sanitized;
-      } catch (e) {
-        this.deps.index.update(path, { skipped: true });
-        this.noticeSvg(path, thrownReason(e));
-        return;
-      }
-      size = bytes.byteLength;
-      log(`svg sanitized: ${before} → ${size} bytes`);
-    }
+    const canonical = await this.canonicalSvgBytes(path, bytes);
+    if (canonical === null) return;
+    bytes = canonical;
+    size = bytes.byteLength;
     const hash = blake3_hex(bytes);
     if (this.superseded.delete(path)) return;
 
@@ -271,13 +258,35 @@ export class BlobUploader {
     const entry = this.deps.index.get(path);
     if (entry && entry.lastRemoteHash === hash) return;
 
-    const uploaded = await this.ensureBlob(hash, size, bytes);
+    const uploaded = await this.ensureBlob(path, hash, size, bytes);
     if (!uploaded) {
       this.deps.index.update(path, { skipped: true });
       return;
     }
     if (this.superseded.delete(path)) return;
     await this.reference(path, key, hash, size, bytes);
+  }
+
+  /**
+   * SVG: sanitize, write back if bytes changed, return canonical bytes.
+   * Non-SVG: return `bytes` unchanged. Sanitize failure parks and returns null.
+   */
+  private async canonicalSvgBytes(path: string, bytes: Uint8Array): Promise<Uint8Array | null> {
+    const ext = pathCaseKey(path).slice(pathCaseKey(path).lastIndexOf('.') + 1);
+    if (ext !== 'svg') return bytes;
+    const before = bytes.byteLength;
+    try {
+      const sanitized = sanitize_svg(bytes);
+      if (!uint8Equal(bytes, sanitized)) {
+        await this.deps.writeBinary(path, bufferOf(sanitized));
+      }
+      log(`svg sanitized: ${before} → ${sanitized.byteLength} bytes`);
+      return sanitized;
+    } catch (e) {
+      this.deps.index.update(path, { skipped: true });
+      this.noticeSvg(path, thrownReason(e));
+      return null;
+    }
   }
 
   /** Debounce, then require the size to be identical across two stat calls. */
@@ -302,9 +311,10 @@ export class BlobUploader {
   }
 
   private noticeSvg(path: string, reason: string): void {
-    const last = this.capNoticeAt.get(path);
+    const key = `svg:${path}`;
+    const last = this.capNoticeAt.get(key);
     if (last !== undefined && this.now() - last < CAP_NOTICE_THROTTLE_MS) return;
-    this.capNoticeAt.set(path, this.now());
+    this.capNoticeAt.set(key, this.now());
     this.deps.notify(svgRejectedMessage(path, reason));
   }
 
@@ -326,11 +336,19 @@ export class BlobUploader {
     this.noticeQuota(typeof quotaBytes === 'number' ? quotaBytes : undefined);
   }
 
-  /** Upload the bytes unless the server already stores this hash. Returns false on quota. */
-  private async ensureBlob(hash: string, size: number, bytes: Uint8Array): Promise<boolean> {
+  /** Upload the bytes unless the server already stores this hash. Returns false on quota or 422. */
+  private async ensureBlob(path: string, hash: string, size: number, bytes: Uint8Array): Promise<boolean> {
     const start = await this.http('POST', '/vault/blobs/uploads', { hash, size });
     if (start.status === 413) {
       this.applyQuotaPause(start.json);
+      return false;
+    }
+    if (start.status === 422) {
+      this.deps.index.update(path, { skipped: true });
+      this.noticeSvg(
+        path,
+        typeof start.json.error === 'string' ? start.json.error : 'rejected by server',
+      );
       return false;
     }
     if (start.json.exists === true) {
@@ -350,6 +368,14 @@ export class BlobUploader {
       let resp: HttpResult;
       try {
         resp = await this.putSegment(uploadId, bytes, offset, end, size);
+        if (resp.status === 422) {
+          this.deps.index.update(path, { skipped: true });
+          this.noticeSvg(
+            path,
+            typeof resp.json.error === 'string' ? resp.json.error : 'rejected by server',
+          );
+          return false;
+        }
         if (resp.status !== 201 && resp.status !== 202 && resp.status !== 409) {
           throw new Error(`segment upload failed (status ${resp.status})`);
         }
@@ -414,7 +440,7 @@ export class BlobUploader {
     if (resp.status === 412) {
       // Server garbage-collected the blob between upload and reference.
       if (retriedUpload) throw new Error(`blob-path rejected: hash ${hash} missing on server`);
-      if (!await this.ensureBlob(hash, size, bytes)) return;
+      if (!await this.ensureBlob(path, hash, size, bytes)) return;
       await this.reference(path, key, hash, size, bytes, true);
       return;
     }
@@ -572,16 +598,27 @@ export class BlobUploader {
     local: { key: string; generation: number },
     remoteGen: number,
   ): Promise<void> {
-    const size = (await this.deps.stat(path))?.size;
-    if (size === undefined) return;
-    const bytes = new Uint8Array(await this.deps.readBinary(path));
+    if ((await this.deps.stat(path))?.size === undefined) return;
+    let bytes: Uint8Array = new Uint8Array(await this.deps.readBinary(path));
+    const canonical = await this.canonicalSvgBytes(path, bytes);
+    if (canonical === null) return;
+    bytes = canonical;
+    const size = bytes.byteLength;
     const hash = blake3_hex(bytes);
-    const uploaded = await this.ensureBlob(hash, size, bytes);
+    const uploaded = await this.ensureBlob(path, hash, size, bytes);
     if (!uploaded) return;
     const generation = Math.max(local.generation, remoteGen) + 1;
     const resp = await this.postPath({
       path, key: local.key, hash, size, generation, state: 'live',
     });
+    if (resp.status === 422) {
+      this.deps.index.update(path, { skipped: true });
+      this.noticeSvg(
+        path,
+        typeof resp.json.error === 'string' ? resp.json.error : 'rejected by server',
+      );
+      return;
+    }
     if (resp.json.accepted !== true) return;
     const seq = typeof resp.json.seq === 'number' ? resp.json.seq : local.generation;
     this.deps.index.update(path, {
