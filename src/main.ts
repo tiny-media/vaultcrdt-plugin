@@ -11,7 +11,7 @@ import { ReplaceConnectionModal } from './replace-connection-modal';
 import { resetConnectionState } from './settings';
 import { SETUP_COPY, WASM_INIT_FAILED_NOTICE } from './user-facing-copy';
 import { Modal } from 'obsidian';
-import { log, error, redact, setSecretProvider, getRecentIssues } from './logger';
+import { log, error, warn, redact, setSecretProvider, getRecentIssues } from './logger';
 import { ServerFeatureCache, FEATURE_INVITE, FEATURE_BLOBS } from './server-features';
 import { buildDiagnosticsReport, assertNoSecret, type DiagnosticsInput } from './diagnostics';
 import { PROTOCOL_VERSION, jsonOf } from './protocol';
@@ -42,6 +42,8 @@ export default class VaultCRDTPlugin extends Plugin {
   private pendingDeleteChecks = new Set<string>();
   private pendingSyncEngineInit: Promise<void> | null = null;
   private handlingSetupLink = false;
+  /** One warn per session for already-synced attachment renames (S3 owns move). */
+  private warnedAttachmentRename = false;
   private activeSetup: SetupModal | null = null;
   /** Cached GET /health feature list (TTL'd), shared by every SetupModal. */
   serverFeatures = new ServerFeatureCache();
@@ -69,9 +71,7 @@ export default class VaultCRDTPlugin extends Plugin {
       serverUrl: () => this.settings.serverUrl,
       peerId: () => this.settings.peerId,
       getJwt: () => this.syncEngine.getJwt(),
-      blobsEnabled: async () =>
-        this.syncEngineInitialized
-        && (await this.serverFeatures.get(this.settings.serverUrl)).includes(FEATURE_BLOBS),
+      blobsEnabled: () => this.blobsEnabled(),
       stat: (path) => this.app.vault.adapter.stat(path),
       readBinary: (path) => this.app.vault.adapter.readBinary(path),
       notify: (text) => { new Notice(text, 8000); },
@@ -323,6 +323,16 @@ export default class VaultCRDTPlugin extends Plugin {
         if (!(file instanceof TFile)) return;
         this.inbox.onFileRenamed(oldPath, file.path);
         this.refreshInboxIndicators();
+        if (isAttachmentPath(oldPath) && this.blobIndex.get(oldPath)) {
+          if (!this.warnedAttachmentRename) {
+            this.warnedAttachmentRename = true;
+            warn('attachment rename of an already-synced file: server-side move comes with the hydration slice');
+          }
+        }
+        if (isAttachmentPath(file.path)) {
+          this.blobUploader.onFileChanged(file.path);
+          return;
+        }
         if (!this.syncEngineInitialized) return; // Ignore renames before sync engine is ready
         const oldSync = isSyncablePath(oldPath);
         const newSync = isSyncablePath(file.path);
@@ -521,9 +531,36 @@ export default class VaultCRDTPlugin extends Plugin {
       await this.runSyncWithProgress(engine, mode, isOnboarding);
       // Catch-up runs after the doc_list-driven initial sync completed.
       await this.blobUploader.catchUp().catch((err) => { error('blob catch-up failed:', err); });
+      await this.backfillAttachments().catch((err) => { error('blob backfill failed:', err); });
     } catch (err) {
       error('initialSync error:', err);
       new Notice('VaultCRDT: Sync failed — see console for details');
+    }
+  }
+
+  private async blobsEnabled(): Promise<boolean> {
+    return this.syncEngineInitialized
+      && (await this.serverFeatures.get(this.settings.serverUrl)).includes(FEATURE_BLOBS);
+  }
+
+  /**
+   * One-pass startup sweep for attachments missed because vault create fired
+   * before blobsEnabled() was true, or skipped by cap/quota. Only at the
+   * post-initial-sync catch-up site — not inside catchUp (that also runs on
+   * remote wake-ups). Does not hash; the uploader does. Never enqueues
+   * hydrated:false (remote is newer; download is S3).
+   */
+  async backfillAttachments(): Promise<void> {
+    try {
+      if (!(await this.blobsEnabled())) return;
+      for (const file of this.app.vault.getFiles()) {
+        const path = file.path;
+        if (!isAttachmentPath(path)) continue;
+        const entry = this.blobIndex.get(path);
+        if (!entry || entry.skipped) this.blobUploader.onFileChanged(path);
+      }
+    } catch (err) {
+      error('blob backfill failed:', err);
     }
   }
 

@@ -36,6 +36,7 @@ async function setup(content: string) {
       on: vi.fn((event, handler) => handlers.set(event, handler)),
       read: vi.fn().mockResolvedValue(content),
       getAbstractFileByPath: vi.fn().mockReturnValue(null),
+      getFiles: vi.fn().mockReturnValue([]),
     },
     fileManager: {
       trashFile: vi.fn().mockResolvedValue(undefined),
