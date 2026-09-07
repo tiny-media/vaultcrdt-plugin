@@ -3,7 +3,6 @@ import type VaultCRDTPlugin from './main';
 import { validateServerUrl, toHttpBase, normalizeServerUrl } from './url-policy';
 import { SetupModal } from './setup-modal';
 import { TRUST_NOTICE_TEXT, protocolHealthText, SETUP_COPY, OBSIDIAN_SYNC_COPY, SETTINGS_COPY, vaultSecretSetting, PLUGIN_REPO } from './user-facing-copy';
-import { EDIT_DEBOUNCE_MS } from './push-handler';
 
 /**
  * Guard before re-hydrating the active file after catch-up (main.ts). Lives
@@ -443,6 +442,10 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
         })
       );
 
+    const devicesDetails = containerEl.createEl('details');
+    devicesDetails.createEl('summary', { text: 'Devices', cls: 'setting-item-heading' });
+    void this.loadPeers(devicesDetails.createDiv());
+
     new Setting(containerEl)
       .setName('Privacy and trust')
       .setDesc(TRUST_NOTICE_TEXT);
@@ -471,14 +474,9 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
         })
       );
 
-    // Read-only constants — displayed, never editable.
-    new Setting(devContainer).setName(SETTINGS_COPY.activeConstants).setHeading();
-    new Setting(devContainer).setName(SETTINGS_COPY.editDebounce).setDesc(`${EDIT_DEBOUNCE_MS} ms`);
-    new Setting(devContainer).setName(SETTINGS_COPY.hydrationDebounce).setDesc(`${HYDRATION_DEBOUNCE_MS} ms`);
+    // Read-only policy — the one constant users actually ask about.
+    new Setting(devContainer).setName(SETTINGS_COPY.limits).setHeading();
     new Setting(devContainer).setName(SETTINGS_COPY.attachmentCaps).setDesc(SETTINGS_COPY.attachmentCapsValue);
-    new Setting(devContainer)
-      .setName(SETTINGS_COPY.protocolVersionName)
-      .setDesc(protocolHealthText(this.plugin.serverFeatures.protocolVersion(), PROTOCOL_VERSION));
 
     new Setting(devContainer)
       .setName('Peer ID')
@@ -505,12 +503,8 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       );
 
     const storageDetails = devContainer.createEl('details');
-    storageDetails.createEl('summary', { text: 'Storage info', cls: 'setting-item-heading' });
+    storageDetails.createEl('summary', { text: 'Storage', cls: 'setting-item-heading' });
     void this.loadStorageInfo(storageDetails.createDiv());
-
-    const devicesDetails = devContainer.createEl('details');
-    devicesDetails.createEl('summary', { text: 'Synced devices', cls: 'setting-item-heading' });
-    void this.loadPeers(devicesDetails.createDiv());
 
     new Setting(devContainer)
       .setName('Reset device identity')
@@ -569,7 +563,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
   }
 
   private async loadStorageInfo(container: HTMLElement): Promise<void> {
-    container.createEl('p', { text: 'Loading...', cls: 'setting-item-description' });
+    container.createEl('p', { text: 'Loading…', cls: 'setting-item-description' });
 
     try {
       // Local stats
@@ -584,40 +578,15 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       }
 
       const overhead = totalVaultBytes > 0
-        ? ((totalLoroBytes / totalVaultBytes) * 100).toFixed(1)
+        ? (totalLoroBytes / totalVaultBytes).toFixed(1)
         : '0';
 
-      // Sort by size descending for top 10
-      const topFiles = [...loroFiles].sort((a, b) => b[1] - a[1]).slice(0, 10);
-
       container.empty();
-      new Setting(container).setName('Local').setHeading();
-
       new Setting(container)
-        .setName('Synced documents')
-        .setDesc(`${syncedDocCount} files`);
+        .setName('Local')
+        .setDesc(`${syncedDocCount} docs · ${formatBytes(totalLoroBytes)} CRDT state · vault ${formatBytes(totalVaultBytes)} (${overhead}×)`);
 
-      new Setting(container)
-        .setName('CRDT state (.loro files)')
-        .setDesc(`${loroFiles.length} files, ${formatBytes(totalLoroBytes)}`);
-
-      new Setting(container)
-        .setName('Vault size (Markdown)')
-        .setDesc(`${mdFiles.length} files, ${formatBytes(totalVaultBytes)}`);
-
-      new Setting(container)
-        .setName('CRDT overhead')
-        .setDesc(`${overhead}%`);
-
-      if (topFiles.length > 0) {
-        new Setting(container).setName('Largest .loro files').setHeading();
-        const list = container.createEl('ul', { cls: 'vcrdt-stats-list' });
-        for (const [name, size] of topFiles) {
-          list.createEl('li', { text: `${name} — ${formatBytes(size)}` });
-        }
-      }
-
-      // Server stats
+      // Server stats (one summary line + the actionable largest-documents list)
       await this.loadServerStats(container);
     } catch (err) {
       container.empty();
@@ -701,26 +670,15 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       const stats = jsonOf<{
         doc_count: number;
         total_snapshot_bytes: number;
-        total_vv_bytes: number;
         largest_docs: Array<{ doc_uuid: string; snapshot_bytes: number }>;
       }>(statsResp);
 
-      new Setting(container).setName('Server').setHeading();
-
       new Setting(container)
-        .setName('Documents on server')
-        .setDesc(`${stats.doc_count ?? 0} files`);
-
-      new Setting(container)
-        .setName('Total snapshot size')
-        .setDesc(formatBytes(stats.total_snapshot_bytes ?? 0));
-
-      new Setting(container)
-        .setName('Total VV size')
-        .setDesc(formatBytes(stats.total_vv_bytes ?? 0));
+        .setName('Server')
+        .setDesc(`${stats.doc_count ?? 0} docs · ${formatBytes(stats.total_snapshot_bytes ?? 0)} snapshots`);
 
       if ((stats.largest_docs?.length ?? 0) > 0) {
-        new Setting(container).setName('Largest server documents').setHeading();
+        new Setting(container).setName('Largest documents (server)').setHeading();
         const list = container.createEl('ul', { cls: 'vcrdt-stats-list' });
         for (const doc of stats.largest_docs ?? []) {
           list.createEl('li', { text: `${doc.doc_uuid} — ${formatBytes(doc.snapshot_bytes)}` });

@@ -77,16 +77,16 @@ describe('settings tab structure', () => {
     expect(text).toContain(SETTINGS_COPY.carryStyles);
   });
 
-  it('shows read-only constants in the developer section', () => {
+  it('shows the attachment limits as the only constant in the developer section', () => {
     const { tab, containerEl } = makeTab();
     tab.display();
     const text = elementText(containerEl);
 
     expect(text).toContain(SETTINGS_COPY.copyDiagnostics);
-    expect(text).toContain(SETTINGS_COPY.activeConstants);
-    expect(text).toContain('300 ms');
-    expect(text).toContain('2000 ms');
+    expect(text).toContain(SETTINGS_COPY.limits);
     expect(text).toContain(SETTINGS_COPY.attachmentCapsValue);
+    expect(text).not.toContain('debounce');
+    expect(text).not.toContain('Protocol version');
   });
 
   it('no longer offers the sync-delay knob', () => {
