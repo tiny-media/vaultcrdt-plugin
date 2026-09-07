@@ -278,15 +278,17 @@ export default class VaultCRDTPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('delete', (file) => {
         if (!(file instanceof TFile)) return;
-        this.inbox.onFileDeleted(file.path);
-        this.refreshInboxIndicators();
-        if (!isSyncablePath(file.path)) return;
-        if (!this.syncEngineInitialized) return; // Ignore deletes before sync engine is ready
         const path = file.path;
-        if (this.syncEngine.isDeletingFromRemote(path)) {
+        // Remote-originated trash already filed a deleted-remote inbox entry;
+        // clearing here would wipe the notice for the session that saw it.
+        if (this.syncEngine?.isDeletingFromRemote(path)) {
           this.syncEngine.traceVaultDeleteDropped(path, 'remote-suppressed');
           return;
         }
+        this.inbox.onFileDeleted(path);
+        this.refreshInboxIndicators();
+        if (!isSyncablePath(path)) return;
+        if (!this.syncEngineInitialized) return; // Ignore deletes before sync engine is ready
         if (this.pendingDeleteChecks.has(path)) {
           this.syncEngine.traceVaultDeleteDropped(path, 'echo-dropped');
           return;

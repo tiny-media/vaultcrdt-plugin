@@ -7,7 +7,7 @@ import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn } from './logger';
 import { isSyncablePath, pathCaseKey } from './path-policy';
-import { conflictNoticeMessage, failedDocsNoticeMessage } from './user-facing-copy';
+import { conflictNoticeMessage, failedDocsNoticeMessage, remoteDeleteTrashedNoticeMessage } from './user-facing-copy';
 import type { InboxSink } from './inbox';
 
 export type SyncMode = 'pull' | 'push' | 'merge';
@@ -579,9 +579,16 @@ export async function runInitialSync(
     if (!isSyncablePath(uuid)) continue;
     const f = app.vault.getAbstractFileByPath(uuid);
     if (f instanceof TFile) {
+      // ACCEPTED LIMITATION: the entry lives until the next restart — inbox
+      // reconciliation sweeps entries whose file no longer exists, and after a
+      // trash the file is gone, so the sweep is correct; the session in which
+      // the surprise happened is what needs the entry.
       deletingFromRemote.add(uuid);
       try {
         await app.fileManager.trashFile(f);
+        deps.inbox?.add({
+          kind: 'deleted-remote', path: uuid, note: remoteDeleteTrashedNoticeMessage(uuid),
+        });
       } finally {
         window.setTimeout(() => deletingFromRemote.delete(uuid), 500);
       }

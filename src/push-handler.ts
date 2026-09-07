@@ -219,44 +219,46 @@ export class PushHandler {
 
   /** Flush pending debounce edits into CRDT before merging broadcast. */
   async flushPendingEdits(path: string): Promise<void> {
+    // Read first: a null leaf walk (plausible on mobile) must not drop a
+    // still-scheduled fire, and with no timer armed we still fold if the
+    // editor differs from the CRDT (debounce already fired, getOrLoad still
+    // in flight).
+    const freshContent = this.editor.readCurrentContent(path);
+    if (freshContent === null) return;
     const timer = this.pushDebounceTimers.get(path);
-    if (!timer) return;
-    window.clearTimeout(timer);
+    if (timer !== undefined) window.clearTimeout(timer);
     this.pushDebounceTimers.delete(path);
     this.pushFirstChangeAt.delete(path);
-    const freshContent = this.editor.readCurrentContent(path);
     this.tracePath('push.flush.begin', path, {
-      hasEditorContent: freshContent !== null,
-      contentLen: freshContent?.length ?? 0,
+      hasEditorContent: true,
+      contentLen: freshContent.length,
     });
-    if (freshContent !== null) {
-      const doc = await this.docs.getOrLoad(path);
-      if (!doc.text_matches(freshContent)) {
-        const vvBefore = doc.export_vv_json();
-        doc.sync_from_disk(freshContent);
-        // Push flushed ops to server immediately — otherwise these local ops
-        // never reach the server, breaking the causal chain for subsequent deltas.
-        try {
-          const delta = doc.export_delta_since_vv_json(vvBefore);
-          if (delta.length > 0) {
-            const wsOpen = this.isWsOpen();
-            if (wsOpen) {
-              this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
-              this.sentUnacked.add(path);
-              this.tracePath('push.flush.sent', path, { deltaLen: delta.length });
-              log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
-            } else {
-              this.tracePath('push.flush.deferred-offline', path, { deltaLen: delta.length });
-              log(`${this.tag} flushed pending edits locally (WS closed)`, { path, deltaLen: delta.length });
-            }
+    const doc = await this.docs.getOrLoad(path);
+    if (!doc.text_matches(freshContent)) {
+      const vvBefore = doc.export_vv_json();
+      doc.sync_from_disk(freshContent);
+      // Push flushed ops to server immediately — otherwise these local ops
+      // never reach the server, breaking the causal chain for subsequent deltas.
+      try {
+        const delta = doc.export_delta_since_vv_json(vvBefore);
+        if (delta.length > 0) {
+          const wsOpen = this.isWsOpen();
+          if (wsOpen) {
+            this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
+            this.sentUnacked.add(path);
+            this.tracePath('push.flush.sent', path, { deltaLen: delta.length });
+            log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
+          } else {
+            this.tracePath('push.flush.deferred-offline', path, { deltaLen: delta.length });
+            log(`${this.tag} flushed pending edits locally (WS closed)`, { path, deltaLen: delta.length });
           }
-        } catch (err) {
-          this.tracePath('push.flush.error', path, { message: err instanceof Error ? err.message : String(err) });
-          warn(`${this.tag} flush push failed`, { path, err });
         }
-      } else {
-        this.tracePath('push.flush.skip-text-match', path);
+      } catch (err) {
+        this.tracePath('push.flush.error', path, { message: err instanceof Error ? err.message : String(err) });
+        warn(`${this.tag} flush push failed`, { path, err });
       }
+    } else {
+      this.tracePath('push.flush.skip-text-match', path);
     }
   }
 

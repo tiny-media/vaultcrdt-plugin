@@ -171,7 +171,11 @@ export class EditorIntegration {
           // typing — the diff was applied correctly, extra chars are user keystrokes.
           log(`${this.tag} diff apply mismatch (concurrent typing, no fallback)`, { filePath });
         } else {
-          warn(`${this.tag} diff apply mismatch, falling back to setValue`, { filePath });
+          warn(`${this.tag} diff apply mismatch, falling back to setValue`, {
+            filePath,
+            lenBefore: editor.getValue().length,
+            lenAfter: expectedText.length,
+          });
           this.updatingEditorFromRemote.add(filePath);
           try {
             const cursor = editor.getCursor();

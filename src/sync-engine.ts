@@ -16,7 +16,7 @@ import { SyncTrace } from './sync-trace';
 import type { VVCacheEntry } from './state-storage';
 import { StartupDirtyTracker } from './startup-dirty-tracker';
 import type { InboxSink } from './inbox';
-import { authRejectedNoticeMessage, protocolMismatchNoticeMessage, conflictNoticeMessage, tombstoneNoticeMessage, remoteDeleteKeptNoticeMessage, tombstoneRenamedNoticeMessage } from './user-facing-copy';
+import { authRejectedNoticeMessage, protocolMismatchNoticeMessage, conflictNoticeMessage, tombstoneNoticeMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage, tombstoneRenamedNoticeMessage } from './user-facing-copy';
 
 export type SyncStatus = 'connected' | 'syncing' | 'offline' | 'error';
 export { type SyncMode } from './sync-initial';
@@ -805,20 +805,47 @@ export class SyncEngine {
       this.lastServerVV.set(docUuid, serverVVStr);
     }
 
-    // Try surgical editor update via diff; fall back to full writeToVault
+    // Try surgical editor update via diff; fall back to full writeToVault.
+    // skipFallback: a verification mismatch means concurrent local typing —
+    // never rewrite the editor from CRDT state on this path (tail loss).
+    let appliedDiff = false;
     try {
-      if (diffJson && this.editor.applyDiffToEditor(docUuid, diffJson, doc.get_text())) {
+      appliedDiff = diffJson
+        ? this.editor.applyDiffToEditor(docUuid, diffJson, doc.get_text(), true)
+        : false;
+      if (appliedDiff) {
         this.trace.markPath('broadcast.apply-diff', docUuid, { textLen: doc.get_text().length });
-        this.lastRemoteWrite.set(docUuid, fnv1aHash64(doc.get_text()));
-        await this.docs.persist(docUuid);
-        if (serverVVStr !== null) this.rememberVVCache(docUuid, serverVVStr, doc.get_text());
-        return;
       }
     } catch (err) {
       this.trace.markPath('broadcast.apply-diff-error', docUuid, {
         message: err instanceof Error ? err.message : String(err),
       });
       warn(`${this.tag} applyDiffToEditor failed, falling back to writeToVault`, { docUuid, err });
+    }
+
+    if (appliedDiff) {
+      // Fold local keystrokes typed during the async apply back into the
+      // CRDT and push them (flushPendingEdits pushes with peer_id and
+      // sentUnacked tracking; with no timer armed it still folds — see its
+      // own change). This mirrors the catch-up branch but guarantees the
+      // tail reaches the server, which the catch-up branch can defer to
+      // the full push after initial sync.
+      // Bind the server VV to the post-import/apply text, not the post-fold
+      // text: a fold can add local ops the server has not confirmed.
+      const preFoldText = doc.get_text();
+      try {
+        await this.push.flushPendingEdits(docUuid);
+      } catch (err) {
+        this.trace.markPath('broadcast.fold-error', docUuid, {
+          message: err instanceof Error ? err.message : String(err),
+        });
+        warn(`${this.tag} post-apply fold failed`, { docUuid, err });
+      }
+      const postContent = this.editor.readCurrentContent(docUuid);
+      this.lastRemoteWrite.set(docUuid, fnv1aHash64(postContent ?? doc.get_text()));
+      await this.docs.persist(docUuid);
+      if (serverVVStr !== null) this.rememberVVCache(docUuid, serverVVStr, preFoldText);
+      return;
     }
 
     this.trace.markPath('broadcast.write-to-vault', docUuid, { textLen: textAfter.length });
@@ -924,12 +951,12 @@ export class SyncEngine {
         unackedKeep ||
         (doc !== undefined && editorContent !== null && !doc.text_matches(editorContent))) {
       this.forgetStartupPath(docUuid);
+      this.inbox?.add({ kind: 'deleted-remote', path: docUuid, note: remoteDeleteKeptNoticeMessage(docUuid) });
       await this.docs.removeAndClean(docUuid);
       this.lastServerVV.delete(docUuid);
       this.lastRemoteWrite.delete(docUuid);
       this.push.markRecreateIntent(docUuid);
       this.trace.markPath('delete.kept-local-edits', docUuid, unackedKeep ? { unacked: true } : undefined);
-      this.inbox?.add({ kind: 'deleted-remote', path: docUuid, note: remoteDeleteKeptNoticeMessage(docUuid) });
       return;
     }
     this.forgetStartupPath(docUuid);
@@ -940,8 +967,9 @@ export class SyncEngine {
       this.deletingFromRemote.add(docUuid);
       try {
         await this.app.fileManager.trashFile(f);
+        this.inbox?.add({ kind: 'deleted-remote', path: docUuid, note: remoteDeleteTrashedNoticeMessage(docUuid) });
       } finally {
-        window.setTimeout(() => this.deletingFromRemote.delete(docUuid), 0);
+        window.setTimeout(() => this.deletingFromRemote.delete(docUuid), 500);
       }
     }
   }

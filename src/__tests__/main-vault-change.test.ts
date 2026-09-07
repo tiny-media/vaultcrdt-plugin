@@ -27,7 +27,7 @@ import VaultCRDTPlugin from '../main';
 import { SyncEngine } from '../sync-engine';
 import { TFile } from 'obsidian';
 import { fnv1aHash64 } from '../conflict-utils';
-import { PANEL_COPY } from '../user-facing-copy';
+import { PANEL_COPY, remoteDeleteTrashedNoticeMessage } from '../user-facing-copy';
 
 async function setup(content: string) {
   const handlers = new Map<string, (file: TFile) => Promise<void>>();
@@ -135,6 +135,32 @@ describe('vault delete remote-write window', () => {
     vi.advanceTimersByTime(600);
     expect(deleted).not.toHaveBeenCalled();
     expect(engine.isDeletingFromRemote(file.path)).toBe(false);
+  });
+
+  it('does not clear a deleted-remote inbox entry while the delete is remote-originated', async () => {
+    vi.useFakeTimers();
+    const { engine, handlers, app, plugin } = await setup('');
+    const file = new TFile();
+    engine.inbox = plugin.inbox;
+    Object.assign((engine as any).docs, {
+      get: vi.fn(), removeAndClean: vi.fn().mockResolvedValue(undefined),
+      saveVVCache: vi.fn().mockResolvedValue(undefined),
+      cleanOrphans: vi.fn().mockResolvedValue(0),
+      saveDeleteJournal: vi.fn().mockResolvedValue(undefined),
+    });
+    app.vault.getAbstractFileByPath.mockReturnValue(file);
+    app.fileManager.trashFile = vi.fn(async () => {
+      expect(engine.isDeletingFromRemote(file.path)).toBe(true);
+      await handlers.get('delete')!(file);
+    });
+    await (engine as any).onDocDeleted(file.path);
+    expect(plugin.inbox.list()).toEqual([
+      expect.objectContaining({
+        kind: 'deleted-remote',
+        path: file.path,
+        note: remoteDeleteTrashedNoticeMessage(file.path),
+      }),
+    ]);
   });
 
   it('deletes immediately outside the write window', async () => {

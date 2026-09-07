@@ -108,6 +108,113 @@ describe('PushHandler push debounce maxWait', () => {
     expect(fire).toHaveBeenCalledTimes(1);
   });
 
+  it('flush without a timer folds and pushes differing editor content', async () => {
+    const send = vi.fn();
+    const stubDoc = {
+      text_matches: vi.fn(() => false),
+      sync_from_disk: vi.fn(),
+      export_vv_json: () => '{}',
+      export_delta_since_vv_json: () => new Uint8Array(8),
+    };
+    const docs = {
+      saveDeleteJournal: vi.fn().mockResolvedValue(undefined),
+      loadDeleteJournal: vi.fn().mockResolvedValue([]),
+      movePath: vi.fn(),
+      getOrLoad: vi.fn().mockResolvedValue(stubDoc),
+      persist: vi.fn().mockResolvedValue(undefined),
+      removeAndClean: vi.fn().mockResolvedValue(undefined),
+    };
+    const push = new PushHandler(
+      docs as any,
+      { readCurrentContent: vi.fn(() => 'abXY') } as any,
+      send,
+      { peerId: 'p', debounceMs: 700 } as any,
+      new Map(),
+      new Map(),
+      vi.fn(),
+      () => true,
+      '[test]',
+      vi.fn(),
+    );
+    await push.flushPendingEdits('a.md');
+    expect(docs.getOrLoad).toHaveBeenCalledWith('a.md');
+    expect(stubDoc.sync_from_disk).toHaveBeenCalledWith('abXY');
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'sync_push', doc_uuid: 'a.md', peer_id: 'p',
+    }));
+  });
+
+  it('flush without a timer returns immediately when the editor is closed', async () => {
+    const stubDoc = {
+      text_matches: vi.fn(),
+      sync_from_disk: vi.fn(),
+      export_vv_json: vi.fn(),
+      export_delta_since_vv_json: vi.fn(),
+    };
+    const docs = {
+      saveDeleteJournal: vi.fn().mockResolvedValue(undefined),
+      loadDeleteJournal: vi.fn().mockResolvedValue([]),
+      movePath: vi.fn(),
+      getOrLoad: vi.fn().mockResolvedValue(stubDoc),
+      persist: vi.fn().mockResolvedValue(undefined),
+      removeAndClean: vi.fn().mockResolvedValue(undefined),
+    };
+    const push = new PushHandler(
+      docs as any,
+      { readCurrentContent: vi.fn(() => null) } as any,
+      vi.fn(),
+      { peerId: 'p', debounceMs: 700 } as any,
+      new Map(),
+      new Map(),
+      vi.fn(),
+      () => true,
+      '[test]',
+      vi.fn(),
+    );
+    await push.flushPendingEdits('a.md');
+    expect(docs.getOrLoad).not.toHaveBeenCalled();
+    expect(stubDoc.sync_from_disk).not.toHaveBeenCalled();
+  });
+
+  it('flush with a timer and a null read leaves the timer armed', async () => {
+    const read = vi.fn<() => string | null>();
+    const stubDoc = {
+      text_matches: () => false,
+      sync_from_disk: vi.fn(),
+      export_vv_json: () => '{}',
+      export_delta_since_vv_json: () => new Uint8Array(0),
+    };
+    const docs = {
+      saveDeleteJournal: vi.fn().mockResolvedValue(undefined),
+      loadDeleteJournal: vi.fn().mockResolvedValue([]),
+      movePath: vi.fn(),
+      getOrLoad: vi.fn().mockResolvedValue(stubDoc),
+      persist: vi.fn().mockResolvedValue(undefined),
+      removeAndClean: vi.fn().mockResolvedValue(undefined),
+    };
+    const push = new PushHandler(
+      docs as any,
+      { readCurrentContent: read } as any,
+      vi.fn(),
+      { peerId: 'p', debounceMs: 700 } as any,
+      new Map(),
+      new Map(),
+      vi.fn(),
+      () => true,
+      '[test]',
+      vi.fn(),
+    );
+    const fire = vi.fn();
+    (push as any).pushFileDelta = fire;
+    read.mockReturnValue(null);
+    push.onFileChanged('a.md');
+    await push.flushPendingEdits('a.md');
+    expect(fire).not.toHaveBeenCalled();
+    read.mockReturnValue('x');
+    vi.advanceTimersByTime(700);
+    expect(fire).toHaveBeenCalledTimes(1);
+  });
+
   it('paths are independent', () => {
     const { push, fire } = makePush();
     push.onFileChanged('a.md');

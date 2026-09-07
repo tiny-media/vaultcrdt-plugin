@@ -11,6 +11,9 @@ export function remoteDeleteKeptNoticeMessage(docUuid: string): string {
   return `VaultCRDT: "${redact(docUuid)}" was deleted on another device, but this device has unsynced edits in it. The file was kept and will be re-created on the server from this local version at the next sync. If you meant to delete it, delete it again here.`;
 }
 
+export const remoteDeleteTrashedNoticeMessage = (path: string): string =>
+  `VaultCRDT: "${redact(path)}" was deleted on another device and moved to trash.`;
+
 export function tombstoneRenamedNoticeMessage(docUuid: string, keptPath: string): string {
   return `VaultCRDT: "${redact(docUuid)}" was deleted on another device. Your local copy was renamed to "${redact(keptPath)}" and syncs under that name; the original name stays deleted.`;
 }

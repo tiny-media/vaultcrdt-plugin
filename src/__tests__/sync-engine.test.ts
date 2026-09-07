@@ -130,6 +130,7 @@ vi.stubGlobal('WebSocket', MockWebSocket);
 
 import { SyncEngine } from '../sync-engine';
 import { fnv1aHash64 } from '../conflict-utils';
+import { remoteDeleteTrashedNoticeMessage } from '../user-facing-copy';
 import { TFile } from 'obsidian';
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -1562,6 +1563,29 @@ describe('SyncEngine', () => {
       expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
     });
 
+    it('adds a deleted-remote inbox entry when step-6 trashes a tombstoned local file', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      mockVault.getMarkdownFiles.mockReturnValue([{ path: 'deleted.md' }]);
+      await engine.start();
+      const add = vi.fn();
+      engine.inbox = { add };
+      const syncPromise = engine.initialSync();
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [],
+        tombstones: ['deleted.md'],
+      });
+      await syncPromise;
+      expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'deleted.md',
+        note: remoteDeleteTrashedNoticeMessage('deleted.md'),
+      }));
+    });
+
     it('does not push a tombstoned local file', async () => {
       mockVault.getMarkdownFiles.mockReturnValue([{ path: 'gone.md' }]);
       mockVault.read.mockResolvedValue('content');
@@ -1876,6 +1900,68 @@ describe('SyncEngine', () => {
       // offsetToPos should have been called with 1 (from) and 3 (to)
       expect(mockEditor.offsetToPos).toHaveBeenCalledWith(1);
       expect(mockEditor.offsetToPos).toHaveBeenCalledWith(3);
+    });
+
+    it('live surgical apply with no local tail folds via flush and skips writeToVault', async () => {
+      const internal = engine as any;
+      mockDocInstance.import_and_diff.mockReturnValue('[]');
+      mockDocInstance.get_text.mockReturnValue('crdt text');
+      const apply = vi.spyOn(internal.editor, 'applyDiffToEditor').mockReturnValue(true);
+      const write = vi.spyOn(internal.editor, 'writeToVault').mockResolvedValue(undefined);
+      const flushEdits = vi.spyOn(internal.push, 'flushPendingEdits').mockResolvedValue(undefined);
+      vi.spyOn(internal.editor, 'readCurrentContent').mockReturnValue('post-fold');
+      await internal.onDeltaBroadcast({
+        doc_uuid: 'note.md', delta: new Uint8Array(8), peer_id: 'other-peer',
+      });
+      expect(apply).toHaveBeenCalledWith('note.md', '[]', 'crdt text', true);
+      expect(flushEdits).toHaveBeenCalledWith('note.md');
+      expect(internal.lastRemoteWrite.get('note.md')).toBe(fnv1aHash64('post-fold'));
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    it('live surgical apply with a local tail folds it into the CRDT and pushes', async () => {
+      await engine.start();
+      const internal = engine as any;
+      mockDocInstance.import_and_diff.mockReturnValue('[]');
+      mockDocInstance.get_text.mockReturnValue('ab');
+      mockDocInstance.text_matches.mockImplementation((content: string) => content === 'ab');
+      mockDocInstance.export_delta_since_vv_json.mockReturnValue(new Uint8Array(16));
+      const apply = vi.spyOn(internal.editor, 'applyDiffToEditor').mockReturnValue(true);
+      const write = vi.spyOn(internal.editor, 'writeToVault').mockResolvedValue(undefined);
+      vi.spyOn(internal.editor, 'readCurrentContent').mockReturnValue('abXY');
+      mockEncode.mockClear();
+      mockDocInstance.sync_from_disk.mockClear();
+      await internal.onDeltaBroadcast({
+        doc_uuid: 'note.md', delta: new Uint8Array(8), peer_id: 'other-peer',
+      });
+      expect(apply).toHaveBeenCalledWith('note.md', '[]', 'ab', true);
+      expect(mockDocInstance.sync_from_disk).toHaveBeenCalledWith('abXY');
+      const pushes = mockEncode.mock.calls.filter((c: any[]) => c[0]?.type === 'sync_push');
+      expect(pushes.length).toBeGreaterThan(0);
+      expect(pushes[0][0]).toMatchObject({ type: 'sync_push', doc_uuid: 'note.md', peer_id: 'peer-test' });
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    it('does not writeToVault when the post-apply fold rejects', async () => {
+      const internal = engine as any;
+      mockDocInstance.import_and_diff.mockReturnValue('[]');
+      mockDocInstance.get_text.mockReturnValue('ab');
+      const write = vi.spyOn(internal.editor, 'writeToVault').mockResolvedValue(undefined);
+      const flushEdits = vi.spyOn(internal.push, 'flushPendingEdits').mockResolvedValue(undefined);
+      vi.spyOn(internal.editor, 'applyDiffToEditor').mockImplementation(() => {
+        flushEdits.mockRejectedValue(new Error('fold failed'));
+        return true;
+      });
+      await expect(internal.onDeltaBroadcast({
+        doc_uuid: 'note.md', delta: new Uint8Array(8), peer_id: 'other-peer',
+      })).resolves.toBeUndefined();
+      expect(write).not.toHaveBeenCalled();
+      expect(internal.lastRemoteWrite.get('note.md')).toBe(fnv1aHash64('ab'));
+      flushEdits.mockResolvedValue(undefined);
+      await expect(internal.onDeltaBroadcast({
+        doc_uuid: 'next.md', delta: new Uint8Array(8), peer_id: 'other-peer',
+      })).resolves.toBeUndefined();
+      expect(write).not.toHaveBeenCalled();
     });
   });
 
@@ -3482,6 +3568,22 @@ describe('SyncEngine', () => {
 
       expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
     });
+
+    it('adds a deleted-remote inbox entry when a remote delete trashes the local file', async () => {
+      const mockFile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      await engine.start();
+      const add = vi.fn();
+      engine.inbox = { add };
+      fireMessage({ type: 'doc_deleted', doc_uuid: 'gone.md' });
+      await flush();
+      expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'deleted-remote',
+        path: 'gone.md',
+        note: remoteDeleteTrashedNoticeMessage('gone.md'),
+      }));
+    });
   });
 
   // ── doc_deleted keep-guard — sent-but-unacked pushes (U42) ────────────────
@@ -3703,6 +3805,20 @@ describe('SyncEngine', () => {
 
       expect(add).toHaveBeenCalledWith(expect.objectContaining({ kind: 'deleted-remote', path: 'kept.md' }));
       expect(mockFileManager.trashFile).not.toHaveBeenCalled();
+    });
+
+    it('adds the deleted-remote inbox entry before removeAndClean in the keep-branch', async () => {
+      const file = Object.assign(Object.create(TFile.prototype), { path: 'kept.md' });
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) => (p === 'kept.md' ? file : null));
+      mockDocInstance.text_matches.mockReturnValue(false);
+      engine = new SyncEngine(makeApp([makeLeaf('kept.md')]), makeSettings());
+      await engine.start();
+      engine.onFileChanged('kept.md');
+      const add = vi.fn();
+      engine.inbox = { add };
+      vi.spyOn((engine as any).docs, 'removeAndClean').mockRejectedValue(new Error('clean failed'));
+      await expect((engine as any).onDocDeleted('kept.md')).rejects.toThrow('clean failed');
+      expect(add).toHaveBeenCalledWith(expect.objectContaining({ kind: 'deleted-remote', path: 'kept.md' }));
     });
 
     it('collects a failed-docs inbox entry when an overlapping doc fails to sync', async () => {
