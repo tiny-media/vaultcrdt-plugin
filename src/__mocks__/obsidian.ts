@@ -11,10 +11,12 @@ export class Setting {
   settingEl: StubElement;
   nameEl: StubElement;
   descEl: StubElement;
+  controlEl: StubElement;
   constructor(containerEl?: StubElement) {
     this.settingEl = makeStubElement('div');
     this.nameEl = this.settingEl.createDiv();
     this.descEl = this.settingEl.createDiv();
+    this.controlEl = this.settingEl.createDiv();
     containerEl?.children?.push(this.settingEl);
   }
   setName(name: string) { this.nameEl.textContent = name; return this; }

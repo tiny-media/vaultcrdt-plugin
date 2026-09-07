@@ -22,7 +22,7 @@ export function tombstoneRenamedNoticeMessage(docUuid: string, keptPath: string)
 }
 
 export function authRejectedNoticeMessage(): string {
-  return 'VaultCRDT: the server rejected this device\'s credentials. Check the vault name and vault secret in Settings, then retry.';
+  return 'VaultCRDT: the server rejected this device\'s credentials. Check the vault ID and vault secret in Settings, then retry.';
 }
 
 export function protocolMismatchNoticeMessage(server: number, client: number): string {
@@ -105,9 +105,10 @@ export const WASM_INIT_FAILED_NOTICE =
 export const PLUGIN_REPO = 'tiny-media/vaultcrdt-plugin';
 export const SETUP_COPY = {
   title: 'Setup link', command: 'Invite a device', change: 'change',
-  server: 'Server', vault: 'Vault Name',
+  server: 'Server', vault: 'Vault ID',
   join: 'I trust this server - Join', secret: "Vault secret — paste it, don't type it",
   required: 'Vault secret is required', device: 'Device name', paste: 'Paste',
+  vaultInvalid: 'Vault ID must be lowercase letters, numbers, or hyphens (e.g. my-notes)',
   pasteFailed: 'Clipboard unavailable — paste into the field.',
   update: 'This link needs a newer VaultCRDT plugin',
   invite: 'Invite token detected - it will be used automatically once your server supports it.',
@@ -148,3 +149,52 @@ export const OBSIDIAN_SYNC_COPY = {
   configDirNote:
     'Uses the hardcoded folder name .obsidian; a custom configDir is not synced.',
 };
+
+export const SETTINGS_COPY = {
+  vaultSecret: 'Vault secret',
+  vaultSecretPlaceholder: 'vault secret',
+  vaultSecretDesc: 'Shared secret for this vault. Must be identical on every device that syncs this vault.',
+  vaultSecretDeviceKey: 'Authenticated via device key',
+  vaultSecretDeviceKeyDesc: 'This device joined via invite link. The vault secret is not used here.',
+  serverUrlDesc: 'Address of your VaultCRDT server. WebSocket connection is derived automatically. Changing this resets the device key and connection state.',
+  vaultIdSwitch: 'Switching vaults runs setup again',
+  joinDifferentVault: 'Join a different vault',
+  openSetup: 'Open setup…',
+  fullSync: 'Full sync',
+  fullSyncDesc: 'Pull all documents from the server and push all local files',
+  runFullSync: 'Run full sync',
+};
+
+/** Settings B7: invite-joined devices authenticate with deviceKey, not the shared secret. */
+export function vaultSecretSetting(deviceKey: string | undefined): {
+  usesTextField: boolean;
+  name: string;
+  desc: string;
+  placeholder: string;
+  readonlyLine: string;
+} {
+  if (deviceKey) {
+    return {
+      usesTextField: false,
+      name: SETTINGS_COPY.vaultSecret,
+      desc: SETTINGS_COPY.vaultSecretDeviceKeyDesc,
+      placeholder: '',
+      readonlyLine: SETTINGS_COPY.vaultSecretDeviceKey,
+    };
+  }
+  return {
+    usesTextField: true,
+    name: SETTINGS_COPY.vaultSecret,
+    desc: SETTINGS_COPY.vaultSecretDesc,
+    placeholder: SETTINGS_COPY.vaultSecretPlaceholder,
+    readonlyLine: '',
+  };
+}
+
+/** Ribbon variant (b): count badge, or an empty dot when offline with an empty inbox. */
+export function ribbonBadgeState(count: number, connected: boolean): { text: string; offlineDot: boolean } {
+  return {
+    text: count > 0 ? String(count) : '',
+    offlineDot: !connected && count === 0,
+  };
+}

@@ -2,7 +2,7 @@ import { App, Modal, Platform, PluginSettingTab, Setting, requestUrl, Notice } f
 import type VaultCRDTPlugin from './main';
 import { validateServerUrl, toHttpBase, normalizeServerUrl } from './url-policy';
 import { SetupModal } from './setup-modal';
-import { TRUST_NOTICE_TEXT, protocolHealthText, SETUP_COPY, OBSIDIAN_SYNC_COPY } from './user-facing-copy';
+import { TRUST_NOTICE_TEXT, protocolHealthText, SETUP_COPY, OBSIDIAN_SYNC_COPY, SETTINGS_COPY, vaultSecretSetting } from './user-facing-copy';
 import { PROTOCOL_VERSION, jsonOf } from './protocol';
 import { redact } from './logger';
 import type { ObsidianSyncEnabled } from './path-policy';
@@ -188,6 +188,7 @@ export async function resetConnectionState(plugin: VaultCRDTPlugin, wipe: boolea
 export class VaultCRDTSettingsTab extends PluginSettingTab {
   plugin: VaultCRDTPlugin;
   private reconnectTimer: number | null = null;
+  private urlResetTimer: number | null = null;
 
   constructor(app: App, plugin: VaultCRDTPlugin) {
     super(app, plugin);
@@ -199,6 +200,25 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
     this.reconnectTimer = window.setTimeout(() => {
       void this.plugin.syncEngine.restart();
     }, 1500);
+  }
+
+  /** B5: URL changes are identity-bound — same reset as Reconfigure, not a bare restart. */
+  private scheduleServerUrlReset(): void {
+    if (this.urlResetTimer) window.clearTimeout(this.urlResetTimer);
+    this.urlResetTimer = window.setTimeout(() => {
+      void this.applyServerUrlChange();
+    }, 1500);
+  }
+
+  private async applyServerUrlChange(): Promise<void> {
+    await resetConnectionState(this.plugin, false);
+    await this.plugin.saveSettings();
+    try {
+      await this.plugin.syncEngine.start();
+    } catch (err) {
+      new Notice(redact(`VaultCRDT: reconnect failed — ${(err as Error).message}`), 8000);
+    }
+    this.display();
   }
 
   /**
@@ -272,7 +292,7 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Server')
-      .setDesc('Address of your VaultCRDT server. WebSocket connection is derived automatically.')
+      .setDesc(SETTINGS_COPY.serverUrlDesc)
       .addText((text) =>
         text
           .setPlaceholder('https://obsidian-sync.example.com')
@@ -291,31 +311,38 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
             }
             this.plugin.settings.serverUrl = normalizeServerUrl(raw);
             await this.plugin.saveSettings();
-            this.scheduleReconnect();
+            this.scheduleServerUrlReset();
           })
       );
 
     new Setting(containerEl)
-      .setName('Vault Name')
+      .setName(SETUP_COPY.vault)
       .setDesc(this.plugin.settings.vaultId
         ? `Connected to: ${this.plugin.settings.vaultId}`
         : 'Not configured — enable the plugin to run Setup');
 
-    new Setting(containerEl)
-      .setName('Password')
-      .setDesc('Shared password for this vault. Must be identical on every device that syncs this vault.')
-      .addText((text) => {
-        text
-          .setPlaceholder('vault password')
-          .setValue(this.plugin.settings.vaultSecret)
-          .onChange(async (value) => {
-            this.plugin.settings.vaultSecret = value;
-            await this.plugin.saveSettings();
-            this.scheduleReconnect();
-          });
-        text.inputEl.type = 'password';
-        return text;
-      });
+    {
+      const secret = vaultSecretSetting(this.plugin.settings.deviceKey);
+      const secretRow = new Setting(containerEl)
+        .setName(secret.name)
+        .setDesc(secret.desc);
+      if (secret.usesTextField) {
+        secretRow.addText((text) => {
+          text
+            .setPlaceholder(secret.placeholder)
+            .setValue(this.plugin.settings.vaultSecret)
+            .onChange(async (value) => {
+              this.plugin.settings.vaultSecret = value;
+              await this.plugin.saveSettings();
+              this.scheduleReconnect();
+            });
+          text.inputEl.type = 'password';
+          return text;
+        });
+      } else {
+        secretRow.controlEl.createSpan({ text: secret.readonlyLine });
+      }
+    }
 
     new Setting(containerEl)
       .setName('Device name')
@@ -331,10 +358,10 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Reconnect to a different vault')
+      .setName(SETTINGS_COPY.joinDifferentVault)
       .setDesc('Run setup again — useful when switching to a new vault or registering one with an admin token.')
       .addButton((btn) =>
-        btn.setButtonText('Reconfigure').onClick(async () => {
+        btn.setButtonText(SETTINGS_COPY.openSetup).onClick(async () => {
           await this.runReconfigure();
         })
       );
@@ -374,24 +401,24 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       );
 
     const syncSetting = new Setting(containerEl)
-      .setName('Force full sync')
-      .setDesc('Re-sync everything: pull all documents from the server and push all local files')
+      .setName(SETTINGS_COPY.fullSync)
+      .setDesc(SETTINGS_COPY.fullSyncDesc)
       .addButton((btn) =>
-        btn.setButtonText('Sync now').onClick(async () => {
+        btn.setButtonText(SETTINGS_COPY.runFullSync).onClick(async () => {
           btn.setDisabled(true);
           btn.setButtonText('Syncing...');
           try {
             await this.plugin.syncEngine.initialSync((done, total) => {
               syncSetting.setDesc(`${done} / ${total}`);
             });
-            syncSetting.setDesc('Re-sync everything: pull all documents from the server and push all local files');
+            syncSetting.setDesc(SETTINGS_COPY.fullSyncDesc);
             btn.setButtonText('Done!');
           } catch {
             btn.setButtonText('Failed');
           } finally {
             window.setTimeout(() => {
               btn.setDisabled(false);
-              btn.setButtonText('Sync now');
+              btn.setButtonText(SETTINGS_COPY.runFullSync);
             }, 2000);
           }
         })
@@ -449,17 +476,11 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
       );
 
     new Setting(advancedContainer)
-      .setName('Vault Name')
-      .setDesc('Identifies this vault on the server. Changing this reconnects to a different vault.')
-      .addText((text) =>
-        text
-          .setPlaceholder('my-notes')
-          .setValue(this.plugin.settings.vaultId)
-          .onChange(async (value) => {
-            this.plugin.settings.vaultId = value.toLowerCase().trim();
-            await this.plugin.saveSettings();
-            this.scheduleReconnect();
-          })
+      .setName(SETUP_COPY.vault)
+      .setDesc(
+        this.plugin.settings.vaultId
+          ? `${this.plugin.settings.vaultId}. ${SETTINGS_COPY.vaultIdSwitch}`
+          : SETTINGS_COPY.vaultIdSwitch,
       )
       .addButton((btn) =>
         btn.setButtonText(SETUP_COPY.copy).onClick(() => {

@@ -10,7 +10,7 @@ import { parseSetupParams } from './setup-link';
 import { InviteModal } from './invite-modal';
 import { ReplaceConnectionModal } from './replace-connection-modal';
 import { resetConnectionState } from './settings';
-import { SETUP_COPY, WASM_INIT_FAILED_NOTICE } from './user-facing-copy';
+import { SETUP_COPY, WASM_INIT_FAILED_NOTICE, ribbonBadgeState } from './user-facing-copy';
 import { Modal } from 'obsidian';
 import { log, error, redact, setSecretProvider, getRecentIssues } from './logger';
 import { ServerFeatureCache, FEATURE_INVITE, FEATURE_BLOBS } from './server-features';
@@ -37,6 +37,7 @@ export default class VaultCRDTPlugin extends Plugin {
   fileWatcher!: FileWatcher;
   private statusBarEl: HTMLElement | null = null;
   private ribbonEl: HTMLElement | null = null;
+  private ribbonBadgeEl: HTMLElement | null = null;
   private connected = false;
   /** Quiet-mode inbox (design §E) — persisted in state/inbox.json, not settings. */
   inbox!: Inbox;
@@ -729,10 +730,21 @@ export default class VaultCRDTPlugin extends Plugin {
     this.statusBarEl.toggleClass('vcrdt-status-connected', connected);
   }
 
-  /** Ribbon tint + status-bar badge follow inbox count and connection state. */
+  /** Ribbon badge follows inbox count and connection state (no warning tint). */
   private refreshInboxIndicators(): void {
-    const attention = (this.inbox?.count() ?? 0) > 0 || !this.connected;
+    const count = this.inbox?.count() ?? 0;
+    const badge = ribbonBadgeState(count, this.connected);
+    const attention = count > 0 || !this.connected;
     this.ribbonEl?.toggleClass('vcrdt-ribbon-attention', attention);
+    const host = this.ribbonEl;
+    if (!host?.createEl) return;
+    if (!this.ribbonBadgeEl) {
+      this.ribbonBadgeEl = host.createEl('span', { cls: 'vcrdt-ribbon-badge' }) ?? null;
+    }
+    if (!this.ribbonBadgeEl) return;
+    this.ribbonBadgeEl.textContent = badge.text;
+    this.ribbonBadgeEl.toggleClass('vcrdt-ribbon-badge-dot', badge.offlineDot);
+    this.ribbonBadgeEl.toggleClass('vcrdt-hidden', !attention);
   }
 
   private async exportStartupTrace(): Promise<void> {

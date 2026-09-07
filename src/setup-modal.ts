@@ -127,9 +127,9 @@ export class SetupModal extends Modal {
           .onChange((v) => { this.serverUrl = v.trim(); })
       );
 
-    // Vault Name
+    // Vault ID
     new Setting(contentEl)
-      .setName('Vault Name')
+      .setName(SETUP_COPY.vault)
       .setDesc('Must match on every device that syncs this vault')
       .addText((text) =>
         text
@@ -138,13 +138,13 @@ export class SetupModal extends Modal {
           .onChange((v) => { this.vaultId = v.toLowerCase().trim(); })
       );
 
-    // Password
+    // Vault secret
     new Setting(contentEl)
-      .setName('Password')
-      .setDesc('Shared password for this vault — same on every device')
+      .setName(SETUP_COPY.secretLabel)
+      .setDesc('Shared secret for this vault — same on every device')
       .addText((text) => {
         text
-          .setPlaceholder('vault password')
+          .setPlaceholder('vault secret')
           .setValue(this.vaultSecret)
           .onChange((v) => { this.vaultSecret = v; });
         text.inputEl.type = 'password';
@@ -217,12 +217,12 @@ export class SetupModal extends Modal {
     // a trailing slash that would later become `//auth/verify` or `//ws`.
     this.serverUrl = normalizeServerUrl(this.serverUrl);
     if (!VAULT_NAME_RE.test(this.vaultId)) {
-      this.showError('Vault Name must be lowercase letters, numbers, or hyphens (e.g. my-notes)');
+      this.showError(SETUP_COPY.vaultInvalid);
       return;
     }
     const inviteMode = this.inviteMode() && !this.expert;
     if (!inviteMode && !this.vaultSecret) {
-      this.showError(this.prefill ? SETUP_COPY.required : 'Password is required');
+      this.showError(SETUP_COPY.required);
       return;
     }
 
@@ -317,7 +317,7 @@ export class SetupModal extends Modal {
       const status = (e as { status?: number })?.status;
       if (status === 401) {
         this.showError(
-          'Authentication failed. Check vault name and password. ' +
+          'Authentication failed. Check vault ID and vault secret. ' +
           'If you are registering a NEW vault, expand "Creating a new vault?" and enter the admin token.'
         );
       } else if (status) {

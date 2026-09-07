@@ -32,9 +32,33 @@
   image-rendering: pixelated;
 }
 
-/* Ribbon icon tint when the inbox has items or the device is offline */
+/* Ribbon: icon stays theme-default; attention is a small count/dot badge */
 .vcrdt-ribbon-attention {
-  color: var(--text-warning);
+  position: relative;
+}
+
+.vcrdt-ribbon-badge {
+  min-width: 1.1em;
+  border-radius: 8px;
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: 0.6em;
+  padding: 0 0.3em;
+  position: absolute;
+  top: 0;
+  right: 0;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.vcrdt-ribbon-badge-dot {
+  min-width: 0.45em;
+  width: 0.45em;
+  height: 0.45em;
+  padding: 0;
+  border-radius: 50%;
+  top: 0.15em;
+  right: 0.15em;
 }
 
 /* Status panel (ribbon) */
