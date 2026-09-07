@@ -1,4 +1,5 @@
 import { Plugin, Platform, TFile, TFolder, Notice, requestUrl, apiVersion } from 'obsidian';
+import type { EventRef } from 'obsidian';
 import { VaultCRDTSettings, VaultCRDTSettingsTab, DEFAULT_SETTINGS, ensureDeviceIdentity, regeneratePeerId } from './settings';
 import { initWasm } from './wasm-bridge';
 import { SyncEngine } from './sync-engine';
@@ -20,6 +21,7 @@ import { isSyncablePath, isAttachmentPath } from './path-policy';
 import { BlobIndex } from './blob-index';
 import { BlobUploader } from './blob-uploader';
 import { BlobDownloader } from './blob-downloader';
+import { ObsidianSync, listenVaultRaw } from './obsidian-sync';
 import { StateStorage } from './state-storage';
 import { Inbox } from './inbox';
 import { InboxModal } from './inbox-modal';
@@ -50,6 +52,8 @@ export default class VaultCRDTPlugin extends Plugin {
   blobIndex!: BlobIndex;
   blobUploader!: BlobUploader;
   blobDownloader!: BlobDownloader;
+  obsidianSync!: ObsidianSync;
+  private obsidianRawRef: EventRef | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -82,6 +86,9 @@ export default class VaultCRDTPlugin extends Plugin {
         const f = this.app.vault.getAbstractFileByPath(path);
         if (f instanceof TFile) await this.app.fileManager.trashFile(f);
       },
+      removeFile: (path) => this.app.vault.adapter.remove(path),
+      obsidianSyncEnabled: () => this.settings?.obsidianSync ?? { settings: false, styles: false },
+      sweepObsidian: () => this.obsidianSync.sweep(),
     });
     this.blobDownloader = new BlobDownloader({
       index: this.blobIndex,
@@ -96,6 +103,25 @@ export default class VaultCRDTPlugin extends Plugin {
       app: this.app,
       isMobile: Platform.isMobile,
       getFileCache: (file) => this.app.metadataCache.getFileCache(file),
+    });
+    this.obsidianSync = new ObsidianSync({
+      index: this.blobIndex,
+      downloader: this.blobDownloader,
+      enabled: () => this.settings?.obsidianSync ?? { settings: false, styles: false },
+      vaultBasePath: () => {
+        const adapter = this.app.vault.adapter as { getBasePath?: () => string };
+        return adapter.getBasePath?.() ?? '';
+      },
+      list: async (dir) => {
+        try {
+          return await this.app.vault.adapter.list(dir);
+        } catch {
+          return { files: [], folders: [] };
+        }
+      },
+      stat: (path) => this.app.vault.adapter.stat(path),
+      onFileChanged: (path) => this.blobUploader.onFileChanged(path),
+      onFileDeleted: (path) => this.blobUploader.onFileDeleted(path),
     });
     this.refreshInboxIndicators();
     // Obsidian prefixes this with the manifest id, yielding vaultcrdt:invite-device.
@@ -127,6 +153,7 @@ export default class VaultCRDTPlugin extends Plugin {
 
     // React to editor keystrokes (debounced inside SyncEngine)
     this.registerEditorAndVaultEvents();
+    this.syncObsidianRawListener();
 
     // Scan for external changes (git pull, Syncthing) when window is focused
     if (Platform.isDesktop) {
@@ -255,7 +282,9 @@ export default class VaultCRDTPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('modify', async (abstractFile) => {
         if (!(abstractFile instanceof TFile)) return;
-        if (isAttachmentPath(abstractFile.path)) { this.blobUploader.onFileChanged(abstractFile.path); return; }
+        // TFile create/modify never fire for `.obsidian/**` (no TFiles). Config
+        // files use the adapter raw listener + backstop sweep instead.
+        if (isAttachmentPath(abstractFile.path, this.settings?.obsidianSync)) { this.blobUploader.onFileChanged(abstractFile.path); return; }
         if (!isSyncablePath(abstractFile.path)) return;
         if (!this.syncEngineInitialized) return; // Ignore changes before sync engine is ready
         let content: string | undefined;
@@ -277,7 +306,7 @@ export default class VaultCRDTPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('create', async (file) => {
         if (!(file instanceof TFile)) return;
-        if (isAttachmentPath(file.path)) { this.blobUploader.onFileChanged(file.path); return; }
+        if (isAttachmentPath(file.path, this.settings?.obsidianSync)) { this.blobUploader.onFileChanged(file.path); return; }
         if (!isSyncablePath(file.path)) return;
         if (!this.syncEngineInitialized) return; // Ignore creates before sync engine is ready
         let content: string | undefined;
@@ -299,7 +328,7 @@ export default class VaultCRDTPlugin extends Plugin {
       this.app.vault.on('delete', (file) => {
         if (!(file instanceof TFile)) return;
         const path = file.path;
-        if (isAttachmentPath(path)) {
+        if (isAttachmentPath(path, this.settings?.obsidianSync)) {
           void this.blobUploader.onFileDeleted(path);
           return;
         }
@@ -347,15 +376,15 @@ export default class VaultCRDTPlugin extends Plugin {
         if (!(file instanceof TFile)) return;
         this.inbox.onFileRenamed(oldPath, file.path);
         this.refreshInboxIndicators();
-        if (isAttachmentPath(oldPath) && isAttachmentPath(file.path)) {
+        if (isAttachmentPath(oldPath, this.settings?.obsidianSync) && isAttachmentPath(file.path, this.settings?.obsidianSync)) {
           await this.blobUploader.onFileRenamed(oldPath, file.path);
           return;
         }
-        if (isAttachmentPath(file.path)) {
+        if (isAttachmentPath(file.path, this.settings?.obsidianSync)) {
           this.blobUploader.onFileChanged(file.path);
           return;
         }
-        if (isAttachmentPath(oldPath)) {
+        if (isAttachmentPath(oldPath, this.settings?.obsidianSync)) {
           void this.blobUploader.onFileDeleted(oldPath);
           return;
         }
@@ -588,13 +617,36 @@ export default class VaultCRDTPlugin extends Plugin {
       if (!(await this.blobsEnabled())) return;
       for (const file of this.app.vault.getFiles()) {
         const path = file.path;
-        if (!isAttachmentPath(path)) continue;
+        if (!isAttachmentPath(path, this.settings?.obsidianSync)) continue;
         const entry = this.blobIndex.get(path);
         if (!entry || entry.skipped) this.blobUploader.onFileChanged(path);
       }
     } catch (err) {
       error('blob backfill failed:', err);
     }
+  }
+
+  /**
+   * Start/stop the undocumented vault.on('raw') listener. Firing for
+   * `.obsidian/**` is not guaranteed — the backstop sweep is required.
+   */
+  private syncObsidianRawListener(): void {
+    const on = !!(this.settings?.obsidianSync?.settings || this.settings?.obsidianSync?.styles);
+    if (on && !this.obsidianRawRef) {
+      this.obsidianRawRef = listenVaultRaw(this.app.vault, (path) => {
+        this.obsidianSync.onRaw(path);
+      }) as EventRef;
+      this.registerEvent(this.obsidianRawRef);
+    }
+    if (!on && this.obsidianRawRef) {
+      this.app.vault.offref(this.obsidianRawRef);
+      this.obsidianRawRef = null;
+    }
+  }
+
+  async applyObsidianSyncToggle(category: 'settings' | 'styles', on: boolean): Promise<void> {
+    this.syncObsidianRawListener();
+    if (on) await this.obsidianSync.onCategoryEnabled(category);
   }
 
   private async runSyncWithProgress(engine: SyncEngine, mode: SyncMode, forceNotice = false): Promise<void> {
@@ -808,6 +860,11 @@ export default class VaultCRDTPlugin extends Plugin {
       delete data.registrationKey;
     }
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    const rawSync = this.settings.obsidianSync;
+    this.settings.obsidianSync = {
+      settings: !!(rawSync && typeof rawSync === 'object' && rawSync.settings),
+      styles: !!(rawSync && typeof rawSync === 'object' && rawSync.styles),
+    };
 
     // Startup invariant: peerId and deviceName must exist BEFORE the
     // SyncEngine is constructed, otherwise the Loro doc would be created

@@ -17,6 +17,7 @@ vi.mock('obsidian', () => ({
   Modal: class {},
   requestUrl: vi.fn(),
   apiVersion: 'test',
+  normalizePath: (p: string) => p.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, ''),
 }));
 vi.mock('../settings', () => ({ VaultCRDTSettingsTab: class {} }));
 vi.mock('../setup-modal', () => ({ SetupModal: class {} }));

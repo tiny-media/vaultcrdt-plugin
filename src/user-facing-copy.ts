@@ -14,6 +14,9 @@ export function remoteDeleteKeptNoticeMessage(docUuid: string): string {
 export const remoteDeleteTrashedNoticeMessage = (path: string): string =>
   `VaultCRDT: "${redact(path)}" was deleted on another device and moved to trash.`;
 
+export const remoteDeleteRemovedNoticeMessage = (path: string): string =>
+  `VaultCRDT: "${redact(path)}" was deleted on another device and removed.`;
+
 export function tombstoneRenamedNoticeMessage(docUuid: string, keptPath: string): string {
   return `VaultCRDT: "${redact(docUuid)}" was deleted on another device. Your local copy was renamed to "${redact(keptPath)}" and syncs under that name; the original name stays deleted.`;
 }
@@ -131,3 +134,17 @@ export const joinTitle = (vault: string): string => `Join vault ${vault}`;
 export const invitedHost = (host: string): string => `Invited to ${host}`;
 export const replaceConnectionText = (vault: string): string =>
   `Replace current connection to ${vault}? Local sync state will be wiped.`;
+
+export const OBSIDIAN_SYNC_COPY = {
+  heading: '.obsidian sync',
+  settingsName: 'Sync app and appearance settings',
+  settingsDesc:
+    'Whole-file last-write-wins: concurrent edits on two devices keep only the newer side. No JSON-key merge and no conflict copies. Always uses the folder name .obsidian — a custom configDir is not synced.',
+  stylesName: 'Sync snippets and themes',
+  stylesDesc:
+    'Whole-file last-write-wins for each CSS/theme file: concurrent edits keep only the newer side; no conflict copies. workspace.json, workspace-mobile.json, and .obsidian/plugins/ never sync, regardless of these toggles.',
+  neverSyncs:
+    'Never synced: workspace.json, workspace-mobile.json, and plugin data/binaries — regardless of these toggles.',
+  configDirNote:
+    'Uses the hardcoded folder name .obsidian; a custom configDir is not synced.',
+};

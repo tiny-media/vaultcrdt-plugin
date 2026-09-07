@@ -48,6 +48,11 @@ export class Setting {
   }
 }
 export const Platform = { isDesktopApp: false, isMobileApp: false };
+
+/** Mirrors Obsidian's normalizePath: `\\` → `/`, collapse slashes, drop trailing slash. */
+export function normalizePath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '');
+}
 export class App {
   workspace = {
     on: (_event: string, _cb: unknown) => {},

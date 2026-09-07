@@ -49,6 +49,14 @@ describe('isAttachmentPath', () => {
   ];
   it.each(rejected)('rejects %s', (p) => expect(isAttachmentPath(p)).toBe(false));
 
+  it('foo.json and x.css stay non-attachments; category json needs the toggle', () => {
+    expect(isAttachmentPath('foo.json')).toBe(false);
+    expect(isAttachmentPath('x.css')).toBe(false);
+    expect(isAttachmentPath('.obsidian/app.json')).toBe(false);
+    expect(isAttachmentPath('.obsidian/app.json', { settings: true, styles: false })).toBe(true);
+    expect(attachmentCap('.obsidian/app.json')).toBe(2 * 1024 * 1024);
+  });
+
   it('foo/bar.svg is an image attachment under IMAGE_CAP', () => {
     expect(isAttachmentPath('foo/bar.svg')).toBe(true);
     expect(attachmentCap('foo/bar.svg')).toBe(10 * 1024 * 1024);

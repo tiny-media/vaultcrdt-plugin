@@ -12,7 +12,9 @@ use unicode_normalization::UnicodeNormalization;
 /// with `ATTACHMENT_EXTENSIONS` in `src/path-policy.ts`.
 ///
 /// The extension whitelist is NOT part of the frozen key_version=1 algorithm;
-/// `svg` lands under key_version 1 (no bump).
+/// `svg` lands under key_version 1 (no bump). The .obsidian path gate (json/css
+/// allowlist on the folded key) is likewise not part of the frozen algorithm
+/// (svg precedent).
 pub const ATTACHMENT_EXTENSIONS: [&str; 19] = [
     "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "svg", "pdf", "mp3", "m4a", "ogg",
     "oga", "opus", "flac", "wav", "webm", "3gp",
@@ -20,6 +22,32 @@ pub const ATTACHMENT_EXTENSIONS: [&str; 19] = [
 
 const BLOCKED_PREFIXES: [&str; 2] = [".obsidian/", ".trash/"];
 const MAX_PATH_BYTES: usize = 1024;
+
+/// Allowlisted `.obsidian/**` keys (settings + styles). Compared on the FINAL
+/// casefolded key, same place as BLOCKED_PREFIXES. json/css are valid ONLY
+/// inside these shapes — vault-root `foo.json` / `x.css` stay rejected.
+/// Hardcoded `.obsidian/` prefix is deliberate (custom configDir is not a key).
+fn is_obsidian_allowlisted_key(key: &str) -> bool {
+    if key == ".obsidian/app.json" || key == ".obsidian/appearance.json" {
+        return true;
+    }
+    if let Some(rest) = key.strip_prefix(".obsidian/snippets/") {
+        return !rest.contains('/')
+            && !rest.contains('\\')
+            && rest.ends_with(".css")
+            && rest.len() > ".css".len();
+    }
+    if let Some(rest) = key.strip_prefix(".obsidian/themes/") {
+        let Some((seg, file)) = rest.split_once('/') else {
+            return false;
+        };
+        if seg.is_empty() || seg.contains('\\') || file.contains('/') || file.contains('\\') {
+            return false;
+        }
+        return file == "theme.css" || file == "manifest.json";
+    }
+    false
+}
 
 /// Canonical key for a vault-relative attachment path, or `None` if the path is
 /// not a syncable attachment path (fail-closed).
@@ -38,6 +66,11 @@ pub fn blob_path_key(path: &str) -> Option<String> {
         if seg.is_empty() || seg == "." || seg == ".." {
             return None;
         }
+        // Reject a Windows separator inside a POSIX segment (`.obsidian/snippets/a\..\plugins\x.css`
+        // is one segment here and would write into plugins/ on Windows via the adapter).
+        if seg.contains('\\') {
+            return None;
+        }
         if seg.ends_with(' ') || seg.ends_with('.') {
             return None;
         }
@@ -45,7 +78,9 @@ pub fn blob_path_key(path: &str) -> Option<String> {
 
     let file = path.rsplit('/').next()?;
     let ext = file.rsplit_once('.')?.1.to_lowercase();
-    if !ATTACHMENT_EXTENSIONS.contains(&ext.as_str()) {
+    let is_att_ext = ATTACHMENT_EXTENSIONS.contains(&ext.as_str());
+    let is_obsidian_ext = ext == "json" || ext == "css";
+    if !is_att_ext && !is_obsidian_ext {
         return None;
     }
 
@@ -53,9 +88,15 @@ pub fn blob_path_key(path: &str) -> Option<String> {
     let s2 = default_case_fold_str(&s1);
     let key: String = s2.nfc().collect();
 
-    // Blocked prefixes are compared on the FINAL key, so folded spellings
-    // (`.Obsidian/`, `.OBSIDIAN/`) are caught too.
+    // Allowlist + blocked prefixes are compared on the FINAL key, so folded
+    // spellings (`.Obsidian/`, `.obsidian/SNIPPETS/x.CSS`) match what the server sees.
+    if is_obsidian_allowlisted_key(&key) {
+        return Some(key);
+    }
     if BLOCKED_PREFIXES.iter().any(|p| key.starts_with(p)) {
+        return None;
+    }
+    if !is_att_ext {
         return None;
     }
 
@@ -87,7 +128,7 @@ mod tests {
                 }
             }
         }
-        assert!(accepted >= 12 && rejected >= 8, "{accepted} accepted, {rejected} rejected");
+        assert!(accepted >= 18 && rejected >= 18, "{accepted} accepted, {rejected} rejected");
     }
 
     #[test]
@@ -127,6 +168,16 @@ mod tests {
             "a/b/../c.png",
             "noext",
             "",
+            ".obsidian/workspace.json",
+            ".obsidian/workspace-mobile.json",
+            ".obsidian/plugins/vaultcrdt/data.json",
+            ".obsidian/plugins/o/data.json",
+            "foo.json",
+            "x.css",
+            ".obsidian/snippets/a/b.css",
+            ".obsidian/themes/T/other.json",
+            ".obsidian/snippets/a\\..\\.css",
+            ".obsidian/themes/T/sub/x.css",
         ] {
             assert_eq!(blob_path_key(bad), None, "{bad:?} must reject");
         }
@@ -143,5 +194,36 @@ mod tests {
         assert_eq!(blob_path_key("voice.oga").as_deref(), Some("voice.oga"));
         assert_eq!(blob_path_key("x.svg").as_deref(), Some("x.svg"));
         assert_eq!(blob_path_key("video.mp4"), None);
+    }
+
+    #[test]
+    fn obsidian_allowlist_on_folded_key() {
+        assert_eq!(blob_path_key(".obsidian/app.json").as_deref(), Some(".obsidian/app.json"));
+        assert_eq!(
+            blob_path_key(".obsidian/appearance.json").as_deref(),
+            Some(".obsidian/appearance.json")
+        );
+        assert_eq!(
+            blob_path_key(".obsidian/snippets/x.css").as_deref(),
+            Some(".obsidian/snippets/x.css")
+        );
+        assert_eq!(
+            blob_path_key(".obsidian/SNIPPETS/x.CSS").as_deref(),
+            Some(".obsidian/snippets/x.css")
+        );
+        assert_eq!(
+            blob_path_key(".obsidian/themes/Nord/theme.css").as_deref(),
+            Some(".obsidian/themes/nord/theme.css")
+        );
+        assert_eq!(
+            blob_path_key(".obsidian/themes/Nord/manifest.json").as_deref(),
+            Some(".obsidian/themes/nord/manifest.json")
+        );
+        assert_eq!(
+            blob_path_key(".obsidian/themes/Ünïcode/theme.css").as_deref(),
+            Some(".obsidian/themes/ünïcode/theme.css")
+        );
+        assert_eq!(blob_path_key(".obsidian/a.png"), None);
+        assert_eq!(blob_path_key(".Obsidian/a.png"), None);
     }
 }

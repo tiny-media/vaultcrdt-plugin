@@ -81,6 +81,22 @@
     {
       "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
       "key": null
-    }
+    },
+    { "input": ".obsidian/app.json", "key": ".obsidian/app.json" },
+    { "input": ".obsidian/appearance.json", "key": ".obsidian/appearance.json" },
+    { "input": ".obsidian/snippets/x.css", "key": ".obsidian/snippets/x.css" },
+    { "input": ".obsidian/themes/Nord/theme.css", "key": ".obsidian/themes/nord/theme.css" },
+    { "input": ".obsidian/themes/Nord/manifest.json", "key": ".obsidian/themes/nord/manifest.json" },
+    { "input": ".obsidian/themes/Ünïcode/theme.css", "key": ".obsidian/themes/ünïcode/theme.css" },
+    { "input": ".obsidian/workspace.json", "key": null },
+    { "input": ".obsidian/workspace-mobile.json", "key": null },
+    { "input": ".obsidian/plugins/vaultcrdt/data.json", "key": null },
+    { "input": ".obsidian/plugins/o/data.json", "key": null },
+    { "input": "foo.json", "key": null },
+    { "input": "x.css", "key": null },
+    { "input": ".obsidian/snippets/a/b.css", "key": null },
+    { "input": ".obsidian/themes/T/other.json", "key": null },
+    { "input": ".obsidian/snippets/a\\..\\.css", "key": null },
+    { "input": ".obsidian/themes/T/sub/x.css", "key": null }
   ]
 }

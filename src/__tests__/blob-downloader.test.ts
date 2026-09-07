@@ -102,7 +102,7 @@ function makeApp(files: Map<string, Uint8Array>): App {
   } as App;
 }
 
-function makePair(opts: { isMobile?: boolean; cache?: { embeds?: { link: string }[]; links?: { link: string }[] } | null } = {}) {
+function makePair(opts: { isMobile?: boolean; cache?: { embeds?: { link: string }[]; links?: { link: string }[] } | null; enabled?: { settings: boolean; styles: boolean } } = {}) {
   const vault = makeVault();
   const index = new BlobIndex(memStorage());
   const enqueue = vi.fn();
@@ -134,6 +134,7 @@ function makePair(opts: { isMobile?: boolean; cache?: { embeds?: { link: string 
     sleep: async () => undefined,
     now: () => 0,
     hydratePending: () => downloader.hydratePending(),
+    obsidianSyncEnabled: () => opts.enabled ?? { settings: false, styles: false },
   });
   return { vault, index, downloader, uploader, enqueue };
 }
@@ -364,3 +365,89 @@ describe('BlobDownloader (hydration S3)', () => {
     expect(copies[0]).toContain('(conflict ');
   });
 });
+
+const CFG = '.obsidian/app.json';
+const ALL_ON = { settings: true, styles: true };
+
+describe('.obsidian category hydration',
+  () => {
+    it('exempts category files from maybeConflictCopy and does not enqueue a copy', async () => {
+      const { vault, index, downloader, enqueue } = makePair({ enabled: ALL_ON });
+      const local = new Uint8Array([1, 1, 1, 1, 1]);
+      vault.files.set(CFG, local);
+      index.update(CFG, {
+        hash: blake3_hex(REMOTE),
+        size: REMOTE.length,
+        generation: 3,
+        seq: 9,
+        hydrated: false,
+        lastRemoteHash: blake3_hex(BYTES),
+      });
+      mockRequestUrl.mockImplementation(async (opts: Call) => serveRange(REMOTE, opts));
+      await downloader.hydratePending();
+
+      expect([...vault.files.keys()].filter((p) => p !== CFG)).toEqual([]);
+      expect(vault.files.get(CFG)).toEqual(REMOTE);
+      expect(index.get(CFG)!.hydrated).toBe(true);
+      expect(enqueue).not.toHaveBeenCalled();
+    });
+
+    it('hydrates category files eagerly on mobile; attachments stay lazy', async () => {
+      const { index, downloader, vault } = makePair({ isMobile: true, enabled: ALL_ON });
+      const cfg = new Uint8Array([1, 2, 3]);
+      const png = new Uint8Array([4, 5, 6]);
+      index.update(CFG, {
+        hash: blake3_hex(cfg), size: cfg.length, hydrated: false, seq: 1, generation: 1,
+      });
+      index.update(PATH, {
+        hash: blake3_hex(png), size: png.length, hydrated: false, seq: 2, generation: 1,
+      });
+      mockRequestUrl.mockImplementation(async (opts: Call) => {
+        const hash = opts.url.split('/').pop() ?? '';
+        if (hash === blake3_hex(cfg)) return serveRange(cfg, opts);
+        if (hash === blake3_hex(png)) return serveRange(png, opts);
+        throw new Error(`unexpected hash ${hash}`);
+      });
+      await downloader.hydratePending();
+      expect(index.get(CFG)!.hydrated).toBe(true);
+      expect(index.get(PATH)!.hydrated).toBe(false);
+      expect(vault.files.has(CFG)).toBe(true);
+      expect(vault.files.has(PATH)).toBe(false);
+    });
+
+    it('mobile catchUp hydrates category files (uploader gate)', async () => {
+      const { index, uploader } = makePair({ isMobile: true, enabled: ALL_ON });
+      mockRequestUrl.mockImplementation(async (opts: Call) => {
+        if (opts.method === 'GET' && opts.url.includes('/vault/blob-paths')) {
+          return catchUpLive(CFG, BYTES);
+        }
+        if (opts.method === 'GET' && opts.url.includes('/vault/blobs/')) {
+          return serveRange(BYTES, opts);
+        }
+        throw new Error(`unexpected ${opts.method} ${opts.url}`);
+      });
+      await uploader.catchUp();
+      expect(index.get(CFG)!.hydrated).toBe(true);
+      expect(index.get(CFG)!.lastRemoteHash).toBe(blake3_hex(BYTES));
+    });
+
+    it('echo suppression is index-based after adapter write (no vault events)', async () => {
+      const { index, uploader } = makePair({ enabled: ALL_ON });
+      mockRequestUrl.mockImplementation(async (opts: Call) => {
+        if (opts.method === 'GET' && opts.url.includes('/vault/blob-paths')) {
+          return catchUpLive(CFG, BYTES);
+        }
+        if (opts.method === 'GET' && opts.url.includes('/vault/blobs/')) {
+          return serveRange(BYTES, opts);
+        }
+        throw new Error(`unexpected ${opts.method} ${opts.url}`);
+      });
+      await uploader.catchUp();
+      expect(index.get(CFG)!.lastRemoteHash).toBe(blake3_hex(BYTES));
+      mockRequestUrl.mockClear();
+      uploader.onFileChanged(CFG);
+      await uploader.flush();
+      expect(puts()).toEqual([]);
+      expect(calls().filter((c) => c.url.includes('/vault/blobs/uploads'))).toEqual([]);
+    });
+  });

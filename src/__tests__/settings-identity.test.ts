@@ -9,6 +9,12 @@ const makeSettings = (overrides: Partial<VaultCRDTSettings> = {}): VaultCRDTSett
   ...overrides,
 });
 
+describe('obsidianSync defaults', () => {
+  it('defaults both categories OFF', () => {
+    expect(DEFAULT_SETTINGS.obsidianSync).toEqual({ settings: false, styles: false });
+  });
+});
+
 describe('resetConnectionState', () => {
   it('clears the per-device key and onboarding flag', async () => {
     const plugin = {

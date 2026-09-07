@@ -94,6 +94,8 @@ function makeUploader(opts: {
   isMobile?: boolean;
   hydratePending?: () => Promise<void>;
   trashIfPresent?: (path: string) => Promise<void>;
+  removeFile?: (path: string) => Promise<void>;
+  obsidianSyncEnabled?: () => { settings: boolean; styles: boolean };
   readBinary?: ((path: string) => Promise<ArrayBuffer>) & { mock?: unknown };
   writeBinary?: (path: string, data: ArrayBuffer) => Promise<void>;
   now?: () => number;
@@ -128,6 +130,8 @@ function makeUploader(opts: {
     now: opts.now ?? (() => 0),
     hydratePending: opts.hydratePending,
     trashIfPresent: opts.trashIfPresent,
+    removeFile: opts.removeFile,
+    obsidianSyncEnabled: opts.obsidianSyncEnabled,
   });
   return { uploader, index, notify, readBinary, writeBinary };
 }
@@ -796,6 +800,145 @@ describe('BlobUploader (attachment lane S2)', () => {
     expect(writeBinary).toHaveBeenCalledTimes(1);
     expect(new Uint8Array(writeBinary.mock.calls[0][1] as ArrayBuffer)).toEqual(FIXED);
   });
+});
+
+const CFG = '.obsidian/app.json';
+const PLUGINS = '.obsidian/plugins/vaultcrdt/data.json';
+
+describe('.obsidian blob-path catch-up', () => {
+  it('toggle-off indexes incoming category states as skipped, never hydrates',
+    async () => {
+      const hash = blake3_hex(BYTES);
+      const hydratePending = vi.fn(async () => undefined);
+      const { uploader, index } = makeUploader({
+        files: {},
+        hydratePending,
+        obsidianSyncEnabled: () => ({ settings: false, styles: false }),
+      });
+      mockRequestUrl.mockResolvedValueOnce(resp(200, {
+        states: [{
+          path_key: blob_path_key(CFG),
+          display_path: CFG,
+          state: 'live',
+          content_hash: hash,
+          size: BYTES.length,
+          generation: 1,
+          seq: 8,
+        }],
+        max_seq: 8,
+      }));
+      await uploader.catchUp();
+      expect(index.get(CFG)).toMatchObject({
+        skipped: true, hydrated: false, hash, seq: 8,
+      });
+      expect(index.get(CFG)!.hydrated).toBe(false);
+    });
+
+  it('toggle-on catch-up indexes a category file as pending hydration',
+    async () => {
+      const hash = blake3_hex(BYTES);
+      const { uploader, index } = makeUploader({
+        files: {},
+        obsidianSyncEnabled: () => ({ settings: true, styles: false }),
+      });
+      mockRequestUrl.mockResolvedValueOnce(resp(200, {
+        states: [{
+          path_key: blob_path_key(CFG),
+          display_path: CFG,
+          state: 'live',
+          content_hash: hash,
+          size: BYTES.length,
+          generation: 1,
+          seq: 8,
+        }],
+        max_seq: 8,
+      }));
+      await uploader.catchUp();
+      expect(index.get(CFG)).toMatchObject({
+        hash, hydrated: false, seq: 8,
+      });
+      expect(index.get(CFG)!.skipped).toBeFalsy();
+    });
+
+  it('display_path into .obsidian/plugins/** never materializes', async () => {
+    const { uploader, index } = makeUploader({
+      obsidianSyncEnabled: () => ({ settings: true, styles: true }),
+    });
+    mockRequestUrl.mockResolvedValueOnce(resp(200, {
+      states: [{
+        path_key: PLUGINS,
+        display_path: PLUGINS,
+        state: 'live',
+        content_hash: blake3_hex(BYTES),
+        size: BYTES.length,
+        generation: 1,
+        seq: 3,
+      }],
+      max_seq: 3,
+    }));
+    await uploader.catchUp();
+    expect(index.get(PLUGINS)).toBeUndefined();
+    expect(index.pathForKey(PLUGINS)).toBeUndefined();
+  });
+
+  it('remote tombstone of a category file uses adapter.remove, not trash',
+    async () => {
+      const hash = blake3_hex(BYTES);
+      const key = blob_path_key(CFG)!;
+      const trash = vi.fn(async () => undefined);
+      const removeFile = vi.fn(async () => undefined);
+      const { uploader, index } = makeUploader({
+        files: { [CFG]: BYTES },
+        trashIfPresent: trash,
+        removeFile,
+        obsidianSyncEnabled: () => ({ settings: true, styles: false }),
+      });
+      index.update(CFG, {
+        hash, size: BYTES.length, generation: 2, seq: 5,
+        lastRemoteHash: hash, hydrated: true,
+      });
+      mockRequestUrl.mockResolvedValueOnce(resp(200, {
+        states: [{
+          path_key: key, display_path: CFG, state: 'deleted',
+          content_hash: hash, generation: 3, seq: 20,
+        }],
+        max_seq: 20,
+      }));
+      await uploader.catchUp();
+      expect(removeFile).toHaveBeenCalledExactlyOnceWith(CFG);
+      expect(trash).not.toHaveBeenCalled();
+      expect(index.get(CFG)).toBeUndefined();
+    });
+
+  it('toggle-off skipped category + remote tombstone: index.remove only',
+    async () => {
+      const hash = blake3_hex(BYTES);
+      const key = blob_path_key(CFG)!;
+      const trash = vi.fn(async () => undefined);
+      const removeFile = vi.fn(async () => undefined);
+      const { uploader, index } = makeUploader({
+        files: { [CFG]: BYTES },
+        trashIfPresent: trash,
+        removeFile,
+        obsidianSyncEnabled: () => ({ settings: false, styles: false }),
+      });
+      index.update(CFG, {
+        hash, size: BYTES.length, generation: 2, seq: 5,
+        lastRemoteHash: 'old', hydrated: false, skipped: true,
+      });
+      mockRequestUrl.mockResolvedValueOnce(resp(200, {
+        states: [{
+          path_key: key, display_path: CFG, state: 'deleted',
+          content_hash: hash, generation: 3, seq: 20,
+        }],
+        max_seq: 20,
+      }));
+      await uploader.catchUp();
+      expect(index.get(CFG)).toBeUndefined();
+      expect(trash).not.toHaveBeenCalled();
+      expect(removeFile).not.toHaveBeenCalled();
+      expect(calls().filter((c) => c.method === 'POST')).toEqual([]);
+    });
 });
 
 describe('SyncEngine blob auth frame and wake-up', () => {

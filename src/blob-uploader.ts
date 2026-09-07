@@ -1,9 +1,9 @@
 import { requestUrl } from 'obsidian';
 import { blake3_hex, sanitize_svg } from '../wasm/vaultcrdt_wasm';
-import { attachmentCap, pathCaseKey } from './path-policy';
+import { attachmentCap, obsidianSyncCategoryOf, pathCaseKey, type ObsidianSyncEnabled } from './path-policy';
 import { toHttpBase } from './url-policy';
 import { log, error, warn } from './logger';
-import { attachmentTooLargeMessage, quotaExceededMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage, svgRejectedMessage } from './user-facing-copy';
+import { attachmentTooLargeMessage, quotaExceededMessage, remoteDeleteKeptNoticeMessage, remoteDeleteRemovedNoticeMessage, remoteDeleteTrashedNoticeMessage, svgRejectedMessage } from './user-facing-copy';
 import type { BlobIndex } from './blob-index';
 
 /** Debounce before hashing, so foreign writers (camera apps) can finish. */
@@ -28,7 +28,7 @@ export interface BlobUploaderDeps {
   getJwt(): Promise<string>;
   /** True when the cached /health features advertise FEATURE_BLOBS. */
   blobsEnabled(): Promise<boolean>;
-  stat(path: string): Promise<{ size: number } | null>;
+  stat(path: string): Promise<{ size: number; mtime?: number } | null>;
   readBinary(path: string): Promise<ArrayBuffer>;
   writeBinary(path: string, data: ArrayBuffer): Promise<void>;
   notify(text: string): void;
@@ -37,10 +37,16 @@ export interface BlobUploaderDeps {
   now?: () => number;
   /** Injected wait — tests resolve immediately. */
   sleep?: (ms: number) => Promise<void>;
-  /** Desktop eager hydration after catch-up / wake-up. */
+  /** Desktop eager hydration after catch-up / wake-up. Mobile still hydrates .obsidian category files. */
   hydratePending?: () => Promise<void>;
-  /** Trash a vault file if present (remote tombstone). */
+  /** Trash a vault file if present (remote tombstone for TFile attachments). */
   trashIfPresent?: (path: string) => Promise<void>;
+  /** Adapter remove — category files have no TFile / no trash. */
+  removeFile?: (path: string) => Promise<void>;
+  /** Per-device .obsidian category toggles (defaults OFF). */
+  obsidianSyncEnabled?: () => ObsidianSyncEnabled;
+  /** Backstop adapter sweep for .obsidian category files. */
+  sweepObsidian?: () => Promise<void>;
 }
 
 export interface BlobHttpResult {
@@ -92,8 +98,14 @@ export class BlobUploader {
     return this.deps.isMobile ? 1 : 2;
   }
 
+  private enabled(): ObsidianSyncEnabled {
+    return this.deps.obsidianSyncEnabled?.() ?? { settings: false, styles: false };
+  }
+
   /** Vault create/modify for an attachment path. */
   onFileChanged(path: string): void {
+    const cat = obsidianSyncCategoryOf(path);
+    if (cat && !this.enabled()[cat]) return;
     if (this.queued.has(path)) return;
     this.queued.add(path);
     this.queue.push(path);
@@ -229,6 +241,9 @@ export class BlobUploader {
     if (this.superseded.delete(path)) return;
     const key = this.deps.index.keyFor(path);
     if (!key) return;
+
+    const cat = obsidianSyncCategoryOf(path);
+    if (cat && !this.enabled()[cat]) return;
 
     if (this.now() < this.quotaExceededUntil) {
       this.deps.index.update(path, { skipped: true });
@@ -461,8 +476,10 @@ export class BlobUploader {
     if (resp.json.accepted !== true) throw new Error(`blob-path not accepted (status ${resp.status})`);
 
     const seq = typeof resp.json.seq === 'number' ? resp.json.seq : (prev?.seq ?? 0);
+    const st = await this.deps.stat(path);
     this.deps.index.update(path, {
       hash, size, generation, seq, hydrated: true, lastRemoteHash: hash, skipped: false,
+      ...(typeof st?.mtime === 'number' ? { mtime: st.mtime } : {}),
     });
   }
 
@@ -502,7 +519,10 @@ export class BlobUploader {
       maxSeq = resp.json.max_seq;
     }
     this.deps.index.noteMaxSeq(maxSeq);
-    if (!this.deps.isMobile) await this.deps.hydratePending?.();
+    // Category files hydrate eagerly on every device class; downloader filters
+    // mobile to .obsidian paths. Sweep is the required backstop (raw is undocumented).
+    await this.deps.hydratePending?.();
+    await this.deps.sweepObsidian?.();
   }
 
   /** Second-device catch-up: create an index entry when the server has a live path we have never seen. */
@@ -523,8 +543,26 @@ export class BlobUploader {
       const local = this.deps.index.get(path);
       if (!local) {
         const same = await this.localFileMatches(path, contentHash, size);
-        if (same === false) {
+        const cat = obsidianSyncCategoryOf(path);
+        // Category files are whole-file LWW (no JSON-key merge, no conflict copies):
+        // a differing local file is still indexed so catch-up can overwrite.
+        if (same === false && !cat) {
           log('blob.catch-up.unindexed-local-modified', path);
+          return;
+        }
+        if (this.categoryDetached(path)) {
+          // Toggle-off: still index so maxSeq stays meaningful. Explicit
+          // skipped+hydrated:false — unknown-path defaults are hydrated:true
+          // and the sweep would tombstone a file this device never had.
+          this.deps.index.update(path, {
+            hash: contentHash,
+            size,
+            generation,
+            seq,
+            skipped: true,
+            hydrated: false,
+            lastRemoteHash: null,
+          });
           return;
         }
         this.deps.index.update(path, {
@@ -541,6 +579,17 @@ export class BlobUploader {
 
     const local = this.deps.index.get(path);
     if (!local) return;
+    if (this.categoryDetached(path)) {
+      this.deps.index.update(path, {
+        hash: contentHash,
+        size,
+        generation,
+        seq,
+        skipped: true,
+        hydrated: false,
+      });
+      return;
+    }
     if (local.hash === contentHash) return;
     this.deps.index.update(path, {
       hash: contentHash,
@@ -549,6 +598,11 @@ export class BlobUploader {
       seq,
       hydrated: false,
     });
+  }
+
+  private categoryDetached(path: string): boolean {
+    const cat = obsidianSyncCategoryOf(path);
+    return !!(cat && !this.enabled()[cat]);
   }
 
   private async localFileMatches(path: string, contentHash: string, size: number): Promise<boolean | null> {
@@ -566,6 +620,14 @@ export class BlobUploader {
     if (!path) return;
     const local = this.deps.index.get(path);
     if (!local) return;
+
+    const cat = obsidianSyncCategoryOf(path);
+    // Toggle-off + remote tombstone: skipped category → index.remove only.
+    // No republish (would upload despite OFF), no file delete (detach).
+    if (cat && local.skipped) {
+      this.deps.index.remove(path);
+      return;
+    }
 
     const remoteGen = typeof s.generation === 'number' ? s.generation : local.generation;
     const stat = await this.deps.stat(path);
@@ -586,9 +648,16 @@ export class BlobUploader {
       return;
     }
 
-    // Echo suppression: drop the index entry BEFORE trashFile. The vault
+    // Echo suppression: drop the index entry BEFORE trash/remove. The vault
     // 'delete' event then hits onFileDeleted's never-synced branch and no-ops.
     this.deps.index.remove(path);
+    if (cat) {
+      // Category files have no TFile; trashIfPresent would no-op and the sweep
+      // would see the leftover file as new and resurrect it on the deleter.
+      await this.deps.removeFile?.(path);
+      this.noticeRemote(path, remoteDeleteRemovedNoticeMessage(path));
+      return;
+    }
     await this.deps.trashIfPresent?.(path);
     this.noticeRemote(path, remoteDeleteTrashedNoticeMessage(path));
   }

@@ -2,7 +2,7 @@ import type { App, TFile } from 'obsidian';
 import { blake3_hex, blob_path_key } from '../wasm/vaultcrdt_wasm';
 import { conflictPath } from './conflict-utils';
 import { log, error } from './logger';
-import { pathCaseKey } from './path-policy';
+import { obsidianSyncCategoryOf, pathCaseKey } from './path-policy';
 import { blobRequest, headerValue } from './blob-uploader';
 import type { BlobIndex, BlobIndexEntry } from './blob-index';
 
@@ -46,11 +46,12 @@ export class BlobDownloader {
   constructor(private deps: BlobDownloaderDeps) {}
 
   /**
-   * Desktop eager pass: every live `hydrated: false` entry, smallest first,
-   * concurrency 2. A pass already in flight is not restarted.
+   * Eager pass: every live `hydrated: false` entry, smallest first,
+   * concurrency 2. Desktop hydrates all attachments; mobile hydrates
+   * only .obsidian category files (attachments stay lazy via file-open).
+   * A pass already in flight is not restarted.
    */
   async hydratePending(): Promise<void> {
-    if (this.deps.isMobile) return;
     if (this.pass) return;
     if (!(await this.deps.blobsEnabled())) return;
     const run = this.runHydratePending().finally(() => {
@@ -77,7 +78,12 @@ export class BlobDownloader {
 
   private async runHydratePending(): Promise<void> {
     const pending = this.deps.index.entries()
-      .filter(([, e]) => !e.hydrated && !e.skipped)
+      .filter(([path, e]) => {
+        if (e.hydrated || e.skipped) return false;
+        // Category files hydrate eagerly on every device class (S1).
+        if (this.deps.isMobile) return obsidianSyncCategoryOf(path) !== null;
+        return true;
+      })
       .sort((a, b) => a[1].size - b[1].size);
     await pool(pending, 2, ([path]) => this.hydrateOne(path));
   }
@@ -172,6 +178,9 @@ export class BlobDownloader {
   private async maybeConflictCopy(
     path: string, entry: BlobIndexEntry, remoteHash: string,
   ): Promise<void> {
+    // Category files overwrite locally (whole-file LWW, no JSON-key merge).
+    // A `.obsidian/app (conflict …).json` could never produce a valid key.
+    if (obsidianSyncCategoryOf(path)) return;
     if (!(await this.deps.exists(path))) return;
     const localBytes = new Uint8Array(await this.deps.readBinary(path));
     const localHash = blake3_hex(localBytes);

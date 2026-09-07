@@ -2,9 +2,10 @@ import { App, Modal, Platform, PluginSettingTab, Setting, requestUrl, Notice } f
 import type VaultCRDTPlugin from './main';
 import { validateServerUrl, toHttpBase, normalizeServerUrl } from './url-policy';
 import { SetupModal } from './setup-modal';
-import { TRUST_NOTICE_TEXT, protocolHealthText, SETUP_COPY } from './user-facing-copy';
+import { TRUST_NOTICE_TEXT, protocolHealthText, SETUP_COPY, OBSIDIAN_SYNC_COPY } from './user-facing-copy';
 import { PROTOCOL_VERSION, jsonOf } from './protocol';
 import { redact } from './logger';
+import type { ObsidianSyncEnabled } from './path-policy';
 
 export interface VaultCRDTSettings {
   serverUrl: string;
@@ -21,6 +22,8 @@ export interface VaultCRDTSettings {
   debounceMs: number;
   showSyncStatus: boolean;
   onboardingComplete: boolean;
+  /** Per-device .obsidian blob-lane categories. Defaults OFF (data.json is per-device). */
+  obsidianSync?: ObsidianSyncEnabled;
 }
 
 export const DEFAULT_SETTINGS: VaultCRDTSettings = {
@@ -33,6 +36,7 @@ export const DEFAULT_SETTINGS: VaultCRDTSettings = {
   debounceMs: 300,
   showSyncStatus: true,
   onboardingComplete: false,
+  obsidianSync: { settings: false, styles: false },
 };
 
 /**
@@ -392,6 +396,41 @@ export class VaultCRDTSettingsTab extends PluginSettingTab {
           }
         })
       );
+
+    // ── .obsidian sync ─────────────────────────────────────────────────────
+    new Setting(containerEl).setName(OBSIDIAN_SYNC_COPY.heading).setHeading();
+
+    new Setting(containerEl)
+      .setName(OBSIDIAN_SYNC_COPY.settingsName)
+      .setDesc(OBSIDIAN_SYNC_COPY.settingsDesc)
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.obsidianSync?.settings ?? false).onChange(async (value) => {
+          this.plugin.settings.obsidianSync = {
+            settings: value,
+            styles: this.plugin.settings.obsidianSync?.styles ?? false,
+          };
+          await this.plugin.saveSettings();
+          await this.plugin.applyObsidianSyncToggle('settings', value);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(OBSIDIAN_SYNC_COPY.stylesName)
+      .setDesc(OBSIDIAN_SYNC_COPY.stylesDesc)
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.obsidianSync?.styles ?? false).onChange(async (value) => {
+          this.plugin.settings.obsidianSync = {
+            settings: this.plugin.settings.obsidianSync?.settings ?? false,
+            styles: value,
+          };
+          await this.plugin.saveSettings();
+          await this.plugin.applyObsidianSyncToggle('styles', value);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(OBSIDIAN_SYNC_COPY.neverSyncs)
+      .setDesc(OBSIDIAN_SYNC_COPY.configDirNote);
 
     // ── Advanced ────────────────────────────────────────────────────────────
     const details = containerEl.createEl('details');

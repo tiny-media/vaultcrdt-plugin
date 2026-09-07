@@ -24,6 +24,8 @@ export interface BlobIndexEntry {
   lastRemoteHash: string | null;
   /** Set when the file exceeded the type cap and was never read. */
   skipped?: boolean;
+  /** Adapter mtime from the last successful upload/stat — sweep diff. */
+  mtime?: number;
 }
 
 interface BlobIndexFile {
@@ -56,6 +58,7 @@ function parse(raw: unknown): BlobIndexFile {
         ? e.lastRemoteHash
         : e.lastRemoteHash === null ? null : '',
       ...(e.skipped ? { skipped: true } : {}),
+      ...(typeof e.mtime === 'number' ? { mtime: e.mtime } : {}),
     };
   }
   empty.maxSeq = typeof file.maxSeq === 'number' ? file.maxSeq : 0;
