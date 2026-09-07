@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-07
+
+### Fixed
+
+- Typing while another device edits the same note no longer rewinds the
+  editor. A remote change arriving mid-typing applied its diff and then,
+  on verification mismatch, rewrote the editor from CRDT state —
+  discarding every keystroke typed in the async window in between. The
+  live path now folds local keystrokes back into the document instead
+  (the catch-up path always did), and the flush also works when no
+  debounce timer is armed.
+- Remotely deleted files now always leave a review-inbox entry, on every
+  path (kept locally, or moved to trash by the initial sync). Previously
+  the entry could be missing or cleared again by the delete handler.
+
+### Added
+
+- Long-divergence integration tests: two devices edited apart and
+  reunited, and a fresh installation over a similar-but-different vault.
+  They also pin that file timestamps alone never trigger pushes.
+
 ## [0.5.2] - 2026-09-07
 
 ### Added
