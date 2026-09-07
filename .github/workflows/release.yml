@@ -88,3 +88,25 @@ jobs:
             main.js
             manifest.json
             styles.css
+
+      - name: Prune unexpected release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release must carry exactly the three expected assets. Anything
+          # else (e.g. a wasm sibling from a bad workflow state) is dead weight
+          # for every BRAT install — delete it so the release stays clean.
+          repo="${{ github.repository }}"
+          tag="${{ github.ref_name }}"
+          mapfile -t rows < <(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$repo/releases/tags/$tag" \
+            | jq -r '.assets[] | "\(.id) \(.name)"')
+          for row in "${rows[@]}"; do
+            id="${row%% *}"; name="${row#* }"
+            case " main.js manifest.json styles.css " in
+              *" $name "*) echo "keep $name" ;;
+              *) curl -sf -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/$repo/releases/assets/$id" \
+                  && echo "pruned $name" ;;
+            esac
+          done
