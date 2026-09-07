@@ -585,7 +585,7 @@ export async function runInitialSync(
     const f = app.vault.getAbstractFileByPath(uuid);
     if (!(f instanceof TFile)) continue;
 
-    let keep = false;
+    let keep: boolean;
     if (push.hasPendingEdits(uuid) || push.hasUnackedEdit(uuid)) {
       keep = true;
     } else {

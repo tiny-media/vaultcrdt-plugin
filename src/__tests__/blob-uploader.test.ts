@@ -732,7 +732,7 @@ describe('BlobUploader (attachment lane S2)', () => {
     await uploader.flush();
     expect(writeBinary).toHaveBeenCalledTimes(1);
     expect(writeBinary.mock.calls[0][0]).toBe(SVG_PATH);
-    expect(new Uint8Array(writeBinary.mock.calls[0][1] as ArrayBuffer)).toEqual(FIXED);
+    expect(new Uint8Array(writeBinary.mock.calls[0][1])).toEqual(FIXED);
     const start = calls().find((c) => c.method === 'POST' && c.url.includes('/vault/blobs/uploads'));
     expect(JSON.parse(start!.body as string).size).toBe(FIXED.byteLength);
     expect(JSON.parse(start!.body as string).size).not.toBe(SVG_BYTES.byteLength);
@@ -798,7 +798,7 @@ describe('BlobUploader (attachment lane S2)', () => {
     const put = calls().find((c) => c.method === 'PUT');
     expect(new Uint8Array(put!.body as ArrayBuffer)).toEqual(FIXED);
     expect(writeBinary).toHaveBeenCalledTimes(1);
-    expect(new Uint8Array(writeBinary.mock.calls[0][1] as ArrayBuffer)).toEqual(FIXED);
+    expect(new Uint8Array(writeBinary.mock.calls[0][1])).toEqual(FIXED);
   });
 });
 

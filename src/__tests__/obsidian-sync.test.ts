@@ -146,7 +146,7 @@ describe('listObsidianCategoryFiles + sweep', () => {
 
     await sync.sweep();
 
-    const uploaded = onFileChanged.mock.calls.map((c) => c[0] as string).sort();
+    const uploaded = onFileChanged.mock.calls.map((c) => c[0]).sort();
     expect(uploaded).toEqual([MANIFEST, SNIP, THEME].sort());
     expect(onFileDeleted).toHaveBeenCalledTimes(1);
     expect(onFileDeleted).toHaveBeenCalledWith('.obsidian/appearance.json');
