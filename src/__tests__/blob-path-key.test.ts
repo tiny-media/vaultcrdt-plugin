@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { readFileSync } from 'node:fs';
 import initWasmModule, { blob_path_key } from '../../wasm/vaultcrdt_wasm';
-import { isAttachmentPath } from '../path-policy';
+import { isAttachmentPath, attachmentCap } from '../path-policy';
 
 const vectors = JSON.parse(
   readFileSync(new URL('../../docs/blob-path-key-vectors.json', import.meta.url), 'utf8'),
@@ -37,15 +37,21 @@ describe('isAttachmentPath', () => {
   const accepted = [
     'a.jpg', 'a.jpeg', 'a.png', 'a.webp', 'a.gif', 'a.heic', 'a.heif', 'a.avif',
     'a.pdf', 'a.mp3', 'a.m4a', 'a.ogg', 'a.oga', 'a.opus', 'a.flac', 'a.wav', 'a.webm', 'a.3gp',
-    'Bilder/Übersicht.PNG', 'nested/dir/x.JPG',
+    'Bilder/Übersicht.PNG', 'nested/dir/x.JPG', 'x.svg',
   ];
   it.each(accepted)('accepts %s', (p) => expect(isAttachmentPath(p)).toBe(true));
 
   const rejected = [
-    'x.svg', 'x.mp4', 'x.txt', 'x.md', 'noext',
+    'x.mp4', 'x.txt', 'x.md', 'noext',
     '.obsidian/x.png', '.Obsidian/x.png', '.trash/x.png',
     'a//b.png', '/x.png', '../x.png', './x.png', 'a/b/../c.png', 'a./x.png',
     'foo.png ', '',
   ];
   it.each(rejected)('rejects %s', (p) => expect(isAttachmentPath(p)).toBe(false));
+
+  it('foo/bar.svg is an image attachment under IMAGE_CAP', () => {
+    expect(isAttachmentPath('foo/bar.svg')).toBe(true);
+    expect(attachmentCap('foo/bar.svg')).toBe(10 * 1024 * 1024);
+    expect(blob_path_key('x.svg')).toBe('x.svg');
+  });
 });

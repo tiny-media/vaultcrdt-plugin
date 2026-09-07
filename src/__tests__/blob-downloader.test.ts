@@ -128,6 +128,7 @@ function makePair(opts: { isMobile?: boolean; cache?: { embeds?: { link: string 
     blobsEnabled: async () => true,
     stat: vault.stat,
     readBinary: vault.readBinary,
+    writeBinary: (p, data) => vault.writeBinary(p, data),
     notify: vi.fn(),
     isMobile: opts.isMobile ?? false,
     sleep: async () => undefined,

@@ -74,6 +74,7 @@ export default class VaultCRDTPlugin extends Plugin {
       blobsEnabled: () => this.blobsEnabled(),
       stat: (path) => this.app.vault.adapter.stat(path),
       readBinary: (path) => this.app.vault.adapter.readBinary(path),
+      writeBinary: (path, data) => this.app.vault.adapter.writeBinary(path, data),
       notify: (text) => { new Notice(text, 8000); },
       isMobile: Platform.isMobile,
       hydratePending: () => this.blobDownloader.hydratePending(),

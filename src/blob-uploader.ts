@@ -1,9 +1,9 @@
 import { requestUrl } from 'obsidian';
-import { blake3_hex } from '../wasm/vaultcrdt_wasm';
-import { attachmentCap } from './path-policy';
+import { blake3_hex, sanitize_svg } from '../wasm/vaultcrdt_wasm';
+import { attachmentCap, pathCaseKey } from './path-policy';
 import { toHttpBase } from './url-policy';
 import { log, error, warn } from './logger';
-import { attachmentTooLargeMessage, quotaExceededMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage } from './user-facing-copy';
+import { attachmentTooLargeMessage, quotaExceededMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage, svgRejectedMessage } from './user-facing-copy';
 import type { BlobIndex } from './blob-index';
 
 /** Debounce before hashing, so foreign writers (camera apps) can finish. */
@@ -30,6 +30,7 @@ export interface BlobUploaderDeps {
   blobsEnabled(): Promise<boolean>;
   stat(path: string): Promise<{ size: number } | null>;
   readBinary(path: string): Promise<ArrayBuffer>;
+  writeBinary(path: string, data: ArrayBuffer): Promise<void>;
   notify(text: string): void;
   /** Mobile uploads one file at a time (design §3). */
   isMobile: boolean;
@@ -234,7 +235,7 @@ export class BlobUploader {
       return;
     }
 
-    const size = await this.stableSize(path);
+    let size = await this.stableSize(path);
     if (size === null) return;
 
     // Cap-skip BEFORE reading: an oversized file is never pulled into memory.
@@ -245,7 +246,24 @@ export class BlobUploader {
       return;
     }
 
-    const bytes = new Uint8Array(await this.deps.readBinary(path));
+    let bytes: Uint8Array = new Uint8Array(await this.deps.readBinary(path));
+    const ext = pathCaseKey(path).slice(pathCaseKey(path).lastIndexOf('.') + 1);
+    if (ext === 'svg') {
+      const before = bytes.byteLength;
+      try {
+        const sanitized = sanitize_svg(bytes);
+        if (!uint8Equal(bytes, sanitized)) {
+          await this.deps.writeBinary(path, bufferOf(sanitized));
+        }
+        bytes = sanitized;
+      } catch (e) {
+        this.deps.index.update(path, { skipped: true });
+        this.noticeSvg(path, thrownReason(e));
+        return;
+      }
+      size = bytes.byteLength;
+      log(`svg sanitized: ${before} → ${size} bytes`);
+    }
     const hash = blake3_hex(bytes);
     if (this.superseded.delete(path)) return;
 
@@ -281,6 +299,13 @@ export class BlobUploader {
     if (last !== undefined && this.now() - last < CAP_NOTICE_THROTTLE_MS) return;
     this.capNoticeAt.set(path, this.now());
     this.deps.notify(attachmentTooLargeMessage(path, cap));
+  }
+
+  private noticeSvg(path: string, reason: string): void {
+    const last = this.capNoticeAt.get(path);
+    if (last !== undefined && this.now() - last < CAP_NOTICE_THROTTLE_MS) return;
+    this.capNoticeAt.set(path, this.now());
+    this.deps.notify(svgRejectedMessage(path, reason));
   }
 
   private noticeQuota(quotaBytes?: number): void {
@@ -397,6 +422,14 @@ export class BlobUploader {
       // note: LWW loss drops the local version instead of writing a
       // conflict copy. Upgrade path: the S3 conflict-copy flow.
       warn('blob.lww-loss (dropped, conflict copy is S3):', path);
+      return;
+    }
+    if (resp.status === 422) {
+      this.deps.index.update(path, { skipped: true });
+      this.noticeSvg(
+        path,
+        typeof resp.json.error === 'string' ? resp.json.error : 'rejected by server',
+      );
       return;
     }
     if (resp.json.accepted !== true) throw new Error(`blob-path not accepted (status ${resp.status})`);
@@ -664,4 +697,24 @@ function parseResponseJson(resp: { json?: unknown; text?: unknown }): Record<str
     }
   }
   return {};
+}
+
+function uint8Equal(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function bufferOf(bytes: Uint8Array): ArrayBuffer {
+  return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+    ? bytes.buffer as ArrayBuffer
+    : bytes.slice().buffer;
+}
+
+function thrownReason(e: unknown): string {
+  if (typeof e === 'string') return e;
+  if (e instanceof Error && e.message) return e.message;
+  return 'invalid SVG';
 }

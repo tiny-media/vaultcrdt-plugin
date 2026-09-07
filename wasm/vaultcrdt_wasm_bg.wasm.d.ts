@@ -4,6 +4,7 @@ export const memory: WebAssembly.Memory;
 export const __wbg_wasmsyncdocument_free: (a: number, b: number) => void;
 export const blake3_hex: (a: number, b: number, c: number) => void;
 export const blob_path_key: (a: number, b: number, c: number) => void;
+export const sanitize_svg: (a: number, b: number, c: number) => void;
 export const wasmsyncdocument_delete_text: (a: number, b: number, c: number, d: number) => void;
 export const wasmsyncdocument_export_delta_since_vv_json: (a: number, b: number, c: number, d: number) => void;
 export const wasmsyncdocument_export_snapshot: (a: number, b: number) => void;

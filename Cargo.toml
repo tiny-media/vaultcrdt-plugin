@@ -37,6 +37,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # WASM — pinned to lockfile version for reproducible plugin builds
 wasm-bindgen = "=0.2.128"
 
+# svg-hush: protocol-pinned; upgrade = protocol event, both repos in lockstep
+svg-hush = "=0.9.7"
+
 # Unicode (blob path key v1: NFC + full casefold)
 unicode-normalization = "0.1.25"
 caseless = "0.2.2"

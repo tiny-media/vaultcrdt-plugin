@@ -55,6 +55,11 @@ export function blake3_hex(data: Uint8Array): string;
  */
 export function blob_path_key(path: string): string | undefined;
 
+/**
+ * Sanitize SVG bytes with the protocol-pinned svg-hush config. SYNC — JS does not await.
+ */
+export function sanitize_svg(data: Uint8Array): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -62,6 +67,7 @@ export interface InitOutput {
     readonly __wbg_wasmsyncdocument_free: (a: number, b: number) => void;
     readonly blake3_hex: (a: number, b: number, c: number) => void;
     readonly blob_path_key: (a: number, b: number, c: number) => void;
+    readonly sanitize_svg: (a: number, b: number, c: number) => void;
     readonly wasmsyncdocument_delete_text: (a: number, b: number, c: number, d: number) => void;
     readonly wasmsyncdocument_export_delta_since_vv_json: (a: number, b: number, c: number, d: number) => void;
     readonly wasmsyncdocument_export_snapshot: (a: number, b: number) => void;

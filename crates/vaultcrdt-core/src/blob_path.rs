@@ -10,9 +10,12 @@ use unicode_normalization::UnicodeNormalization;
 
 /// Allowed attachment extensions (lowercased, without dot). Must stay in sync
 /// with `ATTACHMENT_EXTENSIONS` in `src/path-policy.ts`.
-pub const ATTACHMENT_EXTENSIONS: [&str; 18] = [
-    "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "pdf", "mp3", "m4a", "ogg", "oga",
-    "opus", "flac", "wav", "webm", "3gp",
+///
+/// The extension whitelist is NOT part of the frozen key_version=1 algorithm;
+/// `svg` lands under key_version 1 (no bump).
+pub const ATTACHMENT_EXTENSIONS: [&str; 19] = [
+    "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "svg", "pdf", "mp3", "m4a", "ogg",
+    "oga", "opus", "flac", "wav", "webm", "3gp",
 ];
 
 const BLOCKED_PREFIXES: [&str; 2] = [".obsidian/", ".trash/"];
@@ -75,11 +78,7 @@ mod tests {
             let input = v["input"].as_str().expect("input string");
             match v["key"].as_str() {
                 Some(expected) => {
-                    assert_eq!(
-                        blob_path_key(input).as_deref(),
-                        Some(expected),
-                        "vector {input:?}"
-                    );
+                    assert_eq!(blob_path_key(input).as_deref(), Some(expected), "vector {input:?}");
                     accepted += 1;
                 }
                 None => {
@@ -88,7 +87,7 @@ mod tests {
                 }
             }
         }
-        assert!(accepted >= 11 && rejected >= 9, "{accepted} accepted, {rejected} rejected");
+        assert!(accepted >= 12 && rejected >= 8, "{accepted} accepted, {rejected} rejected");
     }
 
     #[test]
@@ -120,7 +119,6 @@ mod tests {
             "../x.png",
             "/x.png",
             "a//b.png",
-            "x.svg",
             "foo.png ",
             "a./x.png",
             ".obsidian/a.png",
@@ -143,6 +141,7 @@ mod tests {
         assert_eq!(blob_path_key("Notes/voice.webm").as_deref(), Some("notes/voice.webm"));
         assert_eq!(blob_path_key("rec.3gp").as_deref(), Some("rec.3gp"));
         assert_eq!(blob_path_key("voice.oga").as_deref(), Some("voice.oga"));
+        assert_eq!(blob_path_key("x.svg").as_deref(), Some("x.svg"));
         assert_eq!(blob_path_key("video.mp4"), None);
     }
 }

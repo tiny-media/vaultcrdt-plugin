@@ -17,5 +17,9 @@ vaultcrdt-crdt = { path = "../vaultcrdt-crdt" }
 wasm-bindgen = { workspace = true }
 blake3 = { workspace = true }
 serde_json = { workspace = true }
+svg-hush = { workspace = true }
 # uuid needs js feature for wasm32-unknown-unknown randomness (transitive via vaultcrdt-core)
 uuid = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+base64 = "0.23"

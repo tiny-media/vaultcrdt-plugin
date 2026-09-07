@@ -19,7 +19,7 @@ export function isCaseOnlyPathRename(oldPath: string, newPath: string): boolean 
  * Attachment extensions eligible for blob sync (lowercase, without dot).
  * Must stay in sync with ATTACHMENT_EXTENSIONS in crates/vaultcrdt-core/src/blob_path.rs.
  */
-const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif', 'avif'];
+const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif', 'avif', 'svg'];
 const PDF_EXTENSIONS = ['pdf'];
 const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'ogg', 'oga', 'opus', 'flac', 'wav', 'webm', '3gp'];
 const ATTACHMENT_EXTENSIONS = [...IMAGE_EXTENSIONS, ...PDF_EXTENSIONS, ...AUDIO_EXTENSIONS];
@@ -55,7 +55,7 @@ const AUDIO_CAP = 25 * MIB;
 
 /**
  * Per-type upload size cap: images 10 MiB, pdf 10 MiB, audio 25 MiB.
- * Extension groups match the server (jpg jpeg png webp gif heic heif avif /
+ * Extension groups match the server (jpg jpeg png webp gif heic heif avif svg /
  * pdf / mp3 m4a ogg oga opus flac wav webm 3gp). Returns 0 for non-attachments.
  */
 export function attachmentCap(path: string): number {

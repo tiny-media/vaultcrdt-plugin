@@ -1,3 +1,7 @@
+use std::error::Error;
+use std::io::Cursor;
+
+use svg_hush::Filter;
 use vaultcrdt_crdt::document::SyncDocument;
 use wasm_bindgen::prelude::*;
 
@@ -12,6 +16,31 @@ pub fn blob_path_key(path: &str) -> Option<String> {
 #[wasm_bindgen]
 pub fn blake3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
+}
+
+fn format_ferr(err: svg_hush::FError) -> String {
+    let mut msg = format!("svg: {err}");
+    let mut src = Error::source(&err);
+    while let Some(cause) = src {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    msg
+}
+
+fn sanitize_svg_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut f = Filter::new();
+    f.set_data_url_filter(svg_hush::data_url_filter::allow_standard_images);
+    let mut dest = Cursor::new(Vec::new());
+    f.filter(Cursor::new(data), &mut dest).map_err(format_ferr)?;
+    Ok(dest.into_inner())
+}
+
+/// Sanitize SVG bytes with the protocol-pinned svg-hush config. SYNC — JS does not await.
+#[wasm_bindgen]
+pub fn sanitize_svg(data: &[u8]) -> Result<Vec<u8>, JsValue> {
+    sanitize_svg_bytes(data).map_err(|s| JsValue::from_str(&s))
 }
 
 /// WASM-exposed wrapper around `SyncDocument`.
@@ -86,6 +115,7 @@ impl WasmSyncDocument {
 
 #[cfg(test)]
 mod tests {
+    use super::sanitize_svg_bytes;
     use super::*;
 
     #[test]
@@ -146,5 +176,63 @@ mod tests {
         doc.insert_text(0, "hello").unwrap();
         assert!(doc.text_matches("hello"), "matches inserted text");
         assert!(!doc.text_matches("world"), "does not match different text");
+    }
+
+    const SCRIPT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect width="10" height="10"/></svg>"#;
+    const CLEAN_SVG: &[u8] =
+        br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>"#;
+    const DATA_URL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg"><image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="/></svg>"#;
+
+    #[test]
+    fn test_sanitize_svg_strips_script_keeps_rect() {
+        let out = sanitize_svg_bytes(SCRIPT_SVG).expect("script svg should sanitize");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("<rect"), "{text}");
+        assert!(!text.contains("<script"), "{text}");
+        assert!(!text.contains("alert"), "{text}");
+    }
+
+    #[test]
+    fn test_sanitize_svg_idempotent() {
+        let once = sanitize_svg_bytes(SCRIPT_SVG).unwrap();
+        let twice = sanitize_svg_bytes(&once).unwrap();
+        assert_eq!(once, twice, "script-svg output must be idempotent");
+
+        let a = sanitize_svg_bytes(CLEAN_SVG).unwrap();
+        let b = sanitize_svg_bytes(&a).unwrap();
+        assert_eq!(a, b, "clean svg output must be idempotent");
+    }
+
+    #[test]
+    fn test_sanitize_svg_rejects_jpeg() {
+        let jpeg = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        let err = sanitize_svg_bytes(&jpeg).expect_err("jpeg must fail");
+        assert!(err.starts_with("svg: "), "{err}");
+    }
+
+    #[test]
+    fn test_sanitize_svg_keeps_png_data_url() {
+        let out = sanitize_svg_bytes(DATA_URL_SVG).expect("data-url svg");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("data:image/png;base64,"), "{text}");
+    }
+
+    #[test]
+    fn test_svg_sanitize_vectors_json() {
+        use base64::Engine;
+        let raw = include_str!("../../../docs/svg-sanitize-vectors.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).expect("valid svg vectors JSON");
+        let cases = doc.as_array().expect("array");
+        assert!(cases.len() >= 4, "need script, clean, data-url, idempotence");
+        for v in cases {
+            let name = v["name"].as_str().expect("name");
+            let input = base64::engine::general_purpose::STANDARD
+                .decode(v["input_b64"].as_str().expect("input_b64"))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let expected = v["output_blake3_hex"].as_str().expect("output_blake3_hex");
+            let out = sanitize_svg_bytes(&input)
+                .unwrap_or_else(|e| panic!("{name}: sanitize failed: {e}"));
+            assert_eq!(blake3_hex(&out), expected, "vector {name}");
+        }
     }
 }

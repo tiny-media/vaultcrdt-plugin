@@ -47,6 +47,10 @@ export function quotaExceededMessage(quotaBytes: number): string {
   return `VaultCRDT: this vault is over the ${Math.round(quotaBytes / (1024 * 1024))} MB storage limit and attachments will not sync.`;
 }
 
+export function svgRejectedMessage(path: string, reason: string): string {
+  return `VaultCRDT: "${redact(path)}" could not be synced as SVG (${reason}) and will not upload.`;
+}
+
 export const INBOX_COPY = {
   discovery: 'VaultCRDT: 1 new item in inbox',
   title: 'VaultCRDT inbox',

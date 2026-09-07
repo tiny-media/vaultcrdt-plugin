@@ -8,6 +8,7 @@ const {
   mockCreateDocument,
   MockWebSocket,
   mockWsInstance,
+  mockSanitizeSvg,
 } = vi.hoisted(() => {
   const mockWsInstance = {
     readyState: 1,
@@ -37,6 +38,7 @@ const {
     }),
     MockWebSocket,
     mockWsInstance,
+    mockSanitizeSvg: vi.fn((bytes: Uint8Array) => bytes),
   };
 });
 vi.mock('obsidian', async () => {
@@ -50,6 +52,10 @@ vi.mock('@msgpack/msgpack', () => ({
 vi.mock('../wasm-bridge', () => ({
   createDocument: mockCreateDocument,
 }));
+vi.mock('../../wasm/vaultcrdt_wasm', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../wasm/vaultcrdt_wasm')>();
+  return { ...actual, sanitize_svg: mockSanitizeSvg };
+});
 vi.stubGlobal('WebSocket', MockWebSocket);
 
 import initWasmModule, { blake3_hex, blob_path_key } from '../../wasm/vaultcrdt_wasm';
@@ -89,6 +95,7 @@ function makeUploader(opts: {
   hydratePending?: () => Promise<void>;
   trashIfPresent?: (path: string) => Promise<void>;
   readBinary?: ((path: string) => Promise<ArrayBuffer>) & { mock?: unknown };
+  writeBinary?: (path: string, data: ArrayBuffer) => Promise<void>;
   now?: () => number;
 } = {}) {
   const index = new BlobIndex(memStorage());
@@ -99,6 +106,7 @@ function makeUploader(opts: {
       if (f) return f.slice().buffer;
       return BYTES.slice().buffer;
     });
+  const writeBinary = opts.writeBinary ?? vi.fn(async () => undefined);
   const uploader = new BlobUploader({
     index,
     serverUrl: () => 'https://s.example.com',
@@ -113,6 +121,7 @@ function makeUploader(opts: {
       return { size: opts.size ?? BYTES.length };
     },
     readBinary,
+    writeBinary,
     notify,
     isMobile: opts.isMobile ?? false,
     sleep: async () => undefined,
@@ -120,7 +129,7 @@ function makeUploader(opts: {
     hydratePending: opts.hydratePending,
     trashIfPresent: opts.trashIfPresent,
   });
-  return { uploader, index, notify, readBinary };
+  return { uploader, index, notify, readBinary, writeBinary };
 }
 
 const resp = (status: number, json: Record<string, unknown> = {}) => ({ status, json });
@@ -176,6 +185,8 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   mockRequestUrl.mockReset();
+  mockSanitizeSvg.mockReset();
+  mockSanitizeSvg.mockImplementation((bytes: Uint8Array) => bytes);
   mockEncode.mockClear();
   mockDecode.mockReset();
   MockWebSocket.mockClear();
@@ -671,6 +682,68 @@ describe('BlobUploader (attachment lane S2)', () => {
     expect(JSON.parse(calls()[2].body as string)).toMatchObject({
       path_key: key, state: 'live', content_hash: hash, generation: 4,
     });
+  });
+
+  const SVG_PATH = 'Bilder/icon.svg';
+  const SVG_BYTES = new TextEncoder().encode(
+    '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+  );
+  const FIXED = new TextEncoder().encode(
+    '<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>',
+  );
+
+  it('parks when sanitize_svg throws, without POSTing', async () => {
+    mockSanitizeSvg.mockImplementation(() => { throw new Error('svg: malformed XML'); });
+    const { uploader, index, notify } = makeUploader({ files: { [SVG_PATH]: SVG_BYTES } });
+    uploader.onFileChanged(SVG_PATH);
+    await uploader.flush();
+    expect(index.get(SVG_PATH)!.skipped).toBe(true);
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it('uploads sanitized bytes: POST hash and PUT body match fixedBytes', async () => {
+    mockSanitizeSvg.mockReturnValue(FIXED);
+    const { uploader } = makeUploader({ files: { [SVG_PATH]: SVG_BYTES } });
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(201, { upload_id: 'u1', next_offset: 0, segment_bytes: 1024 }))
+      .mockResolvedValueOnce(resp(201, { hash: blake3_hex(FIXED) }))
+      .mockResolvedValueOnce(resp(200, { accepted: true, seq: 1 }));
+    uploader.onFileChanged(SVG_PATH);
+    await uploader.flush();
+    const start = calls().find((c) => c.method === 'POST' && c.url.includes('/vault/blobs/uploads'));
+    expect(JSON.parse(start!.body as string).hash).toBe(blake3_hex(FIXED));
+    const put = calls().find((c) => c.method === 'PUT');
+    expect(new Uint8Array(put!.body as ArrayBuffer)).toEqual(FIXED);
+  });
+
+  it('writes sanitized bytes back and uses sanitized size, not stat size', async () => {
+    mockSanitizeSvg.mockReturnValue(FIXED);
+    const writeBinary = vi.fn(async (_path: string, _data: ArrayBuffer) => undefined);
+    const { uploader } = makeUploader({ files: { [SVG_PATH]: SVG_BYTES }, writeBinary });
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(200, { exists: true }))
+      .mockResolvedValueOnce(resp(200, { accepted: true, seq: 1 }));
+    uploader.onFileChanged(SVG_PATH);
+    await uploader.flush();
+    expect(writeBinary).toHaveBeenCalledTimes(1);
+    expect(writeBinary.mock.calls[0][0]).toBe(SVG_PATH);
+    expect(new Uint8Array(writeBinary.mock.calls[0][1] as ArrayBuffer)).toEqual(FIXED);
+    const start = calls().find((c) => c.method === 'POST' && c.url.includes('/vault/blobs/uploads'));
+    expect(JSON.parse(start!.body as string).size).toBe(FIXED.byteLength);
+    expect(JSON.parse(start!.body as string).size).not.toBe(SVG_BYTES.byteLength);
+  });
+
+  it('parks with notice on attach 422 and does not throw', async () => {
+    const { uploader, index, notify } = makeUploader({ files: { [SVG_PATH]: SVG_BYTES } });
+    mockRequestUrl
+      .mockResolvedValueOnce(resp(200, { exists: true }))
+      .mockResolvedValueOnce(resp(422, { error: 'sanitize mismatch' }));
+    uploader.onFileChanged(SVG_PATH);
+    await uploader.flush();
+    expect(index.get(SVG_PATH)!.skipped).toBe(true);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain('sanitize mismatch');
   });
 });
 
