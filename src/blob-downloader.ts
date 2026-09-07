@@ -35,15 +35,39 @@ export interface BlobDownloaderDeps {
  * each response wholly).
  *
  * Echo suppression relies on updating the index (hash, size, generation,
- * seq, hydrated: true, lastRemoteHash) BEFORE writeBinary. The vault
- * 'create' from that write routes to onFileChanged → upload() → hash →
- * `entry.lastRemoteHash === hash` returns early.
+ * seq, lastRemoteHash) BEFORE writeBinary. `hydrated` flips only AFTER
+ * writeBinary resolves — a failed write leaves hydrated:false (retryable)
+ * so a concurrent sweep cannot tombstone a file that is not on disk yet.
+ * The vault 'create' from that write routes to onFileChanged → upload() →
+ * hash → `entry.lastRemoteHash === hash` returns early.
  */
 export class BlobDownloader {
   private pass: Promise<void> | null = null;
+  private idleWaiters: Array<() => void> = [];
   private readonly inflight = new Set<string>();
 
   constructor(private deps: BlobDownloaderDeps) {}
+
+  /**
+   * Resolves when no hydration pass is running. If a pass is in flight,
+   * registers a waiter that fires when that pass finishes. No polling.
+   */
+  whenIdle(): Promise<void> {
+    if (!this.pass) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.idleWaiters.push(resolve);
+    });
+  }
+
+  private beginPass(work: () => Promise<void>): Promise<void> {
+    const run = work().finally(() => {
+      if (this.pass === run) this.pass = null;
+      const waiters = this.idleWaiters.splice(0);
+      for (const w of waiters) w();
+    });
+    this.pass = run;
+    return run;
+  }
 
   /**
    * Eager pass: every live `hydrated: false` entry, smallest first,
@@ -54,11 +78,8 @@ export class BlobDownloader {
   async hydratePending(): Promise<void> {
     if (this.pass) return;
     if (!(await this.deps.blobsEnabled())) return;
-    const run = this.runHydratePending().finally(() => {
-      if (this.pass === run) this.pass = null;
-    });
-    this.pass = run;
-    return run;
+    if (this.pass) return;
+    return this.beginPass(() => this.runHydratePending());
   }
 
   /**
@@ -69,11 +90,8 @@ export class BlobDownloader {
     if (!this.deps.isMobile) return;
     if (this.pass) return;
     if (!(await this.deps.blobsEnabled())) return;
-    const run = this.runHydrateForOpenFile(file).finally(() => {
-      if (this.pass === run) this.pass = null;
-    });
-    this.pass = run;
-    return run;
+    if (this.pass) return;
+    return this.beginPass(() => this.runHydrateForOpenFile(file));
   }
 
   private async runHydratePending(): Promise<void> {
@@ -149,25 +167,26 @@ export class BlobDownloader {
       }
       await this.maybeConflictCopy(path, entry, hash);
       await this.mkdirParents(path);
-      const prevHydrated = entry.hydrated;
       const prevLastRemoteHash = entry.lastRemoteHash;
+      // lastRemoteHash must be set BEFORE writeBinary (echo suppression).
+      // hydrated stays false until the write resolves — a failed write
+      // leaves hydrated:false so the next pass retries.
       this.deps.index.update(path, {
         hash,
         size: bytes.byteLength,
         generation: entry.generation,
         seq: entry.seq,
-        hydrated: true,
         lastRemoteHash: hash,
       });
       try {
         await this.deps.writeBinary(path, bufferOf(bytes));
       } catch (e) {
         this.deps.index.update(path, {
-          hydrated: prevHydrated,
           lastRemoteHash: prevLastRemoteHash,
         });
         throw e;
       }
+      this.deps.index.update(path, { hydrated: true });
     } catch (e) {
       error('blob.hydrate failed:', path, e);
     } finally {

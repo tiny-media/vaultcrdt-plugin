@@ -1,8 +1,9 @@
-import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { normalizePath } from 'obsidian';
-import initWasmModule from '../../wasm/vaultcrdt_wasm';
+import initWasmModule, { blake3_hex } from '../../wasm/vaultcrdt_wasm';
 import { BlobIndex } from '../blob-index';
+import { BlobUploader } from '../blob-uploader';
 import { ObsidianSync, vaultRelativeRawPath, joinListed, listObsidianCategoryFiles } from '../obsidian-sync';
 import type { BlobDownloader } from '../blob-downloader';
 import type { ObsidianSyncEnabled } from '../path-policy';
@@ -19,6 +20,17 @@ function memStorage() {
     loadJson: async <T,>(name: string) => (files.get(name) ?? null) as T | null,
     saveJson: async (name: string, value: unknown) => { files.set(name, value); },
   };
+}
+
+function idleDownloader(hydrateOne: BlobDownloader['hydrateOne'] = vi.fn()): BlobDownloader {
+  return {
+    hydrateOne,
+    whenIdle: async () => undefined,
+  } as unknown as BlobDownloader;
+}
+
+function bufOf(bytes: Uint8Array): ArrayBuffer {
+  return bytes.slice().buffer;
 }
 
 beforeAll(async () => {
@@ -63,11 +75,12 @@ describe('ObsidianSync raw debounce', () => {
     const index = new BlobIndex(memStorage());
     const sync = new ObsidianSync({
       index,
-      downloader: { hydrateOne: vi.fn() } as unknown as BlobDownloader,
+      downloader: idleDownloader(),
       enabled: () => ON,
       vaultBasePath: () => '/vault',
       list: async () => ({ files: [], folders: [] }),
       stat: async () => null,
+      readBinary: async () => new ArrayBuffer(0),
       onFileChanged,
       onFileDeleted: async () => undefined,
       sleep,
@@ -121,11 +134,12 @@ describe('listObsidianCategoryFiles + sweep', () => {
 
     const sync = new ObsidianSync({
       index,
-      downloader: { hydrateOne: vi.fn() } as unknown as BlobDownloader,
+      downloader: idleDownloader(),
       enabled: () => ON,
       vaultBasePath: () => '',
       list: async (dir) => listing[dir] ?? { files: [], folders: [] },
       stat: async (path) => stats[path] ?? null,
+      readBinary: async () => new ArrayBuffer(0),
       onFileChanged,
       onFileDeleted,
     });
@@ -153,7 +167,7 @@ describe('toggle-ON hydrate-then-sweep',
       const onFileChanged = vi.fn((path: string) => { order.push(`upload:${path}`); });
       const sync = new ObsidianSync({
         index,
-        downloader: { hydrateOne } as unknown as BlobDownloader,
+        downloader: idleDownloader(hydrateOne),
         enabled: () => ON,
         vaultBasePath: () => '',
         list: async (dir) => {
@@ -165,6 +179,7 @@ describe('toggle-ON hydrate-then-sweep',
           order.push('stat');
           return { size: 3, mtime: 1 };
         },
+        readBinary: async () => new ArrayBuffer(0),
         onFileChanged,
         onFileDeleted: async () => undefined,
       });
@@ -177,4 +192,144 @@ describe('toggle-ON hydrate-then-sweep',
       expect(firstHydrate).toBeGreaterThanOrEqual(0);
       expect(firstList).toBeGreaterThan(firstHydrate);
     });
+  });
+
+describe('sweep fail-closed / reentrancy / skipped / mtime',
+  () => {
+    it('adapter.list reject aborts the sweep: zero tombstones, index unchanged',
+      async () => {
+        const index = new BlobIndex(memStorage());
+        index.update('.obsidian/appearance.json', {
+          hash: 'h', size: 1, hydrated: true, skipped: false,
+        });
+        const uploader = new BlobUploader({
+          index,
+          serverUrl: () => 'https://s.example.com',
+          peerId: () => 'peer-1',
+          getJwt: async () => 'jwt-1',
+          blobsEnabled: async () => true,
+          stat: async () => null,
+          readBinary: async () => new ArrayBuffer(0),
+          writeBinary: async () => undefined,
+          notify: vi.fn(),
+          isMobile: false,
+          sleep: async () => undefined,
+        });
+        const postPath = vi.spyOn(
+          uploader as unknown as { postPath: (...args: unknown[]) => Promise<unknown> },
+          'postPath',
+        ).mockResolvedValue({
+          status: 200, json: { accepted: true }, arrayBuffer: new ArrayBuffer(0), headers: {},
+        });
+        const before = JSON.stringify(index.entries());
+        const sync = new ObsidianSync({
+          index,
+          downloader: idleDownloader(),
+          enabled: () => ON,
+          vaultBasePath: () => '',
+          list: async () => { throw new Error('EIO'); },
+          stat: async () => ({ size: 1, mtime: 1 }),
+          readBinary: async () => new ArrayBuffer(0),
+          onFileChanged: vi.fn(),
+          onFileDeleted: (path) => uploader.onFileDeleted(path),
+        });
+
+        await sync.sweep();
+
+        expect(postPath).not.toHaveBeenCalled();
+        expect(JSON.stringify(index.entries())).toBe(before);
+        expect(index.get('.obsidian/appearance.json')?.hydrated).toBe(true);
+      });
+
+    it('two concurrent sweep calls share one logical run',
+      async () => {
+        let entered = 0;
+        let release!: () => void;
+        const gate = new Promise<void>((r) => { release = r; });
+        const index = new BlobIndex(memStorage());
+        index.update(APP, { hash: 'h', size: 3, mtime: 1, hydrated: true, skipped: false });
+        const sync = new ObsidianSync({
+          index,
+          downloader: idleDownloader(),
+          enabled: () => ON,
+          vaultBasePath: () => '',
+          list: async (dir) => {
+            if (dir === '.obsidian') {
+              entered += 1;
+              await gate;
+              return { files: ['app.json'], folders: [] };
+            }
+            return { files: [], folders: [] };
+          },
+          stat: async () => ({ size: 3, mtime: 1 }),
+          readBinary: async () => new ArrayBuffer(0),
+          onFileChanged: vi.fn(),
+          onFileDeleted: async () => undefined,
+        });
+
+        const first = sync.sweep();
+        await vi.waitFor(() => expect(entered).toBe(1));
+        const second = sync.sweep();
+        release();
+        await Promise.all([first, second]);
+        expect(entered).toBe(1);
+      });
+
+    it('skipped over-cap file present is enqueued once, not on the next sweep',
+      async () => {
+        const onFileChanged = vi.fn();
+        const index = new BlobIndex(memStorage());
+        index.update(APP, {
+          hash: 'h', size: 10, mtime: 1, hydrated: false, skipped: true,
+        });
+        const sync = new ObsidianSync({
+          index,
+          downloader: idleDownloader(),
+          enabled: () => ON,
+          vaultBasePath: () => '',
+          list: async (dir) => {
+            if (dir === '.obsidian') return { files: ['app.json'], folders: [] };
+            return { files: [], folders: [] };
+          },
+          stat: async () => ({ size: 10, mtime: 1 }),
+          readBinary: async () => new ArrayBuffer(0),
+          onFileChanged,
+          onFileDeleted: async () => undefined,
+        });
+
+        onFileChanged(APP);
+        await sync.sweep();
+        await sync.sweep();
+        expect(onFileChanged).toHaveBeenCalledTimes(1);
+        expect(onFileChanged).toHaveBeenCalledWith(APP);
+      });
+
+    it('mtime-missing: same size, different content is detected via blake3',
+      async () => {
+        const oldBytes = new Uint8Array([1, 1, 1, 1]);
+        const newBytes = new Uint8Array([2, 2, 2, 2]);
+        const onFileChanged = vi.fn();
+        const index = new BlobIndex(memStorage());
+        index.update(APP, {
+          hash: blake3_hex(oldBytes), size: 4, hydrated: true, skipped: false,
+        });
+        const sync = new ObsidianSync({
+          index,
+          downloader: idleDownloader(),
+          enabled: () => ON,
+          vaultBasePath: () => '',
+          list: async (dir) => {
+            if (dir === '.obsidian') return { files: ['app.json'], folders: [] };
+            return { files: [], folders: [] };
+          },
+          stat: async () => ({ size: 4 }),
+          readBinary: async () => bufOf(newBytes),
+          onFileChanged,
+          onFileDeleted: async () => undefined,
+        });
+
+        await sync.sweep();
+        expect(onFileChanged).toHaveBeenCalledTimes(1);
+        expect(onFileChanged).toHaveBeenCalledWith(APP);
+      });
   });

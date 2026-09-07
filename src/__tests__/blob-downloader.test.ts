@@ -13,6 +13,7 @@ import initWasmModule, { blake3_hex, blob_path_key } from '../../wasm/vaultcrdt_
 import { BlobIndex } from '../blob-index';
 import { BlobDownloader } from '../blob-downloader';
 import { BlobUploader } from '../blob-uploader';
+import { ObsidianSync } from '../obsidian-sync';
 
 const PATH = 'Bilder/photo.png';
 const OTHER = 'Bilder/other.png';
@@ -451,3 +452,119 @@ describe('.obsidian category hydration',
       expect(calls().filter((c) => c.url.includes('/vault/blobs/uploads'))).toEqual([]);
     });
   });
+
+describe('hydration vs sweep (data-loss class)', () => {
+  it('sweep waits for an in-flight hydrate pass and does not tombstone that entry', async () => {
+    const { vault, index, downloader } = makePair({ enabled: ALL_ON });
+    const cfg = new Uint8Array([1, 2, 3]);
+    index.update(CFG, {
+      hash: blake3_hex(cfg), size: cfg.length, hydrated: false, seq: 1, generation: 1,
+      lastRemoteHash: null,
+    });
+
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((r) => { releaseWrite = r; });
+    let hitWrite!: () => void;
+    const atWrite = new Promise<void>((r) => { hitWrite = r; });
+    const order: string[] = [];
+    const origWrite = vault.writeBinary;
+    vault.writeBinary = async (p, data) => {
+      order.push('write-wait');
+      hitWrite();
+      await writeGate;
+      await origWrite(p, data);
+      order.push('write-done');
+    };
+
+    mockRequestUrl.mockImplementation(async (opts: Call) => serveRange(cfg, opts));
+
+    const hydrateP = downloader.hydratePending().then(() => { order.push('hydrate-done'); });
+    await atWrite;
+
+    const onFileDeleted = vi.fn(async () => { order.push('tombstone'); });
+    const sync = new ObsidianSync({
+      index,
+      downloader,
+      enabled: () => ALL_ON,
+      vaultBasePath: () => '',
+      list: async (dir) => {
+        order.push(`list:${dir}`);
+        if (dir === '.obsidian') {
+          expect(index.get(CFG)!.hydrated).toBe(true);
+          expect(vault.files.has(CFG)).toBe(true);
+          return { files: ['app.json'], folders: [] };
+        }
+        return { files: [], folders: [] };
+      },
+      stat: async (path) => {
+        const b = vault.files.get(path);
+        return b ? { size: b.byteLength, mtime: 1 } : null;
+      },
+      readBinary: vault.readBinary,
+      onFileChanged: vi.fn(),
+      onFileDeleted,
+    });
+
+    const sweepP = sync.sweep().then(() => { order.push('sweep-done'); });
+    await Promise.resolve();
+    expect(order.filter((s) => s.startsWith('list:'))).toEqual([]);
+
+    releaseWrite();
+    await Promise.all([hydrateP, sweepP]);
+
+    expect(onFileDeleted).not.toHaveBeenCalled();
+    const firstList = order.findIndex((s) => s.startsWith('list:'));
+    expect(firstList).toBeGreaterThan(order.indexOf('write-done'));
+    expect(index.get(CFG)!.hydrated).toBe(true);
+  });
+
+  it('failing writeBinary leaves hydrated:false (no sweep tombstone); success flips it', async () => {
+    const { vault, index, downloader } = makePair({ enabled: ALL_ON });
+    const origWrite = vault.writeBinary;
+    let failWrite = true;
+    let hydratedDuringWrite: boolean | undefined;
+    let lastRemoteDuringWrite: string | null | undefined;
+    vault.writeBinary = async (p, data) => {
+      hydratedDuringWrite = index.get(p)?.hydrated;
+      lastRemoteDuringWrite = index.get(p)?.lastRemoteHash ?? null;
+      if (failWrite) throw new Error('disk full');
+      return origWrite(p, data);
+    };
+    mockRequestUrl.mockImplementation(async (opts: Call) => serveRange(BYTES, opts));
+    index.update(CFG, {
+      hash: blake3_hex(BYTES), size: BYTES.length, hydrated: false, seq: 1, generation: 1,
+      lastRemoteHash: null,
+    });
+
+    await downloader.hydratePending();
+    expect(hydratedDuringWrite).toBe(false);
+    expect(lastRemoteDuringWrite).toBe(blake3_hex(BYTES));
+    expect(index.get(CFG)!.hydrated).toBe(false);
+    expect(index.get(CFG)!.lastRemoteHash).toBeNull();
+    expect(vault.files.has(CFG)).toBe(false);
+
+    const onFileDeleted = vi.fn(async () => undefined);
+    const sync = new ObsidianSync({
+      index,
+      downloader,
+      enabled: () => ALL_ON,
+      vaultBasePath: () => '',
+      list: async (dir) => {
+        if (dir === '.obsidian') return { files: [], folders: [] };
+        return { files: [], folders: [] };
+      },
+      stat: async () => null,
+      readBinary: vault.readBinary,
+      onFileChanged: vi.fn(),
+      onFileDeleted,
+    });
+    await sync.sweep();
+    expect(onFileDeleted).not.toHaveBeenCalled();
+    expect(index.get(CFG)!.hydrated).toBe(false);
+
+    failWrite = false;
+    await downloader.hydratePending();
+    expect(index.get(CFG)!.hydrated).toBe(true);
+    expect(vault.files.get(CFG)).toEqual(BYTES);
+  });
+});

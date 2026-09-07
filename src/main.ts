@@ -112,14 +112,9 @@ export default class VaultCRDTPlugin extends Plugin {
         const adapter = this.app.vault.adapter as { getBasePath?: () => string };
         return adapter.getBasePath?.() ?? '';
       },
-      list: async (dir) => {
-        try {
-          return await this.app.vault.adapter.list(dir);
-        } catch {
-          return { files: [], folders: [] };
-        }
-      },
+      list: (dir) => this.app.vault.adapter.list(dir),
       stat: (path) => this.app.vault.adapter.stat(path),
+      readBinary: (path) => this.app.vault.adapter.readBinary(path),
       onFileChanged: (path) => this.blobUploader.onFileChanged(path),
       onFileDeleted: (path) => this.blobUploader.onFileDeleted(path),
     });
@@ -631,17 +626,11 @@ export default class VaultCRDTPlugin extends Plugin {
    * `.obsidian/**` is not guaranteed — the backstop sweep is required.
    */
   private syncObsidianRawListener(): void {
-    const on = !!(this.settings?.obsidianSync?.settings || this.settings?.obsidianSync?.styles);
-    if (on && !this.obsidianRawRef) {
-      this.obsidianRawRef = listenVaultRaw(this.app.vault, (path) => {
-        this.obsidianSync.onRaw(path);
-      }) as EventRef;
-      this.registerEvent(this.obsidianRawRef);
-    }
-    if (!on && this.obsidianRawRef) {
-      this.app.vault.offref(this.obsidianRawRef);
-      this.obsidianRawRef = null;
-    }
+    if (this.obsidianRawRef) return;
+    this.obsidianRawRef = listenVaultRaw(this.app.vault, (path) => {
+      this.obsidianSync.onRaw(path);
+    }) as EventRef;
+    this.registerEvent(this.obsidianRawRef);
   }
 
   async applyObsidianSyncToggle(category: 'settings' | 'styles', on: boolean): Promise<void> {

@@ -1,8 +1,11 @@
 import { normalizePath } from 'obsidian';
+import { blake3_hex } from '../wasm/vaultcrdt_wasm';
 import { UPLOAD_DEBOUNCE_MS } from './blob-uploader';
-import type { BlobIndex } from './blob-index';
+import type { BlobIndex, BlobIndexEntry } from './blob-index';
 import type { BlobDownloader } from './blob-downloader';
+import { warn } from './logger';
 import {
+  OBSIDIAN_CAP,
   obsidianSyncCategory,
   obsidianSyncCategoryOf,
   type ObsidianSyncCategory,
@@ -21,6 +24,7 @@ export interface ObsidianSyncDeps {
   vaultBasePath: () => string;
   list: (dir: string) => Promise<ListedDir>;
   stat: (path: string) => Promise<{ size: number; mtime?: number } | null>;
+  readBinary: (path: string) => Promise<ArrayBuffer>;
   onFileChanged: (path: string) => void;
   onFileDeleted: (path: string) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
@@ -65,18 +69,16 @@ export function listenVaultRaw(vault: unknown, handler: VaultRawHandler): unknow
   return (vault as { on(name: 'raw', cb: VaultRawHandler): unknown }).on('raw', handler);
 }
 
-async function safeList(
-  list: (dir: string) => Promise<ListedDir>,
-  dir: string,
-): Promise<ListedDir> {
-  try {
-    return await list(dir);
-  } catch {
-    return { files: [], folders: [] };
-  }
+function folderPresent(folders: string[], parent: string, name: string): boolean {
+  const want = joinListed(parent, name);
+  return folders.some((f) => joinListed(parent, f) === want);
 }
 
-/** Backstop discovery: adapter.list of .obsidian, snippets, themes (+ each theme dir). */
+/**
+ * Backstop discovery: adapter.list of .obsidian, snippets, themes (+ each theme dir).
+ * Listing errors propagate — the caller must abort rather than treat them as empty.
+ * Missing child folders (absent from a successful parent listing) are skipped, not errors.
+ */
 export async function listObsidianCategoryFiles(
   list: (dir: string) => Promise<ListedDir>,
   enabled: ObsidianSyncEnabled,
@@ -84,7 +86,7 @@ export async function listObsidianCategoryFiles(
   const out: string[] = [];
   if (!enabled.settings && !enabled.styles) return out;
 
-  const root = await safeList(list, '.obsidian');
+  const root = await list('.obsidian');
   if (enabled.settings) {
     for (const f of root.files) {
       const path = joinListed('.obsidian', f);
@@ -94,19 +96,23 @@ export async function listObsidianCategoryFiles(
 
   if (!enabled.styles) return out;
 
-  const snippets = await safeList(list, '.obsidian/snippets');
-  for (const f of snippets.files) {
-    const path = joinListed('.obsidian/snippets', f);
-    if (obsidianSyncCategory(path, enabled) === 'styles') out.push(path);
+  if (folderPresent(root.folders, '.obsidian', 'snippets')) {
+    const snippets = await list('.obsidian/snippets');
+    for (const f of snippets.files) {
+      const path = joinListed('.obsidian/snippets', f);
+      if (obsidianSyncCategory(path, enabled) === 'styles') out.push(path);
+    }
   }
 
-  const themes = await safeList(list, '.obsidian/themes');
-  for (const folder of themes.folders) {
-    const themeDir = joinListed('.obsidian/themes', folder);
-    const listed = await safeList(list, themeDir);
-    for (const f of listed.files) {
-      const path = joinListed(themeDir, f);
-      if (obsidianSyncCategory(path, enabled) === 'styles') out.push(path);
+  if (folderPresent(root.folders, '.obsidian', 'themes')) {
+    const themes = await list('.obsidian/themes');
+    for (const folder of themes.folders) {
+      const themeDir = joinListed('.obsidian/themes', folder);
+      const listed = await list(themeDir);
+      for (const f of listed.files) {
+        const path = joinListed(themeDir, f);
+        if (obsidianSyncCategory(path, enabled) === 'styles') out.push(path);
+      }
     }
   }
   return out;
@@ -119,6 +125,7 @@ export async function listObsidianCategoryFiles(
 export class ObsidianSync {
   private pendingRaw = new Set<string>();
   private rawFlush: Promise<void> | null = null;
+  private sweepRun: Promise<void> | null = null;
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(private deps: ObsidianSyncDeps) {
@@ -153,23 +160,38 @@ export class ObsidianSync {
    * Diff adapter listing against the blob index. New/changed → upload check.
    * Gone entries are tombstoned via onFileDeleted only when hydrated && !skipped
    * (unhydrated second-device rows must not be pushed as deletes).
+   * In-flight: a second call joins the current run (toggle-ON and periodic
+   * must not interleave).
    */
   async sweep(): Promise<void> {
+    if (this.sweepRun) return this.sweepRun;
+    const run = this.runSweep().finally(() => {
+      if (this.sweepRun === run) this.sweepRun = null;
+    });
+    this.sweepRun = run;
+    return run;
+  }
+
+  private async runSweep(): Promise<void> {
+    await this.deps.downloader.whenIdle();
     const enabled = this.deps.enabled();
     if (!enabled.settings && !enabled.styles) return;
-    const present = await listObsidianCategoryFiles(this.deps.list, enabled);
+    let present: string[];
+    try {
+      present = await listObsidianCategoryFiles(this.deps.list, enabled);
+    } catch (e) {
+      warn('obsidian.sweep.list-failed', e);
+      return;
+    }
     const presentSet = new Set(present);
 
     for (const path of present) {
       const st = await this.deps.stat(path);
       if (!st) continue;
       const entry = this.deps.index.get(path);
-      if (
-        !entry
-        || entry.skipped
-        || entry.size !== st.size
-        || (entry.mtime != null && st.mtime != null && entry.mtime !== st.mtime)
-      ) {
+      // Cap-parked rows stay parked until a raw event or toggle-ON.
+      if (entry?.skipped) continue;
+      if (!entry || await this.contentChanged(path, entry, st)) {
         this.deps.onFileChanged(path);
       }
     }
@@ -180,6 +202,26 @@ export class ObsidianSync {
       if (entry.hydrated && !entry.skipped) {
         await this.deps.onFileDeleted(path);
       }
+    }
+  }
+
+  /**
+   * Size mismatch always counts. When both mtimes exist, compare them.
+   * Legacy rows (or stats) without mtime re-read ≤2 MiB and compare blake3.
+   */
+  private async contentChanged(
+    path: string,
+    entry: BlobIndexEntry,
+    st: { size: number; mtime?: number },
+  ): Promise<boolean> {
+    if (entry.size !== st.size) return true;
+    if (entry.mtime != null && st.mtime != null) return entry.mtime !== st.mtime;
+    if (st.size > OBSIDIAN_CAP) return false;
+    try {
+      const bytes = new Uint8Array(await this.deps.readBinary(path));
+      return blake3_hex(bytes) !== entry.hash;
+    } catch {
+      return true;
     }
   }
 
