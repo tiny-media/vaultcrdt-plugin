@@ -100,12 +100,12 @@ describe('invite redemption (S1b)', () => {
     ]);
   });
 
-  it('treats an unreachable /health as "no features" and caches within the TTL', async () => {
-    mockRequestUrl.mockRejectedValueOnce(new Error('offline'));
+  it('treats an unreachable /health as "no features" and re-probes (failures are not cached)', async () => {
+    mockRequestUrl.mockRejectedValue(new Error('offline'));
     const cache = new ServerFeatureCache();
     expect(await cache.get('https://sync.example.com')).toEqual([]);
     expect(await cache.get('https://sync.example.com')).toEqual([]);
-    expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+    expect(mockRequestUrl).toHaveBeenCalledTimes(2);
   });
 
   it('re-probes /health after the TTL expires', async () => {

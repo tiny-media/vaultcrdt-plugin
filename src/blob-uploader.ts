@@ -93,6 +93,12 @@ export class BlobUploader {
   private catchUpWork: Promise<void> | null = null;
   /** Paths whose in-flight upload should not reference after a rename/delete. */
   private superseded = new Set<string>();
+  /**
+   * Paths whose upload was skipped *solely* because blobsEnabled() was false.
+   * Without this the create event is consumed and the file only retries at the
+   * next app restart (backfill). Bounded: same contents as the queue.
+   */
+  private gateBlocked = new Set<string>();
   /** Session pause after a 413 quota_exceeded; uploads skip until this timestamp. */
   quotaExceededUntil = 0;
 
@@ -119,6 +125,19 @@ export class BlobUploader {
     this.pump();
   }
 
+  /** Re-queue every upload that was skipped by a closed blobs gate. */
+  retryGateBlocked(): void {
+    if (this.gateBlocked.size === 0) return;
+    const paths = [...this.gateBlocked];
+    this.gateBlocked.clear();
+    for (const path of paths) this.onFileChanged(path);
+  }
+
+  /** Paths currently parked on a closed blobs gate (tests / diagnostics). */
+  gateBlockedPaths(): string[] {
+    return [...this.gateBlocked];
+  }
+
   isPending(path: string): boolean {
     return this.queued.has(path);
   }
@@ -136,6 +155,7 @@ export class BlobUploader {
   async onFileRenamed(oldPath: string, newPath: string): Promise<void> {
     const wasPending = this.isPending(oldPath);
     this.dropQueued(oldPath);
+    this.gateBlocked.delete(oldPath);
     this.superseded.add(oldPath);
 
     const old = this.deps.index.get(oldPath);
@@ -200,6 +220,7 @@ export class BlobUploader {
    */
   async onFileDeleted(path: string): Promise<void> {
     this.dropQueued(path);
+    this.gateBlocked.delete(path);
     this.superseded.add(path);
     const entry = this.deps.index.get(path);
     if (!entry || !entry.hash) {
@@ -244,7 +265,10 @@ export class BlobUploader {
 
   private async upload(path: string): Promise<void> {
     if (this.superseded.delete(path)) return;
-    if (!(await this.deps.blobsEnabled())) return;
+    if (!(await this.deps.blobsEnabled())) {
+      this.gateBlocked.add(path);
+      return;
+    }
     if (this.superseded.delete(path)) return;
     const key = this.deps.index.keyFor(path);
     if (!key) return;

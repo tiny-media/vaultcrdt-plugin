@@ -49,6 +49,8 @@ export default class VaultCRDTPlugin extends Plugin {
   private activeSetup: SetupModal | null = null;
   /** Cached GET /health feature list (TTL'd), shared by every SetupModal. */
   serverFeatures = new ServerFeatureCache();
+  /** Last observed blobs-gate state; false→true re-queues gate-blocked uploads. */
+  private lastBlobsFeature = false;
   /** Attachment blob lane (design §3) — dormant unless the server has "blobs". */
   blobIndex!: BlobIndex;
   blobUploader!: BlobUploader;
@@ -183,7 +185,7 @@ export default class VaultCRDTPlugin extends Plugin {
   /** Invite modal with the server-minted one-use token (shared by command + panel). */
   openInviteModal(): void {
     const mintInvite = async (): Promise<{ invite: string; expires_at: string } | null> => {
-          const supported = (await this.serverFeatures.get(this.settings.serverUrl)).includes(FEATURE_INVITE);
+          const supported = (await this.getServerFeatures()).includes(FEATURE_INVITE);
           log('invite.mint', { supported, engineReady: this.syncEngineInitialized, vault: this.settings.vaultId });
           if (!supported) return null;
           if (!this.syncEngineInitialized) {
@@ -214,7 +216,7 @@ export default class VaultCRDTPlugin extends Plugin {
 
   /** Ribbon status panel (design §E) — the mobile-safe entry point. */
   openStatusPanel(): void {
-    void this.serverFeatures.get(this.settings.serverUrl);
+    void this.getServerFeatures();
     new StatusPanelModal(this.app, () => ({
       connected: this.connected,
       ...(this.syncEngineInitialized
@@ -490,7 +492,7 @@ export default class VaultCRDTPlugin extends Plugin {
     this.fileWatcher = new FileWatcher(this.app, this.syncEngine);
     // Wire up initial sync (auto-detect pull/push/merge)
     this.syncEngine.inbox = this.inbox;
-    this.syncEngine.getServerFeatures = () => this.serverFeatures.get(this.settings.serverUrl);
+    this.syncEngine.getServerFeatures = () => this.getServerFeatures();
     this.syncEngine.blobUploader = this.blobUploader;
     this.syncEngine.onInitialSync = (engine) => {
       void this.handleInitialSync(engine);
@@ -632,7 +634,22 @@ export default class VaultCRDTPlugin extends Plugin {
 
   private async blobsEnabled(): Promise<boolean> {
     return this.syncEngineInitialized
-      && (await this.serverFeatures.get(this.settings.serverUrl)).includes(FEATURE_BLOBS);
+      && (await this.getServerFeatures()).includes(FEATURE_BLOBS);
+  }
+
+  /**
+   * Single observed seam around the feature cache: when a probe newly reports
+   * FEATURE_BLOBS after a result (or cached state) that did not, uploads that
+   * were dropped by the closed gate are re-queued instead of waiting for the
+   * next restart's backfill.
+   */
+  private async getServerFeatures(): Promise<string[]> {
+    const features = await this.serverFeatures.get(this.settings.serverUrl);
+    const hasBlobs = features.includes(FEATURE_BLOBS);
+    const was = this.lastBlobsFeature;
+    this.lastBlobsFeature = hasBlobs;
+    if (hasBlobs && !was) this.blobUploader?.retryGateBlocked();
+    return features;
   }
 
   /**
