@@ -84,3 +84,9 @@ jobs:
             main.js
             manifest.json
             styles.css
+            wasm/vaultcrdt_wasm_bg.wasm
+          # The wasm ships as a SIBLING FILE (adapter.readBinary loads it next
+          # to main.js). A release without it is broken for BRAT/manual
+          # installs — the plugin shows the missing-wasm notice and cannot
+          # sync. Releases 0.5.3/0.5.4 shipped without it; devices only worked
+          # because they received the file via adb. Verified asset count: 4.
