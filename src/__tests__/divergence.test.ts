@@ -364,6 +364,8 @@ class MiniServer {
   readonly tombstones = new Set<string>();
   readonly tombstoneHashes = new Map<string, string>();
   readonly omitTombstoneHashUuids = new Set<string>();
+  /** Test hook: record inbound `doc_delete` then discard it (no tombstone/ack). */
+  readonly dropDocDeletes = new Set<string>();
   readonly conns = new Map<MockWebSocket, ConnState>();
   readonly inbound: Array<{ peerId: string; type: string; docUuid?: string }> = [];
   inboundOffset = 0;
@@ -555,6 +557,7 @@ class MiniServer {
       }
       case 'doc_delete': {
         const uuid = fieldString(msg.doc_uuid);
+        if (this.dropDocDeletes.delete(uuid)) return;
         const doc = this.docs.get(uuid);
         if (doc) {
           // Hash BEFORE free — doc.get_text() after free is UB.
@@ -1336,5 +1339,47 @@ describe('long-divergence (real CRDT)', () => {
     );
     expect(deletes, `unexpected doc_delete frames: ${JSON.stringify(deletes)}`).toEqual([]);
     expect(activeServer!.docs.has(path)).toBe(true);
+  }, 60_000);
+
+  it('lost in-flight delete is not replayed; file returns via server-only download', async () => {
+    const path = notePath(12);
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, seedText(12));
+    await startEngine(a);
+    await untilQuiet();
+    expect(activeServer!.docs.has(path)).toBe(true);
+
+    // Offline delete -> unacked journal (socket closed, no doc_delete emitted).
+    await a.engine.stop();
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await flushMicrotasks();
+    expect(a.engine.getDiagnosticsCounts().pendingDeletes).toBe(1);
+    expect(activeServer!.docs.has(path), 'offline delete must not reach the server').toBe(true);
+
+    // Reconnect 1: resendPendingDeletes emits doc_delete (client marks acked); drop the frame.
+    activeServer!.dropDocDeletes.add(path);
+    await startEngine(a);
+    await untilQuiet();
+    const resent = activeServer!.inbound.filter(
+      (m) => m.type === 'doc_delete' && m.docUuid === path,
+    );
+    expect(resent.length, 'resendPendingDeletes must emit one doc_delete').toBe(1);
+    expect(activeServer!.docs.has(path), 'dropped delete must leave the doc live').toBe(true);
+    expect(activeServer!.tombstones.has(path)).toBe(false);
+    expect(a.fs.has(path), 'pending delete still blocks server-only download').toBe(false);
+    expect(a.engine.getDiagnosticsCounts().pendingDeletes).toBe(1);
+
+    // Reconnect 2: request_doc_list shows LIVE; acked+live = resurrected; journal drops; file returns.
+    await a.engine.stop();
+    activeServer!.checkpoint();
+    await startEngine(a);
+    const deletes = activeServer!.mutatingSinceCheckpoint().filter(
+      (m) => m.type === 'doc_delete' && m.docUuid === path,
+    );
+    expect(deletes, `unexpected doc_delete frames: ${JSON.stringify(deletes)}`).toEqual([]);
+    expect(a.fs.has(path), 'server-only pass must restore the file').toBe(true);
+    expect(a.fs.readText(path)).toBe(seedText(12));
+    expect(a.engine.getDiagnosticsCounts().pendingDeletes).toBe(0);
   }, 60_000);
 });

@@ -14,7 +14,9 @@ import { fnv1aHash64, vvCovers } from './conflict-utils';
  * - Entries are also ADDED by markRecreateIntent() (remote delete kept locally; no doc_delete is sent).
  * - Each entry carries `acked`: true after we emitted `doc_delete` on an open
  *   socket (or saw a doc_deleted confirmation). The journal's resend list is
- *   unacked (typically offline) deletes only.
+ *   unacked (typically offline) deletes only. Acking at send is intentional:
+ *   a lost delete reappears as a restored file (user deletes again); a replay
+ *   would kill a resurrection (data loss).
  * - Entries are REMOVED by reconcilePendingDeletes() after runInitialSync
  *   observed the server's truth via request_doc_list: tombstoned (confirmed),
  *   live-again after an acked delete (peer resurrected — must not replay),
@@ -385,7 +387,11 @@ export class PushHandler {
 
   // ── Private ──────────────────────────────────────────────────────────────────
 
-  /** Emit doc_delete and mark the journal entry acked so reconnects will not replay it. */
+  /**
+   * Emit doc_delete and mark the journal entry acked so reconnects will not replay it.
+   * Intentional trade: a lost in-flight delete reappears as a restored file
+   * (the user deletes again); replaying it would kill a resurrection (data loss).
+   */
   private sendDocDelete(path: string): void {
     this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId });
     const entry = this.pendingDeletes.get(path);
