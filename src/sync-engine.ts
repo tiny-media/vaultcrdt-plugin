@@ -583,6 +583,9 @@ export class SyncEngine {
         this.promises.resolve('doc_list', {
           docs: msg.docs as DocEntry[],
           tombstones: msg.tombstones as string[],
+          tombstone_hashes: Array.isArray(msg.tombstone_hashes)
+            ? msg.tombstone_hashes as Array<{ doc_uuid: string; content_hash: string | null }>
+            : undefined,
         });
         break;
 
@@ -1213,12 +1216,13 @@ export class SyncEngine {
     this.ws.send(bytes as Uint8Array<ArrayBuffer>);
   }
 
-  async requestDocList(): Promise<{ docs: DocEntry[]; tombstones: string[] }> {
+  async requestDocList(): Promise<{ docs: DocEntry[]; tombstones: string[]; tombstone_hashes?: Array<{ doc_uuid: string; content_hash: string | null }> }> {
     this.trace.mark('ws.request-doc-list');
     this.send({ type: 'request_doc_list' });
     const result = await this.promises.waitFor<{
       docs: DocEntry[];
       tombstones: string[];
+      tombstone_hashes?: Array<{ doc_uuid: string; content_hash: string | null }>;
     }>('doc_list');
     this.trace.mark('ws.doc-list', {
       docs: result.docs.length,

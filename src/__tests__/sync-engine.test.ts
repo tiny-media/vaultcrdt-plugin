@@ -1556,6 +1556,7 @@ describe('SyncEngine', () => {
         type: 'doc_list',
         docs: [],
         tombstones: ['deleted.md'],
+        tombstone_hashes: [{ doc_uuid: 'deleted.md', content_hash: fnv1aHash64(await mockVault.read()) }],
       });
 
       await syncPromise;
@@ -1576,6 +1577,7 @@ describe('SyncEngine', () => {
         type: 'doc_list',
         docs: [],
         tombstones: ['deleted.md'],
+        tombstone_hashes: [{ doc_uuid: 'deleted.md', content_hash: fnv1aHash64(await mockVault.read()) }],
       });
       await syncPromise;
       expect(mockFileManager.trashFile).toHaveBeenCalledWith(mockFile);
@@ -1595,7 +1597,12 @@ describe('SyncEngine', () => {
 
       await flush();
 
-      fireMessage({ type: 'doc_list', docs: [], tombstones: ['gone.md'] });
+      fireMessage({
+        type: 'doc_list',
+        docs: [],
+        tombstones: ['gone.md'],
+        tombstone_hashes: [{ doc_uuid: 'gone.md', content_hash: fnv1aHash64(await mockVault.read()) }],
+      });
 
       await syncPromise;
 

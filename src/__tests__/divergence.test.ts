@@ -1,12 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { decode, encode } from '@msgpack/msgpack';
 import { TFile } from 'obsidian';
-import { afterEach, beforeAll, beforeEach, describe, expect, it, test, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FileWatcher } from '../file-watcher';
 import { isSyncablePath } from '../path-policy';
 import { PROTOCOL_VERSION } from '../protocol';
 import type { VaultCRDTSettings } from '../settings';
 import { SyncEngine } from '../sync-engine';
+import { fnv1aHash64 } from '../conflict-utils';
+import { remoteDeleteKeptNoticeMessage } from '../user-facing-copy';
 import initWasmModule, { WasmSyncDocument } from '../../wasm/vaultcrdt_wasm';
 
 /**
@@ -16,12 +18,6 @@ import initWasmModule, { WasmSyncDocument } from '../../wasm/vaultcrdt_wasm';
  * real protocol through a MiniServer of WasmSyncDocument instances. Broadcasts,
  * keep-guard, and initial-sync run on the production paths. Private methods
  * are not invoked directly.
- *
- * PRODUCT FINDING (T2): sync-initial.ts step 6 trashes locally-modified files
- * whose server docs are tombstoned. The live path (sync-engine.ts onDocDeleted)
- * keeps the file when sentUnacked / pending edits are armed. Step 6 has no
- * equivalent keep-guard. The two modified-tombstone fixture cases are
- * `it.fixme` below; they fail today because the files are trashed.
  */
 
 const PINNED_ISO = '2026-09-07T12:00:00.000Z';
@@ -366,6 +362,8 @@ class MockWebSocket {
 class MiniServer {
   readonly docs = new Map<string, WasmSyncDocument>();
   readonly tombstones = new Set<string>();
+  readonly tombstoneHashes = new Map<string, string>();
+  readonly omitTombstoneHashUuids = new Set<string>();
   readonly conns = new Map<MockWebSocket, ConnState>();
   readonly inbound: Array<{ peerId: string; type: string; docUuid?: string }> = [];
   inboundOffset = 0;
@@ -464,7 +462,15 @@ class MiniServer {
           updated_at: new Date().toISOString(),
           server_vv: vvBytes(doc),
         }));
-        this.reply(ws, { type: 'doc_list', docs, tombstones: [...this.tombstones] });
+        const tombstone_hashes: Array<{ doc_uuid: string; content_hash: string | null }> = [];
+        for (const uuid of this.tombstones) {
+          if (this.omitTombstoneHashUuids.has(uuid)) continue;
+          tombstone_hashes.push({
+            doc_uuid: uuid,
+            content_hash: this.tombstoneHashes.get(uuid) ?? null,
+          });
+        }
+        this.reply(ws, { type: 'doc_list', docs, tombstones: [...this.tombstones], tombstone_hashes });
         return;
       }
       case 'sync_start': {
@@ -506,6 +512,7 @@ class MiniServer {
         }
         doc.import_snapshot(delta);
         this.tombstones.delete(uuid);
+        this.tombstoneHashes.delete(uuid);
         this.reply(ws, { type: 'ack' });
         this.broadcast(ws, {
           type: 'delta_broadcast',
@@ -535,6 +542,7 @@ class MiniServer {
         if (!existing) this.docs.set(uuid, target);
         target.import_snapshot(snapshot);
         this.tombstones.delete(uuid);
+        this.tombstoneHashes.delete(uuid);
         this.reply(ws, { type: 'ack' });
         this.broadcast(ws, {
           type: 'delta_broadcast',
@@ -549,6 +557,8 @@ class MiniServer {
         const uuid = fieldString(msg.doc_uuid);
         const doc = this.docs.get(uuid);
         if (doc) {
+          // Hash BEFORE free — doc.get_text() after free is UB.
+          this.tombstoneHashes.set(uuid, fnv1aHash64(doc.get_text()));
           doc.free();
           this.docs.delete(uuid);
         }
@@ -1029,6 +1039,8 @@ describe('long-divergence (real CRDT)', () => {
     expect(c.fs.mdPaths().filter(isConflictCopyPath).length, 'exactly 10 conflict copies').toBe(10);
     expect(c.inbox.filter((e) => e.kind === 'conflict').length).toBe(10);
 
+    // T2 hash-equal unmodified tombstones: stateless peer C must TRASH
+    // (regression guard for over-keeping). Named here instead of duplicating.
     for (const p of tombUnmod) {
       expect(c.fs.has(p), `unmodified tombstone ${p} should be trashed`).toBe(false);
     }
@@ -1045,10 +1057,7 @@ describe('long-divergence (real CRDT)', () => {
     assertConverged(a, c, activeServer!);
   }, 120_000);
 
-  // PRODUCT FINDING: initial-sync step 6 trashes locally-modified tombstoned
-  // files. Live onDocDeleted has a keep-guard; step 6 does not.
-  // vitest 5 has no test.fixme — test.fails is the known-failing equivalent.
-  test.fails('T2 product: tombstoned file C modified before connect is kept (case 1)', async () => {
+  it('T2 product: tombstoned file C modified before connect is kept (case 1)', async () => {
     const a = createHarness('peer-A');
     a.fs.writeText(notePath(43), seedText(43));
     await startEngine(a);
@@ -1059,10 +1068,10 @@ describe('long-divergence (real CRDT)', () => {
     await untilQuiet();
     const c = createHarness('peer-C', cLocal);
     await startEngine(c);
-    expect(c.fs.has(notePath(43)), 'modified tombstone should be kept (keep-guard missing in step 6)').toBe(true);
+    expect(c.fs.has(notePath(43)), 'modified tombstone should be kept').toBe(true);
   }, 60_000);
 
-  test.fails('T2 product: tombstoned file C modified before connect is kept (case 2)', async () => {
+  it('T2 product: tombstoned file C modified before connect is kept (case 2)', async () => {
     const a = createHarness('peer-A');
     a.fs.writeText(notePath(44), seedText(44));
     await startEngine(a);
@@ -1073,7 +1082,50 @@ describe('long-divergence (real CRDT)', () => {
     await untilQuiet();
     const c = createHarness('peer-C', cLocal);
     await startEngine(c);
-    expect(c.fs.has(notePath(44)), 'modified tombstone should be kept (keep-guard missing in step 6)').toBe(true);
+    expect(c.fs.has(notePath(44)), 'modified tombstone should be kept').toBe(true);
+  }, 60_000);
+
+  it('T2: stateless peer keeps a tombstoned file when the tombstone hash is absent (old server)', async () => {
+    const path = notePath(10);
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, seedText(10));
+    await startEngine(a);
+    const cLocal = new MemoryFS();
+    cLocal.writeText(path, seedText(10));
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    activeServer!.omitTombstoneHashUuids.add(path);
+    const c = createHarness('peer-C', cLocal);
+    await startEngine(c);
+    expect(c.fs.has(path), 'hash-absent tombstone must be kept (fail-safe)').toBe(true);
+    expect(c.inbox.some((e) =>
+      e.kind === 'deleted-remote' && e.path === path && e.note === remoteDeleteKeptNoticeMessage(path),
+    )).toBe(true);
+  }, 60_000);
+
+  it('T2: pull mode keeps a modified tombstoned file without pushing doc_create', async () => {
+    const path = notePath(11);
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, seedText(11));
+    await startEngine(a);
+    const cLocal = new MemoryFS();
+    cLocal.writeText(path, `${seedText(11)}\nC_PULL_KEEP`);
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    activeServer!.checkpoint();
+    const c = createHarness('peer-C', cLocal);
+    c.engine.onInitialSync = (e) => { c.lastInitial = e.initialSync(undefined, 'pull'); };
+    await startEngine(c);
+    expect(c.fs.has(path), 'pull mode must keep the modified tombstoned file').toBe(true);
+    const creates = activeServer!.inbound
+      .slice(activeServer!.inboundOffset)
+      .filter((m) => m.type === 'doc_create' && m.peerId === 'peer-C');
+    expect(creates, 'pull mode must not push doc_create').toEqual([]);
+    expect(c.inbox.some((e) =>
+      e.kind === 'deleted-remote' && e.path === path && e.note === remoteDeleteKeptNoticeMessage(path),
+    )).toBe(true);
   }, 60_000);
 
   it('T3 — mtime chaos alone changes nothing', async () => {

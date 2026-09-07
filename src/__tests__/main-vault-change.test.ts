@@ -113,6 +113,7 @@ describe('vault delete remote-write window', () => {
     const deleted = vi.spyOn(engine, 'onFileDeleted').mockImplementation(() => {});
     Object.assign((engine as any).docs, {
       get: vi.fn(), removeAndClean: vi.fn().mockResolvedValue(undefined),
+      loadPersistedSnapshot: vi.fn().mockResolvedValue(null),
       saveVVCache: vi.fn().mockResolvedValue(undefined),
       cleanOrphans: vi.fn().mockResolvedValue(0),
       saveDeleteJournal: vi.fn().mockResolvedValue(undefined),
@@ -128,7 +129,12 @@ describe('vault delete remote-write window', () => {
     } else {
       app.vault.getMarkdownFiles = vi.fn().mockReturnValue([file]);
       app.workspace.getActiveViewOfType = vi.fn().mockReturnValue(null);
-      vi.spyOn(engine, 'requestDocList').mockResolvedValue({ docs: [], tombstones: [file.path] });
+      const mockedContent = await app.vault.read(file);
+      vi.spyOn(engine, 'requestDocList').mockResolvedValue({
+        docs: [],
+        tombstones: [file.path],
+        tombstone_hashes: [{ doc_uuid: file.path, content_hash: fnv1aHash64(mockedContent) }],
+      });
       await engine.initialSync();
     }
     expect(app.fileManager.trashFile).toHaveBeenCalledExactlyOnceWith(file);

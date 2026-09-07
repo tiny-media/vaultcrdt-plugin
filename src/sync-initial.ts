@@ -7,7 +7,7 @@ import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn } from './logger';
 import { isSyncablePath, pathCaseKey } from './path-policy';
-import { conflictNoticeMessage, failedDocsNoticeMessage, remoteDeleteTrashedNoticeMessage } from './user-facing-copy';
+import { conflictNoticeMessage, failedDocsNoticeMessage, remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage } from './user-facing-copy';
 import type { InboxSink } from './inbox';
 
 export type SyncMode = 'pull' | 'push' | 'merge';
@@ -87,7 +87,7 @@ export interface InitialSyncDeps {
   peerId: string;
   ws: WebSocket | null;
   send: (msg: object) => void;
-  requestDocList: () => Promise<{ docs: DocEntry[]; tombstones: string[] }>;
+  requestDocList: () => Promise<{ docs: DocEntry[]; tombstones: string[]; tombstone_hashes?: Array<{ doc_uuid: string; content_hash: string | null }> }>;
   requestSyncStart: (
     docUuid: string,
     clientVV: string | null,
@@ -144,7 +144,7 @@ export async function runInitialSync(
   push.resendPendingDeletes(recreatePathSet);
 
   let tPhase = performance.now();
-  const { docs: serverDocs, tombstones } = await deps.requestDocList();
+  const { docs: serverDocs, tombstones, tombstone_hashes } = await deps.requestDocList();
   const docListMs = performance.now() - tPhase;
   const tombstoneSet = new Set(tombstones);
   const localPathSet = new Set(localFileMap.keys());
@@ -567,7 +567,12 @@ export async function runInitialSync(
   // 5. Offline deletes were already flushed above, before any downloads.
 
   // 6. Tombstones — trash local files (skip if server also has the doc — create-after-delete)
+  // Keep-guard (T2): do not trash when local edits cannot be proven clean.
   tPhase = performance.now();
+  const tombstoneHashByUuid = new Map<string, string | null>();
+  for (const entry of tombstone_hashes ?? []) {
+    tombstoneHashByUuid.set(entry.doc_uuid, entry.content_hash);
+  }
   for (const uuid of tombstoneSet) {
     if (serverDocMap.has(uuid)) continue;
     // U37 keep-promise: paths the recreate pass (step 3) just re-uploaded via
@@ -578,13 +583,56 @@ export async function runInitialSync(
     if (activeServerPathCaseKeys.has(pathCaseKey(uuid))) continue;
     if (!isSyncablePath(uuid)) continue;
     const f = app.vault.getAbstractFileByPath(uuid);
-    if (f instanceof TFile) {
+    if (!(f instanceof TFile)) continue;
+
+    let keep = false;
+    if (push.hasPendingEdits(uuid) || push.hasUnackedEdit(uuid)) {
+      keep = true;
+    } else {
+      // Deviation 2: content proof reads DISK content via
+      // readEffectiveLocalContent (same helper as steps 3/4), not just an
+      // open editor — stronger than the live guard.
+      const localContent = await readEffectiveLocalContent(app, editor, f);
+      const persisted = await docs.loadPersistedSnapshot(uuid);
+      if (persisted !== null) {
+        const doc = await docs.getOrLoad(uuid);
+        keep = !doc.text_matches(localContent);
+      } else {
+        const remoteHash = tombstoneHashByUuid.get(uuid);
+        if (remoteHash == null) {
+          // Fail-safe (T2): old server omits tombstone_hashes; pre-migration
+          // tombstones send content_hash NULL. Stateless peers cannot prove
+          // unmodified, so KEEP. Deviation 1: the live guard trashes when
+          // doc is undefined; initial sync after divergence over-keeps.
+          keep = true;
+        } else {
+          keep = fnv1aHash64(localContent) !== remoteHash;
+        }
+      }
+    }
+
+    if (keep) {
+      if (mode !== 'pull') {
+        const content = await readEffectiveLocalContent(app, editor, f);
+        contentHashes.set(uuid, fnv1aHash64(content));
+        const doc = await docs.getOrLoad(uuid);
+        doc.sync_from_disk(content);
+        push.pushDocCreate(uuid, doc, { replaceTombstone: true });
+        await docs.persist(uuid);
+        clearDirty(uuid);
+      }
+      deps.inbox?.add({
+        kind: 'deleted-remote', path: uuid, note: remoteDeleteKeptNoticeMessage(uuid),
+      });
+    } else {
       // ACCEPTED LIMITATION: the entry lives until the next restart — inbox
       // reconciliation sweeps entries whose file no longer exists, and after a
       // trash the file is gone, so the sweep is correct; the session in which
       // the surprise happened is what needs the entry.
       deletingFromRemote.add(uuid);
       try {
+        await docs.removeAndClean(uuid);
+        lastServerVV.delete(uuid);
         await app.fileManager.trashFile(f);
         deps.inbox?.add({
           kind: 'deleted-remote', path: uuid, note: remoteDeleteTrashedNoticeMessage(uuid),
