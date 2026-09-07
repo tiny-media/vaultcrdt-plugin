@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-09-08
+
+### Fixed
+- The attachment blob lane can no longer die silently for a whole
+  session while note sync keeps working: the `/health` feature probe is
+  bounded (10 s; a single hung request used to stall every upload
+  attempt forever), a failed probe no longer caches an empty feature
+  list as authoritative for the full TTL, and uploads skipped while the
+  blobs gate was closed are parked and re-queued as soon as the feature
+  arrives — instead of waiting for the next app restart.
+
 ## [0.5.7] - 2026-09-07
 
 ### Fixed
