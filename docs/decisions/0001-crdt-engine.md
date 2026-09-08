@@ -35,8 +35,10 @@ is managed by [src/document-manager.ts](../../src/document-manager.ts).
   [Cargo.lock](../../Cargo.lock). Their soundness and maintenance advisories
   have no fixed upstream version as of 2026-09-08, per the dependency triage in
   [the security review](../security-review-2026-09-08.md).
-  Acceptance is limited to the family beta, with re-review before store release,
-  at every Loro release, and no later than 2026-12-08.
+  Status: PROVISIONAL acceptance (recommended 2026-09-08, delegated
+  review) — Richard's explicit confirmation and the risk-register
+  entries are pending; conditions: re-review before store release, at
+  every Loro release, and no later than 2026-12-08.
 - Loro upgrades must stay in lockstep with the server and repeat convergence,
   snapshot compatibility, WASM freshness and bundle-size checks.
 

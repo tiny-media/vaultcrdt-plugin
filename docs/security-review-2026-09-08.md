@@ -1,5 +1,13 @@
 # Security review 2026-09-08 — findings
 
+> Reading note (added 2026-09-08 evening): this file grew chronologically
+> — original review first, then session appendices (S1 triage, S2 flows,
+> S3 dependencies, S4 slices, F2 result, CodeQL adjudication, direction
+> decisions, deploy record). Later sections SUPERSEDE earlier drafts:
+> the "S5 disposition matrix and release plan (DRAFT)" was executed and
+> its releases shipped the same day. Crew provenance in this file is
+> historical evidence and stays; it is not a living record.
+
 Hostile pre-submission security review of vaultcrdt-plugin and
 vaultcrdt-server, executed 2026-09-08 against an identity-scrubbed snapshot of
 both repositories (scrubbing removed owner metadata only; all source content

@@ -11,8 +11,13 @@ maintainer's global setup live in the untracked `AGENTS.override.md`.
   verification; untracked, ≤60 lines, rewritten not appended). Without
   local files, the public docs are the entry: `docs/architecture.md`,
   `docs/development.md`, `docs/decisions/`.
-- History is append-only in `dev/log.md` (one entry per session, run ids
-  as evidence). Frozen history lives in `dev/archive/` (read-only).
+- Only `dev/next.md` carries current priorities and releases. One log
+  entry per session, ≤15 lines, changes + evidence links instead of
+  repeated state. Log, archive and working files are not required
+  reading for continuation.
+- History is append-only in `dev/log.md`; frozen history in
+  `dev/archive/` (read-only); active working material in `dev/work/`
+  (each file states purpose and completion condition).
 - Exit = distill: rewrite `dev/next.md`, append one `dev/log.md` entry,
   and update the durable doc that owns any fact that changed (write
   from the code, not from session notes).
@@ -37,7 +42,9 @@ maintainer's global setup live in the untracked `AGENTS.override.md`.
 ## Working model
 
 - The executing session commits itself, after checks exit 0 and a diff
-  review. Worker runs never commit.
+  review. A slice GO covers that slice's implementation and its
+  commits; push, tag, release, deploy and dependency changes always
+  need their own GO. Worker runs never commit.
 - No push/tag/release/deploy without the maintainer's explicit release; no
   irreversible git operations on tracked files — freeze to `dev/archive/`
   instead.

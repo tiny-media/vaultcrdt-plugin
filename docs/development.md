@@ -17,38 +17,19 @@ bun run build
 
 Use `bun run test`, not `bun test`: it invokes `vitest run`.
 
-[CI](../.github/workflows/ci.yml) runs on main pushes and pull requests,
-with `RUSTFLAGS: -D warnings`. Its exact shell invocations, in order, are:
+[CI](../.github/workflows/ci.yml) runs on main pushes and pull requests
+and chains roughly: locked wasm-bindgen install → `bun install
+--frozen-lockfile` → plugin tests → Rust workspace tests → wasm build →
+wasm freshness check → tsc → build → a 2 MiB bundle-size gate on
+`main.js`. The EXACT commands, versions and their order live in the
+workflow file and change with it — copy from there, not from memory or
+from this page. Two durable facts: the 2 MiB limit is a repository
+regression gate (catches accidental loss of gzip embedding; not an
+Obsidian store limit), and `bun run build` alone enforces neither the
+size gate nor WASM freshness.
 
-```sh
-cargo install wasm-bindgen-cli --version 0.2.128 --locked
-bun install --frozen-lockfile
-bun run test
-cargo test --workspace
-bun run wasm
-bun run wasm:check
-bunx tsc --noEmit
-bun run build
-SIZE=$(stat --format=%s main.js)
-LIMIT=2097152
-echo "main.js size: $SIZE bytes"
-if [ "$SIZE" -gt "$LIMIT" ]; then
-  echo "::error::main.js exceeds 2 MiB ($SIZE bytes) — is the wasm still gzip-embedded?"
-  exit 1
-fi
-```
-
-The size command uses GNU `stat`, as on CI's Ubuntu 24.04 runner.
-The 2 MiB limit is a repository regression gate, not an Obsidian store limit.
-It catches accidental loss of gzip embedding. `bun run build` alone does
-not enforce this gate or check WASM freshness.
-
-CI selects `dtolnay/rust-toolchain@1.98.1` with `wasm32-unknown-unknown`;
-its step label still says “Install Rust 1.94”. Use the action configuration,
-not that label, when comparing CI environments.
-The workspace declares Rust 1.94 as its minimum in [Cargo.toml](../Cargo.toml).
-
-Rust tests cover all three crates. Additional local hygiene checks are:
+The workspace declares its Rust minimum in [Cargo.toml](../Cargo.toml);
+the CI toolchain pin lives in the workflow. Local hygiene checks:
 
 ```sh
 cargo test --workspace
@@ -56,9 +37,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Clippy and fmt are **not invoked by the current CI workflow**; these are
-local checks, not invented CI parity commands. Lint is run by the
-[release workflow](../.github/workflows/release.yml), but not `ci.yml`.
+Whether clippy/fmt/lint run in CI vs. only locally vs. only in the
+release workflow is workflow state — check the workflow files; do not
+rely on this page for it.
 
 ### Rust → WASM → plugin
 
@@ -200,3 +181,10 @@ measurement; mark unimplemented decisions explicitly. Who or what produced
 a measurement belongs in its session record, not in durable documentation.
 Keep unresolved evidence gaps as review hooks rather than upgrading them to
 verified facts. Standing architecture choices live in [decisions/](decisions/).
+
+Doc ownership: `docs/architecture.md` and the ADRs own technical
+contracts; the named risk register (once it exists) owns risk decisions;
+`dev/next.md` owns current work; dated reviews are historical evidence,
+not growing session logs. Their existing crew provenance is a historical
+exception and stays; new crew/provider/deployment details go to session
+records only.

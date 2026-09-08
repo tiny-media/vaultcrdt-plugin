@@ -1,6 +1,7 @@
 # Plugin architecture
 
-This document describes the plugin at **0.5.11** (`manifest.json:version`).
+This document describes the plugin at the current released version
+(`manifest.json:version`; last source-checked 2026-09-08).
 Anchors use `file:symbol`; server details belong to the [server architecture](https://github.com/tiny-media/vaultcrdt-server/blob/main/docs/ARCHITECTURE.md).
 
 ## What the plugin is
