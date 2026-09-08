@@ -655,3 +655,49 @@ auth), F2 real-Obsidian probe, device-level validation of F1 (one
 manual offline-edit scenario on any desktop device would upgrade the
 evidence), N5/N6 budget slices, N1 semantics decision, OS-level
 filesystem aliasing questions (marked UNKNOWN, no known trigger).
+
+---
+
+# Session appendix 2026-09-08 (security session) — F2 result (Richard opened the throwaway vault 2026-09-08 ~15:54)
+
+**Obsidian's real `vault.create`/`createBinary` does NOT reject traversal
+paths — files were written OUTSIDE the vault.** Probe evidence
+(desktop, throwaway vault, self-disabling probe plugin; raw result was at
+`vcrdt-t-f2-vault/_results/f2-probe-result.json`, probe + vault + the
+escaped marker files were cleaned up afterwards; obsidian.json restored
+from backup):
+
+- `normalizePath('..\..\evil.md')` → `'../../evil.md'` (backslash
+  conversion confirmed — exactly finding #2's mechanism).
+- `vault.create('../escape-f2.md', …)`, `vault.create('..\..\evil.md')`,
+  `vault.create('sub/../../escape2-f2.md')`,
+  `vault.createBinary('../escape3-f2.md')` — ALL returned success
+  (`ok:true`; returned TFile is null) and `fs.existsSync` confirmed the
+  files landed at `…/obsidianTest/escape*.md`, i.e. one level ABOVE the
+  vault root.
+
+Consequences:
+
+1. Finding #2's plugin-side fix (`0f3b78e`, on main, in 0.5.11) is now
+   established as the ONLY defense for the note lane — there is no native
+   Obsidian safety net behind it. The fix itself holds (gate rejects the
+   backslash payload before any write).
+2. Open Question 1 of the original review is answered: writing outside
+   the vault via `vault.create` WORKS on desktop (Obsidian 1.x,
+   appVersion 6b15b73…). "Passing the plugin gate is established,
+   writing outside is not" — now it is.
+3. N10 (ungated `doc_tombstoned` rename to a remote-named TFile) and
+   N11 (conflict-copy sinks without re-validation) are no longer
+   theoretical hardening gaps: any remote input reaching those sinks can
+   now be assumed to write/rename outside the vault on desktop. Their
+   DEFERRED disposition stands only with this elevated rationale;
+   pulling N10 into the current release is recommended to Richard
+   (small slice: gate the rename through the path policy + correlate
+   with a pending push).
+4. Evidence kind: direct test reproduction on the real application
+   (desktop macOS), synthetic content, throwaway vault. EVIDENZART:
+   Testreproduktion am echten Obsidian-Desktop.
+
+(One probe artifact noted: `obsidianVersion` came back null — the
+appVersion field is not exposed the way the probe assumed; the hash
+6b15b73d12694dada2ed1418d3ed507b was captured instead.)
