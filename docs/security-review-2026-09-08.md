@@ -691,9 +691,10 @@ Consequences:
    theoretical hardening gaps: any remote input reaching those sinks can
    now be assumed to write/rename outside the vault on desktop. Their
    DEFERRED disposition stands only with this elevated rationale;
-   pulling N10 into the current release is recommended to Richard
-   (small slice: gate the rename through the path policy + correlate
-   with a pending push).
+   N10 is the TOP backlog item for 0.5.12 (small slice: gate the
+   rename through the path policy + correlate with a pending push) —
+   it did not make 0.5.11/v0.4.4, which shipped before this
+   recommendation could be acted on.
 4. Evidence kind: direct test reproduction on the real application
    (desktop macOS), synthetic content, throwaway vault. EVIDENZART:
    Testreproduktion am echten Obsidian-Desktop.
