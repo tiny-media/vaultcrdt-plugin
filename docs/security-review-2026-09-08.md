@@ -764,3 +764,55 @@ targeted lock cleanup (S ≤0.5 d, no incidental upgrades).
 - Server v0.4.4 tagged `v0.4.4` and pushed (`c7332ba..ea7e35a`); CI/
   Security/Docker running. The tunnel deployment (studio build → load →
   fleet) awaits a separate deploy GO.
+
+---
+
+# Session appendix 2026-09-08 (security session) — CodeML alert adjudication (after gh auth) + deploy record
+
+## CodeQL/Scorecard alerts (read 2026-09-08 after authentication)
+
+Server (18× `rust/path-injection` high, all in `src/blobs.rs`): the flagged
+sinks are the path joins in `tmp_file_path` (blobs.rs:206, `blob_dir/tmp/
+<upload_id>` — upload_id is a SERVER-generated UUID; PUT/GET look the row
+up by (vault_id, upload_id) before any path use) and `blob_file_path`
+(blobs.rs:202, `blob_dir/<vault_id>/<hash[..2]>/<hash>` — vault_id is
+registration-validated `[a-z0-9_-]` ≤ 64 B; hash values come from
+digest-verified rows — finalize verifies blake3(bytes) == hash_claimed
+before anything is stored or re-served, and GET looks up the (vault_id,
+hash) row first). One older alert shows state "fixed". Adjudication:
+**accepted as covered** — the layered validation (registration regex,
+server-generated ids, digest-verified hex hashes, segment/length/allowlist
+checks on display paths from this session's caps) is invisible to CodeQL's
+taint model; S2 flows c+d specifically reviewed these flows and found no
+traversal. Re-check: re-adjudicate after any change to blobs.rs path
+construction.
+
+Plugin (`js/log-injection` medium, `src/logger.ts:40`): console.warn with
+dynamic text — the issue ring is capped (50 entries × 300 units), secrets
+are redacted, and the sink is the devtools console (log forging at worst).
+Server-side counterpart (N19 length caps) shipped in v0.4.4. **Accepted
+(low)**.
+
+Scorecard metadata alerts (Maintained, CodeReview, DependencyUpdateTool,
+Vulnerabilities, Fuzzing, PinnedDependencies, CII): repo-maturity flags on
+the public repo. Pinned-dependency findings point at the security.yml
+actions (version-pinned, not hash-pinned). **Accepted for the family
+beta**; revisit before store submission (hash-pinning the few actions is
+an S).
+
+Workflow fix shipped: the OpenSSF scorecard job failed on every TAG push
+by design ("only default branch is supported", publish_results: true);
+b0c76e7 restricts it to main pushes + schedule. The server repo has no
+scorecard job (nothing to fix).
+
+## Deploy record (under Richard's deploy GO)
+
+studio-build fresh (byte-identical, 43 files) → OrbStack headless start on
+studio → docker build ARM64 (image `af57646cc4fb`, tar sha256
+`29ca6dc6…`) → tunnel docker load → Forgejo push (digest
+`sha256:af57646c…`) → fleet compose bump `e9d0aab3` → `FLEET_ACTOR=
+vaultcrdt-plugin just deploy tunnel vaultcrdt` OK (5 steps, 0 warnings, 0
+blockers, planId `sha256:b4af850d…`) → ledger `2b6371f9` pushed →
+`/health` = version 0.4.4, fresh server_epoch, features unchanged. Fleet
+repo 0 ahead of origin at session end; only a foreign session's canon
+journal files remain locally uncommitted (not this session's).
