@@ -18,6 +18,8 @@ const SEGMENT_BYTES = 4 * 1024 * 1024;
 
 export interface BlobDownloaderDeps {
   index: BlobIndex;
+  /** Admitted hydrateOne operations, through local processing/write completion. */
+  onActiveCountChange?(count: number): void;
   serverUrl(): string;
   getJwt(): Promise<string>;
   blobsEnabled(): Promise<boolean>;
@@ -176,12 +178,21 @@ export class BlobDownloader {
     return null;
   }
 
+  private publishActiveCount(): void {
+    try {
+      this.deps.onActiveCountChange?.(this.inflight.size);
+    } catch {
+      // UI observers must not prevent downloads or reject a hydration pass.
+    }
+  }
+
   async hydrateOne(path: string): Promise<void> {
     if (this.inflight.has(path)) return;
     const entry = this.deps.index.get(path);
     if (!entry || entry.hydrated || entry.skipped || !entry.hash) return;
     this.inflight.add(path);
     try {
+      this.publishActiveCount();
       const bytes = await this.download(entry.hash, path, entry.size);
       if (!bytes) return;
       const remoteHash = blake3_hex(bytes);
@@ -235,6 +246,7 @@ export class BlobDownloader {
       error('blob.hydrate failed:', path, e);
     } finally {
       this.inflight.delete(path);
+      this.publishActiveCount();
     }
   }
 

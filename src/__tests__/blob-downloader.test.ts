@@ -112,6 +112,8 @@ function makePair(opts: {
   /** Dynamic toggles (mid-flight flips); overrides `enabled` when given. */
   categoryEnabled?: () => { settings: boolean; styles: boolean };
   hydrateActiveFile?: () => void;
+  onActiveCountChange?: (count: number) => void;
+  blobsEnabled?: () => Promise<boolean>;
 } = {}) {
   const enabledNow = () =>
     opts.categoryEnabled?.() ?? opts.enabled ?? { settings: false, styles: false };
@@ -122,7 +124,8 @@ function makePair(opts: {
     index,
     serverUrl: () => 'https://s.example.com',
     getJwt: async () => 'jwt-1',
-    blobsEnabled: async () => true,
+    blobsEnabled: opts.blobsEnabled ?? (async () => true),
+    onActiveCountChange: opts.onActiveCountChange,
     exists: vault.exists,
     mkdir: vault.mkdir,
     writeBinary: (p, data) => vault.writeBinary(p, data),
@@ -814,4 +817,107 @@ describe('receiver-side SVG sanitize (#6)', () => {
     await downloader.hydratePending();
     expect(vault.files.get(PATH)).toEqual(RAW_SVG);
   });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+describe('admitted hydration activity', () => {
+  it.each(['start', 'completion'])('keeps the full download pool running when the activity observer throws on %s', async phase => {
+    const counts: number[] = [];
+    let previous = 0;
+    const { index, downloader, vault } = makePair({
+      onActiveCountChange: count => {
+        const starting = count > previous;
+        previous = count;
+        counts.push(count);
+        if (starting === (phase === 'start')) throw new Error('synthetic UI observer failure');
+      },
+    });
+    const paths = [PATH, OTHER, 'vcrdt-t-third.png'];
+    for (const path of paths) index.update(path, { hash: blake3_hex(BYTES), size: BYTES.length, hydrated: false });
+    mockRequestUrl.mockImplementation(async (opts: Call) => serveRange(BYTES, opts));
+    await expect(downloader.hydratePending()).resolves.toBeUndefined();
+    expect(counts).toHaveLength(6);
+    expect(Math.max(...counts)).toBe(2);
+    expect(counts.at(-1)).toBe(0);
+    for (const path of paths) {
+      expect(vault.files.get(path)).toEqual(BYTES);
+      expect(index.get(path)?.hydrated).toBe(true);
+    }
+    expect(blobGets()).toHaveLength(6);
+  });
+
+  it('counts overlapping operations, not range requests, through local write completion', async () => {
+    const counts: number[] = [];
+    const { index, downloader, vault } = makePair({ onActiveCountChange: n => counts.push(n) });
+    for (const path of [PATH, OTHER]) index.update(path, { hash: blake3_hex(BYTES), size: BYTES.length, hydrated: false });
+    const network = deferred<void>();
+    const write = deferred<void>();
+    mockRequestUrl.mockImplementation(async (opts: Call) => { await network.promise; return serveRange(BYTES, opts); });
+    const originalWrite = vault.writeBinary;
+    vi.spyOn(vault, 'writeBinary').mockImplementation(async (p, b) => { await write.promise; await originalWrite(p, b); });
+    const a = downloader.hydrateOne(PATH);
+    const b = downloader.hydrateOne(OTHER);
+    await downloader.hydrateOne(PATH); // duplicate must not flash
+    expect(counts).toEqual([1, 2]);
+    network.resolve();
+    await vi.waitFor(() => expect(vault.writeBinary).toHaveBeenCalledTimes(2));
+    expect(blobGets()).toHaveLength(4);
+    expect(counts).toEqual([1, 2]);
+    write.resolve();
+    await Promise.all([a, b]);
+    expect(counts).toEqual([1, 2, 1, 0]);
+  });
+
+  it('does not publish for existing pre-operation guards or queued mobile attachments', async () => {
+    const changed = vi.fn();
+    const { index, downloader } = makePair({ isMobile: true, onActiveCountChange: changed });
+    index.update(PATH, { hash: blake3_hex(BYTES), size: BYTES.length, hydrated: false });
+    index.update(OTHER, { hash: blake3_hex(BYTES), size: BYTES.length, hydrated: true });
+    index.update('skipped.png', { hash: blake3_hex(BYTES), skipped: true, hydrated: false });
+    index.update('hashless.png', { hash: '', hydrated: false });
+    for (const path of ['missing.png', OTHER, 'skipped.png', 'hashless.png']) await downloader.hydrateOne(path);
+    await downloader.hydratePending();
+    const disabled = makePair({
+      isMobile: true, onActiveCountChange: changed, blobsEnabled: async () => false,
+      cache: { embeds: [{ link: PATH }] }, enabled: { settings: true, styles: false },
+    });
+    for (const path of [PATH, '.obsidian/app.json']) {
+      disabled.index.update(path, { hash: blake3_hex(BYTES), size: BYTES.length, hydrated: false });
+    }
+    await disabled.downloader.hydratePending();
+    await disabled.downloader.hydrateForOpenFile(Object.assign(new TFile(), { path: 'note.md' }));
+    expect(changed).not.toHaveBeenCalled();
+    expect(blobGets()).toHaveLength(0);
+  });
+
+  it.each(['success', 'configuration success', 'request failure', 'write failure', 'hash mismatch', 'size rejection', 'category rejection'])(
+    'balances admitted activity on %s (direct hydration has no feature gate)', async outcome => {
+      const counts: number[] = [];
+      const pair = makePair({
+        onActiveCountChange: n => counts.push(n), blobsEnabled: async () => false,
+        enabled: { settings: outcome === 'configuration success', styles: false },
+      });
+      const path = outcome === 'category rejection' || outcome === 'configuration success' ? '.obsidian/app.json' : PATH;
+      pair.index.update(path, { hash: blake3_hex(BYTES), size: BYTES.length, hydrated: false });
+      const response = deferred<ReturnType<typeof serveRange>>();
+      mockRequestUrl.mockImplementation(() => response.promise);
+      if (outcome === 'write failure') vi.spyOn(pair.vault, 'writeBinary').mockRejectedValue(new Error('synthetic write failure'));
+      const run = pair.downloader.hydrateOne(path);
+      expect(counts).toEqual([1]);
+      if (outcome === 'request failure') response.reject(new Error('synthetic request failure'));
+      else {
+        const bytes = outcome === 'hash mismatch' ? REMOTE : outcome === 'size rejection' ? BYTES.slice(1) : BYTES;
+        response.resolve({ status: 200, arrayBuffer: bytes.slice().buffer, headers: { 'Content-Range': '' }, json: {} });
+      }
+      await run;
+      expect(counts).toEqual([1, 0]);
+      expect(pair.index.get(path)?.hydrated).toBe(outcome === 'success' || outcome === 'configuration success');
+    },
+  );
 });

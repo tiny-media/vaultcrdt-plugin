@@ -15,6 +15,15 @@
   top: 0.05em;
 }
 
+.vcrdt-download-activity {
+  margin-inline-start: 0.5em;
+  padding: 0 0.4em;
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
 /* Setup modal error line */
 .vcrdt-setup-error {
   color: var(--text-error);

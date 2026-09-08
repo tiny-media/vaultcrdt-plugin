@@ -116,6 +116,8 @@ bar (desktop) and the status panel.
 
 Use **Open status panel** and **Open conflict inbox** from the command palette on any device, including phones without a status bar. For conflict copies, deletions and restore situations, follow the [recovery runbook](recovery-runbook.md).
 
+**Downloads: N** counts files currently being downloaded or processed locally, including enabled settings/styles files. It updates live in the status panel; the desktop status-bar chip appears only while the count is positive and the status indicator is enabled. This is separate from connection state and inbox count. It is not an upload count or a pending-file total: zero does not mean everything is synced, particularly with mobile's on-demand attachment downloads.
+
 ## Keeping VaultCRDT up to date
 
 BRAT checks for updates automatically. To check manually, use **Settings → BRAT → Check for updates**. The plugin and server must use compatible protocols; a mismatch prevents connection rather than attempting sync.

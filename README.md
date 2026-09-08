@@ -8,11 +8,17 @@ It also syncs supported images (including SVG, sanitised on the originating devi
 
 **Limits:**
 
-- No end-to-end encryption yet: the server sees note text. This is a trusted-operator model; use HTTPS for encryption in transit.
+- No end-to-end encryption yet: the server can read synced content and metadata. This is a trusted-operator model; use HTTPS for encryption in transit.
 - No hosting service is provided and there is no public cloud service; run the server or ask someone you trust to run it.
 - Attachments above 10 MiB for images/PDFs or 25 MiB for audio stay local. Unsupported file types, such as Canvas and `.txt`, do not sync.
 - Obsidian settings outside the exact allowlist do not sync; plugin settings, plugin secrets and workspace state are excluded.
 - Mobile sync runs while Obsidian is in the foreground; background sync is not guaranteed. Do not run another sync service on the same vault.
+
+## Network and privacy
+
+The plugin contacts your configured server for health checks, authentication, invites, note sync over WebSocket, attachment/configuration transfers, and device or diagnostic-statistics queries. Requests carry authentication credentials as needed, vault and peer identifiers, and the device name. Sync transmits note paths and CRDT content, supported attachment bytes, and enabled settings/styles files, with path, hash, size, version and deletion metadata.
+
+There is no end-to-end encryption: trust the server operator with this content and metadata. Use HTTPS/WSS; transport encryption does not hide data from the server. The documentation button opens this project's GitHub page. BRAT installation and update traffic is handled separately by BRAT.
 
 ## Install
 

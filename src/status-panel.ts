@@ -15,6 +15,11 @@ export interface StatusPanelData {
   clientProtocolVersion: number;
 }
 
+export interface DownloadActivity {
+  current(): number;
+  subscribe(listener: (count: number) => void): () => void;
+}
+
 export interface StatusPanelActions {
   syncNow(): void;
   invite(): void;
@@ -28,10 +33,14 @@ export interface StatusPanelActions {
  * the only always-reachable surface for connection state and the inbox.
  */
 export class StatusPanelModal extends Modal {
+  private downloadRow: HTMLElement | null = null;
+  private unsubscribeDownloads: (() => void) | null = null;
+
   constructor(
     app: App,
     private data: () => StatusPanelData,
     private actions: StatusPanelActions,
+    private downloads: DownloadActivity,
     private now: () => number = () => Date.now(),
   ) { super(app); }
 
@@ -51,6 +60,14 @@ export class StatusPanelModal extends Modal {
     const line = (label: string, value: string): void => {
       lines.createDiv({ text: `${label}: ${value}`, cls: 'vcrdt-panel-line' });
     };
+    this.downloadRow = lines.createDiv({ cls: 'vcrdt-panel-line vcrdt-panel-downloads' });
+    this.downloadRow.setAttribute('role', 'status');
+    this.downloadRow.setAttribute('aria-live', 'polite');
+    const renderDownloads = (count: number): void => {
+      if (this.downloadRow) this.downloadRow.textContent = `Downloads: ${count}`;
+    };
+    this.unsubscribeDownloads = this.downloads.subscribe(renderDownloads);
+    renderDownloads(this.downloads.current());
     const t = this.now();
     line(PANEL_COPY.lastActivity, relativeTimeText(d.lastActivityAt, t));
     line(PANEL_COPY.lastSync, relativeTimeText(d.lastInitialSyncAt, t));
@@ -76,5 +93,10 @@ export class StatusPanelModal extends Modal {
     button(PANEL_COPY.settings, () => this.actions.openSettings());
   }
 
-  onClose(): void { this.contentEl.empty(); }
+  onClose(): void {
+    this.unsubscribeDownloads?.();
+    this.unsubscribeDownloads = null;
+    this.downloadRow = null;
+    this.contentEl.empty();
+  }
 }

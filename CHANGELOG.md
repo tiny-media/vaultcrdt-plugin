@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.12] - 2026-09-08
+
+### Added
+- **Download activity**: a desktop status-bar chip and live status-panel
+  count show files being downloaded or processed locally, including enabled
+  settings/styles files. This is separate from connection status and does
+  not claim that all files are synced.
+
+### Docs
+- Explain network traffic and server visibility in README, and distinguish
+  active downloads from queued mobile attachments in the installation guide.
+
 ### Security
 - **Tombstone-refusal path checks**: `doc_tombstoned`
   frames are admitted only for syncable note paths, and the derived

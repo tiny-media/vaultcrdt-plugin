@@ -39,6 +39,8 @@ export default class VaultCRDTPlugin extends Plugin {
   private ribbonEl: HTMLElement | null = null;
   private ribbonBadgeEl: HTMLElement | null = null;
   private connected = false;
+  private activeDownloads = 0;
+  private readonly downloadListeners = new Set<(count: number) => void>();
   /** Quiet-mode inbox (design §E) — persisted in state/inbox.json, not settings. */
   inbox!: Inbox;
   private activityTimer: number | null = null;
@@ -102,6 +104,14 @@ export default class VaultCRDTPlugin extends Plugin {
     });
     this.blobDownloader = new BlobDownloader({
       index: this.blobIndex,
+      onActiveCountChange: (count) => {
+        if (this.hydrationDestroyed) return;
+        this.activeDownloads = count;
+        try { this.renderStatusBar(); } catch { /* UI failure must not stop hydration or panel updates. */ }
+        for (const listener of this.downloadListeners) {
+          try { listener(count); } catch { /* Isolate each panel observer. */ }
+        }
+      },
       serverUrl: () => this.settings.serverUrl,
       getJwt: () => this.syncEngine.getJwt(),
       blobsEnabled: () => this.blobsEnabled(),
@@ -238,6 +248,12 @@ export default class VaultCRDTPlugin extends Plugin {
           .setting.open();
         (this.app as unknown as { setting: { openTabById(id: string): void } })
           .setting.openTabById(this.manifest.id);
+      },
+    }, {
+      current: () => this.activeDownloads,
+      subscribe: (listener) => {
+        if (!this.hydrationDestroyed) this.downloadListeners.add(listener);
+        return () => { this.downloadListeners.delete(listener); };
       },
     }).open();
   }
@@ -782,13 +798,21 @@ export default class VaultCRDTPlugin extends Plugin {
   private setStatusBarConnected(connected: boolean): void {
     this.connected = connected;
     this.refreshInboxIndicators();
+    this.renderStatusBar();
+  }
+
+  private renderStatusBar(): void {
+    const connected = this.connected;
     if (!this.statusBarEl) return;
     this.statusBarEl.empty();
     this.statusBarEl.appendText('sync\u2002');
     this.statusBarEl.createSpan({ text: connected ? '●' : '○', cls: 'vcrdt-status-dot' });
     const inboxCount = this.inbox?.count() ?? 0;
     if (inboxCount > 0) this.statusBarEl.appendText(`\u00b7${inboxCount}`);
-    this.statusBarEl.setAttribute('aria-label', connected ? 'VaultCRDT: connected' : 'VaultCRDT: not connected');
+    const downloads = this.activeDownloads > 0 ? `Downloads: ${this.activeDownloads}` : '';
+    if (downloads) this.statusBarEl.createSpan({ text: downloads, cls: 'vcrdt-download-activity' });
+    const connectionLabel = connected ? 'VaultCRDT: connected' : 'VaultCRDT: not connected';
+    this.statusBarEl.setAttribute('aria-label', downloads ? `${connectionLabel}; ${downloads}` : connectionLabel);
     this.statusBarEl.addClass('vcrdt-status-bar');
     this.statusBarEl.toggleClass('vcrdt-status-connected', connected);
   }
@@ -910,6 +934,9 @@ export default class VaultCRDTPlugin extends Plugin {
   }
 
   private async shutdown(): Promise<void> {
+    // Stop activity publication and detach open panels synchronously, not downloads.
+    this.hydrationDestroyed = true;
+    this.downloadListeners.clear();
     this.clearActivityTimer();
     if (this.hydrateTimer !== null) {
       clearTimeout(this.hydrateTimer);
@@ -918,7 +945,6 @@ export default class VaultCRDTPlugin extends Plugin {
     // Invalidate any callback that already left the timer queue, and bar any
     // late catchUp tail from arming a NEW timer after teardown.
     this.hydrateGeneration += 1;
-    this.hydrationDestroyed = true;
     // note: pending deletes are not flushed on unload; startup reconciles.
     this.pendingDeleteChecks.clear();
     // Wait for pending initialization before stopping

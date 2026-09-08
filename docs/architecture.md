@@ -1,8 +1,8 @@
 # Plugin architecture
 
 This document describes the current plugin source (last source-checked
-2026-09-08). `manifest.json:version` is still 0.5.11; the tombstone-refusal
-path checks described below are unreleased.
+2026-09-08), not the version installed on a device. See the [changelog](../CHANGELOG.md)
+for versioned changes.
 Anchors use `file:symbol`; server details belong to the [server architecture](https://github.com/tiny-media/vaultcrdt-server/blob/main/docs/ARCHITECTURE.md).
 
 ## What the plugin is
@@ -36,6 +36,12 @@ through the adapter. Desktop hydration is eager, smallest first, with two
 workers; mobile attachments are selected from open-note links with one worker.
 Category files hydrate eagerly on both. `hydrated` becomes true only after
 successful writing; the echo baseline is installed before the write.
+Its inflight count covers admitted downloads through local processing/write
+completion, including category files, not queued work or individual HTTP requests.
+`publishActiveCount` isolates observer exceptions from hydration. The plugin
+renders this count independently of connection state; `StatusPanelModal`
+subscribes while open and updates only its download row. Shutdown suppresses
+publication before awaiting teardown; it does not cancel ongoing downloads.
 
 **BlobIndex — `src/blob-index.ts:BlobIndex`.** Maps raw vault paths to canonical keys, hashes, sizes, generations, sequence
 numbers, hydration/skipped flags and remote hash baselines. New updates and

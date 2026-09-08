@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 
+const { download } = vi.hoisted(() => ({ download: { publish: undefined as undefined | ((n: number) => void) } }));
+vi.mock('../blob-downloader', () => ({
+  BlobDownloader: class {
+    constructor(deps: { onActiveCountChange?: (n: number) => void }) { download.publish = deps.onActiveCountChange; }
+  },
+}));
 const notices: string[] = [];
 vi.mock('obsidian', async () => {
   const actual = await vi.importActual<Record<string, unknown>>('../__mocks__/obsidian');
@@ -74,6 +80,112 @@ describe('status bar badge gating', () => {
   });
 });
 
+interface UiNode {
+  textContent: string;
+  children: UiNode[];
+  className: string;
+  attrs: Record<string, string>;
+}
+function nodes(el: UiNode): UiNode[] { return [el, ...el.children.flatMap(nodes)]; }
+
+async function loadActivityUi(show: boolean) {
+  const { plugin, statusBarEl } = makePlugin(show);
+  Object.assign(plugin.app.vault, { on: vi.fn(), getFiles: () => [] });
+  Object.assign(plugin.app.workspace, { on: vi.fn(), onLayoutReady: vi.fn() });
+  Object.assign(plugin.app, { metadataCache: { on: vi.fn() } });
+  vi.spyOn(plugin, 'loadSettings').mockResolvedValue();
+  vi.spyOn(plugin as unknown as { getServerFeatures(): Promise<string[]> }, 'getServerFeatures').mockResolvedValue([]);
+  await plugin.onload();
+  vi.spyOn(plugin.inbox, 'count').mockReturnValue(2);
+  const opened: StatusPanelModal[] = [];
+  const spy = vi.spyOn(StatusPanelModal.prototype, 'open').mockImplementation(function (this: StatusPanelModal) {
+    opened.push(this);
+    this.onOpen();
+  });
+  return { plugin, statusBarEl, opened, spy };
+}
+
+describe('download activity UI wiring', () => {
+  it('isolates a broken status bar and panel listener from other activity observers', async () => {
+    const { plugin, opened, spy } = await loadActivityUi(true);
+    const internals = plugin as unknown as {
+      renderStatusBar(): void;
+      downloadListeners: Set<(count: number) => void>;
+    };
+    const bar = vi.spyOn(internals, 'renderStatusBar').mockImplementation(() => {
+      throw new Error('synthetic status bar failure');
+    });
+    internals.downloadListeners.add(() => { throw new Error('synthetic panel failure'); });
+    try {
+      plugin.openStatusPanel();
+      const root = opened[0].contentEl as unknown as UiNode;
+      expect(() => download.publish!(2)).not.toThrow();
+      expect(elementText(root)).toContain('Downloads: 2');
+      expect(() => download.publish!(0)).not.toThrow();
+      expect(elementText(root)).toContain('Downloads: 0');
+    } finally {
+      opened[0]?.close();
+      bar.mockRestore();
+      spy.mockRestore();
+      plugin.onunload();
+    }
+  });
+
+  it.each([true, false])('shows live activity independently of connection and quiet mode (status=%s)', async show => {
+    const { plugin, statusBarEl, opened, spy } = await loadActivityUi(show);
+    try {
+      expect(download.publish).toBeTypeOf('function');
+      expect(statusBarEl.text).not.toContain('Downloads');
+      download.publish!(2);
+      plugin.openStatusPanel();
+      const modal = opened[0];
+      const root = modal.contentEl as unknown as UiNode;
+      const row = nodes(root).find(n => n.className.includes('vcrdt-panel-downloads'))!;
+      expect(row.textContent).toBe('Downloads: 2');
+      expect(row.attrs['role']).toBe('status');
+      expect(elementText(root)).toContain(PANEL_COPY.offline);
+      const actions = nodes(root).filter(n => n.className.includes('vcrdt-panel-action'));
+      expect(actions).toHaveLength(5);
+      if (show) {
+        expect(statusBarEl.text).toContain('Downloads: 2');
+        expect(statusBarEl.text).toContain('\u00b72'); // inbox remains independent
+        expect(statusBarEl.attrs['aria-label']).toContain('not connected');
+        expect(statusBarEl.attrs['aria-label']).toContain('Downloads: 2');
+      } else expect(statusBarEl.text).toBe('');
+      download.publish!(1);
+      expect(row.textContent).toBe('Downloads: 1');
+      nodes(root).filter(n => n.className.includes('vcrdt-panel-action'))
+        .forEach((action, i) => expect(action).toBe(actions[i]));
+      expect(nodes(root)).toContain(row);
+      download.publish!(0);
+      expect(row.textContent).toBe('Downloads: 0');
+      expect(statusBarEl.text).not.toContain('Downloads');
+      expect(elementText(root)).not.toMatch(/fully synced|up to date/i);
+      modal.close();
+      download.publish!(3);
+      expect(row.textContent).toBe('Downloads: 0');
+      expect(root.children).toHaveLength(0);
+      modal.open();
+      expect(elementText(root)).toContain('Downloads: 3');
+      // Stop publication before an asynchronous shutdown wait settles.
+      let finish!: () => void;
+      Object.assign(plugin, { pendingSyncEngineInit: new Promise<void>(resolve => { finish = resolve; }) });
+      plugin.onunload();
+      const before = elementText(root);
+      const barBefore = statusBarEl.text;
+      download.publish!(0);
+      expect(elementText(root)).toBe(before);
+      expect(statusBarEl.text).toBe(barBefore);
+      finish();
+      await Promise.resolve();
+      download.publish!(1);
+      expect(elementText(root)).toBe(before);
+      expect(statusBarEl.text).toBe(barBefore);
+      modal.close();
+    } finally { spy.mockRestore(); }
+  });
+});
+
 describe('notice policy', () => {
   it('keeps sync progress + complete notices during the first onboarding sync', async () => {
     notices.length = 0;
@@ -116,13 +228,15 @@ describe('notice policy', () => {
 describe('status panel', () => {
   it('renders connection, counts and actions from injected data', () => {
     const now = 2_000_000;
+    const unsubscribe = vi.fn();
+    const subscribe = vi.fn((_listener: (count: number) => void) => unsubscribe);
     const modal = new StatusPanelModal(new App(), () => ({
       connected: true, lastActivityAt: now - 30_000, lastInitialSyncAt: now - 3_600_000,
       sentUnacked: 3, inboxCount: 2, serverProtocolVersion: 1, clientProtocolVersion: 1,
     }), {
       syncNow: () => {}, invite: () => {}, openInbox: () => {},
       exportDiagnostics: () => {}, openSettings: () => {},
-    }, () => now);
+    }, { current: () => 0, subscribe }, () => now);
     modal.open();
     const text = elementText(modal.contentEl as unknown as { textContent: string; children: unknown[] });
     expect(text).toContain(PANEL_COPY.connected);
@@ -131,6 +245,14 @@ describe('status panel', () => {
     expect(text).toContain('30s ago');
     expect(text).toContain('1h ago');
     expect(text).toContain('protocol OK');
+    expect(subscribe).toHaveBeenCalledOnce();
+    const root = modal.contentEl as unknown as UiNode;
+    const row = nodes(root).find(n => n.className.includes('vcrdt-panel-downloads'))!;
+    modal.close();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    subscribe.mock.calls[0][0](9); // retained callback must not touch the discarded element
+    expect(row.textContent).toBe('Downloads: 0');
+    expect(root.children).toHaveLength(0);
   });
 
   it('shows the inbox entries and an empty state', async () => {
