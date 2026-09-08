@@ -70,8 +70,6 @@ export default class VaultCRDTPlugin extends Plugin {
     const setupHandler = (params: Record<string, string>) => {
       void this.handleSetupLink(params).catch(() => new Notice(SETUP_COPY.failed, 8000));
     };
-    this.registerObsidianProtocolHandler('vaultcrdt/setup', setupHandler);
-    this.registerObsidianProtocolHandler('vaultcrdt-setup', setupHandler);
     this.inbox = new Inbox({
       storage: new StateStorage(this.app),
       fileExists: (path) => !!this.app.vault.getAbstractFileByPath(path),
@@ -79,7 +77,14 @@ export default class VaultCRDTPlugin extends Plugin {
     });
     await this.inbox.load();
     this.blobIndex = new BlobIndex(new StateStorage(this.app));
-    await this.blobIndex.load();
+    await this.blobIndex.load(async () => {
+      try {
+        await initWasm();
+      } catch (err) {
+        new Notice(WASM_INIT_FAILED_NOTICE, 0);
+        throw err;
+      }
+    });
     this.blobUploader = new BlobUploader({
       index: this.blobIndex,
       serverUrl: () => this.settings.serverUrl,
@@ -139,6 +144,8 @@ export default class VaultCRDTPlugin extends Plugin {
       onFileChanged: (path) => this.blobUploader.onFileChanged(path),
       onFileDeleted: (path) => this.blobUploader.onFileDeleted(path),
     });
+    this.registerObsidianProtocolHandler('vaultcrdt/setup', setupHandler);
+    this.registerObsidianProtocolHandler('vaultcrdt-setup', setupHandler);
     this.refreshInboxIndicators();
     // Obsidian prefixes this with the manifest id, yielding vaultcrdt:invite-device.
     this.addCommand({ id: 'invite-device', name: SETUP_COPY.command,

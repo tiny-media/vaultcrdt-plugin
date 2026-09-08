@@ -41,12 +41,26 @@ export interface BlobIndexStorage {
 
 export const BLOB_INDEX_FILE = 'blob-index.json';
 
-function parse(raw: unknown): BlobIndexFile {
-  const file = raw as Partial<BlobIndexFile> | null;
-  const empty: BlobIndexFile = { v: 1, maxSeq: 0, paths: {} };
-  if (!file || file.v !== 1 || !file.paths || typeof file.paths !== 'object') return empty;
-  for (const [path, e] of Object.entries(file.paths)) {
-    if (!e || typeof e.key !== 'string' || typeof e.hash !== 'string') continue;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isCandidate(value: unknown): value is Record<string, unknown> & { key: string; hash: string } {
+  return isRecord(value) && typeof value.key === 'string' && typeof value.hash === 'string';
+}
+
+async function parse(raw: unknown, ready: () => Promise<void>): Promise<BlobIndexFile> {
+  const empty: BlobIndexFile = { v: 1, maxSeq: 0, paths: Object.create(null) as Record<string, BlobIndexEntry> };
+  if (!isRecord(raw) || raw.v !== 1 || !isRecord(raw.paths)) return empty;
+  const candidates = Object.entries(raw.paths).filter(
+    (entry): entry is [string, Record<string, unknown> & { key: string; hash: string }] => isCandidate(entry[1]),
+  );
+  // Readiness errors must abort the load, not masquerade as rejected paths.
+  // Candidate-free startup retains lazy WASM initialization.
+  if (candidates.length) await ready();
+  for (const [path, e] of candidates) {
+    const key = blob_path_key(path);
+    if (!key || key !== e.key) continue;
     empty.paths[path] = {
       key: e.key,
       hash: e.hash,
@@ -61,18 +75,20 @@ function parse(raw: unknown): BlobIndexFile {
       ...(typeof e.mtime === 'number' ? { mtime: e.mtime } : {}),
     };
   }
-  empty.maxSeq = typeof file.maxSeq === 'number' ? file.maxSeq : 0;
+  empty.maxSeq = typeof raw.maxSeq === 'number' ? raw.maxSeq : 0;
   return empty;
 }
 
 export class BlobIndex {
-  private file: BlobIndexFile = { v: 1, maxSeq: 0, paths: {} };
+  private file: BlobIndexFile = { v: 1, maxSeq: 0, paths: Object.create(null) as Record<string, BlobIndexEntry> };
   private writes: Promise<void> = Promise.resolve();
 
   constructor(private storage: BlobIndexStorage) {}
 
-  async load(): Promise<void> {
-    this.file = parse(await this.storage.loadJson<BlobIndexFile>(BLOB_INDEX_FILE));
+  /** Read once; publish only after canonical validation. Never persists on read. */
+  async load(ready: () => Promise<void>): Promise<void> {
+    const raw = await this.storage.loadJson<unknown>(BLOB_INDEX_FILE);
+    this.file = await parse(raw, ready);
   }
 
   /** Canonical key, or null when the path is not a syncable attachment. */

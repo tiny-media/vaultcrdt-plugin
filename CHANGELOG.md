@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.13] - 2026-09-08
+
+### Security
+- **Persisted blob-index admission**: await WASM readiness for candidate entries
+  and validate raw paths and stored canonical-key bindings under the existing
+  path policy before exposing loaded entries to blob consumers. Invalid entries
+  are omitted while valid raw spelling and metadata are preserved; loading does
+  not rewrite storage or recompute catch-up cursors.
+
+### Fixed
+- **Startup ordering**: register both setup protocol handlers after successful
+  blob-index loading and blob-consumer construction. Candidate-free startup
+  keeps lazy WASM initialization. Readiness failure shows the existing WASM
+  failure notice and aborts startup without replacing the index or writing
+  storage; explicit load retry reads fresh state.
+
 ## [0.5.12] - 2026-09-08
 
 ### Added

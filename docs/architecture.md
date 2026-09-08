@@ -15,9 +15,14 @@ Entry point: `src/main.ts:VaultCRDTPlugin`.
 ## Components
 
 **Plugin wiring — `src/main.ts:onload`, `buildAndWireSyncEngine`.** Loads settings, inbox and blob index, registers editor/vault events, and
-initialises WASM and the note engine after layout readiness. Device identity
-exists before engine construction. Blob catch-up and attachment backfill
-follow initial note sync; file-open and metadata-cache events trigger mobile
+initialises the note engine after layout readiness. A persisted blob index with
+candidate entries first awaits `initWasm` during load, before blob-consumer
+construction and before either setup protocol handler or editor/vault events
+are registered. Both setup handler names and their behavior are unchanged;
+they register after blob consumers and before commands/events. Candidate-free
+startup retains lazy WASM initialization. Later engine initialization reuses
+completed WASM initialization. Device identity exists before engine construction.
+Blob catch-up and attachment backfill follow initial note sync; file-open and metadata-cache events trigger mobile
 hydration. Shutdown stops the note engine and cancels hydration timers.
 
 **SyncEngine — `src/sync-engine.ts:SyncEngine`.** Owns WebSocket authentication, reconnect/backoff, heartbeat, request waiters,
@@ -45,8 +50,27 @@ publication before awaiting teardown; it does not cancel ongoing downloads.
 
 **BlobIndex — `src/blob-index.ts:BlobIndex`.** Maps raw vault paths to canonical keys, hashes, sizes, generations, sequence
 numbers, hydration/skipped flags and remote hash baselines. New updates and
-moves require a WASM path key. JSON writes are serialised; loading validates
-basic field types but does not re-run canonical path validation.
+moves require a WASM path key. JSON writes are serialised. `load(ready)` reads
+stored JSON once and requires an explicit asynchronous readiness callback.
+For a v1 object with an object (not array) path map, own entries that are
+non-array objects with string key/hash fields are candidates. A nonempty
+candidate set awaits readiness before any canonical export call or admission;
+absent, malformed or candidate-free data needs neither readiness nor exports.
+Admission requires the existing WASM `blob_path_key(rawPath)` to accept the
+path and equal the stored key. Invalid paths and mismatched bindings are
+omitted without logging raw data; unrelated valid entries retain raw spelling,
+including Unicode. Index maps have no prototype-derived entries.
+
+Loading never writes repairs or migrates storage, and preserves existing
+metadata defaults, empty hashes, skipped/unhydrated states and `maxSeq`
+semantics (no cursor recomputation). Readiness failure propagates without
+replacing the prior in-memory index or writing storage; `main.ts:onload` shows
+the existing WASM failure notice and aborts before consumers/registrations.
+An explicit retry reads storage anew; there is no automatic retry loop.
+Synthetic coverage: `blob-index-load.test.ts` uses real WASM initialization
+and downloader/filesystem mocks; `blob-index-readiness.test.ts` and
+`main-blob-index-startup.test.ts` use deferred readiness/export spies to pin
+cold-start ordering. These are not native protocol-dispatch or device tests.
 
 **EditorIntegration — `src/editor-integration.ts:EditorIntegration`.** Reads open Markdown editor buffers before relying on disk. Applies Loro text
 diffs as editor transactions, converting codepoint offsets to UTF-16;
@@ -205,9 +229,13 @@ lowercasing, whereas canonical keys use full Unicode folding
 
 These are not universal sink guards: `handleDocTombstoned` now checks source
 and destination note policy but still lacks pending-operation correlation.
-Other conflict-copy destinations are not revalidated, and persisted blob-index
-paths are not recanonicalised on load (`src/sync-engine.ts:handleDocTombstoned`,
-`src/conflict-utils.ts:conflictPath`, `src/blob-index.ts:parse`).
+Other conflict-copy destinations are not revalidated
+(`src/sync-engine.ts:handleDocTombstoned`, `src/conflict-utils.ts:conflictPath`).
+Persisted blob-index paths are recanonicalised at load admission
+(`src/blob-index.ts:parse`), not via universal consumer sink guards. This uses
+the existing policy unchanged, including accepted drive-colon forms; it is not
+a new platform-specific path policy or universal filesystem-safety guarantee.
+Genuinely empty-index pre-WASM event behavior remains outside this load gate.
 
 ## Storage and state
 
