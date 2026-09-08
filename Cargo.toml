@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 edition = "2024"
 rust-version = "1.94"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 # Size-optimized release builds — the WASM artifact ships inside the plugin,
 # so binary size matters more than peak throughput (ersetzt .cargo/config.toml).
