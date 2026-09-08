@@ -586,3 +586,72 @@ newly registered vaults, so the vault must be opened once by hand from
 the vault switcher. Result lands in
 vcrdt-t-f2-vault/_results/f2-probe-result.json. obsidian.json was
 backed up before registration (backup-f2 beside it).
+
+---
+
+# Session appendix 2026-09-08 (security session) — S5 disposition matrix + release plan (DRAFT, pending Richard's gate decisions)
+
+Evidence codes: FIXED-THIS-SESSION (slice evidence above) · FIXED-PRE-SESSION (commit cited, tests on main) · DEFERRED (open, decision needed) · REJECTED (disproven/inert/documented-design) · PENDING (blocked on external step). Evidence kind is stated: code-path proof ≠ test reproduction; a negative test does not automatically disprove.
+
+| Finding | Status | Evidence | Residual uncertainty |
+| --- | --- | --- | --- |
+| #1 offline edit lost | FIXED-THIS-SESSION (a025824) | flipped pin test + 632-test suite (test reproduction, synthetic) | device-level run not repeated (CI tests are the gate); conflict copy on very long paths untested |
+| #2 backslash path gate | FIXED-PRE-SESSION (0f3b78e) + F2 PENDING | red test on main (path-policy) | real-Obsidian vault.create behaviour = F2 probe, needs one manual vault open |
+| #3 empty secrets | FIXED-PRE-SESSION (d315afc) | unit tests on main | none known |
+| #4 upload admission race | REJECTED-as-high (bounded, documented at blobs.rs:369) | code-path proof | aggregate-quota recheck at finalization = backlog |
+| #5 doc_uuid unbounded | FIXED-THIS-SESSION (e657244) | cap tests via process_message (test reproduction) | none |
+| #6 SVG receiver-side | FIXED-THIS-SESSION (cb893e3) | wasm-real sanitize tests | Obsidian's actual SVG embedding stays ASSUMED (img-inert) |
+| #7 protocol gate | FIXED-THIS-SESSION (cb893e3) | gate tests incl. cross-server cache | no proactive retry after mismatch→match (accepted, commented) |
+| #8 Content-Range allocation | FIXED-THIS-SESSION (cb893e3) | cap tests on all three body paths | one oversized response still buffers in transport before the cap (allocation/write prevented) |
+| #9 abandoned uploads | FIXED-THIS-SESSION (e657244) | sweeper test, two vaults + survivor | failure rows retry hourly (log noise) |
+| #10 casefold asymmetry | REJECTED (inert; no software remap — flow d traced) | code-path proof | filesystem aliasing UNKNOWN-but-no-known-FS-folds (U+017F) |
+| #11 doc_list amplification | REJECTED (core disproven) / superseded by N5 | code-path proof (db.rs:313-316) | N5 carries the real risk |
+| #12 peers block GC | REJECTED (documented keep-guard design, db.rs:611-614) | code-path proof | none |
+| #13 appearance.json | FIXED-THIS-SESSION (doc line, f065a77) | doc | code split (own category) = backlog |
+| #14 msgpack decode | FIXED-THIS-SESSION (cb893e3) | red→green test | none |
+| N1 retirement semantics | **DEFERRED — Richard decision** | two independent flow reviews (a+b) | full fix = device binding design slice |
+| N2 device_auth TOCTOU | narrowed FIXED (e657244) | helper unit tests + 3-line wiring (code read) | residual race open until N1; call order not test-proven |
+| N3 keys not revocable without peer row | DEFERRED | flow review (static) | — |
+| N4 invite inventory quota | DEFERRED | flow review (static) | — |
+| N5 documents/VV unquota'd | **DEFERRED — Richard risk decision** | flow c (static, high confidence) | — |
+| N6 no cumulative receive budget | **DEFERRED — Richard risk decision** | flow c/d (static) | #8 fix removes the single-request vector; many-small-files vector open |
+| N7 catch-up pagination loss | DEFERRED | flow c (static) | — |
+| N8 413 permanent park | DEFERRED | flow c (static) | — |
+| N9 key/display/size unbound | DEFERRED | flow c+d (static) | — |
+| N10 ungated tombstone rename | DEFERRED | flow d (static) | — |
+| N11 conflict-copy not no-clobber | DEFERRED | flow d (static) | — |
+| N12 control-char policy | DEFERRED (backlog) | flow d | — |
+| N13 diagnostics path leak | DEFERRED | flow d (static) | — |
+| N14 index not re-validated on load | DEFERRED | flow d/e (static) | — |
+| N15-N17 toggle transitions | FIXED-THIS-SESSION (f065a77) | 12-test suite incl. stash-based 11-red/1-green | rename-resume path tested indirectly |
+| N18 peer_id collision 500 | REJECTED-for-release (noted) | flow b | — |
+| N19 log metadata caps | FIXED-THIS-SESSION (e657244, bundled with #5) | cap tests | — |
+| RustSec rsa | accept PROPOSED | crate-source proof (HS256-only, alg pinning) | expiry: next jsonwebtoken release or 2026-12-08 |
+| RustSec im-family | accept PROPOSED | lockfile+tree proof, loro 1.16.0 newest | expiry: next loro release or 2026-12-08 |
+| atomic-polyfill | stale lock entry | cargo tree --target all "nothing to print" | optional lock regen (GO) |
+| CodeQL alerts | PENDING gh auth | API 401 measured | 5-min re-adjudication after auth |
+
+## Release proposal (draft — needs Richard's GO; tags NOT pushed by this session)
+
+- **Plugin 0.5.11** (tag `0.5.11`, NO v-prefix — store rule): F1 + F3a +
+  F3c + #13 doc + this review doc. Version bumps: manifest.json,
+  package.json, versions.json; CHANGELOG entry. CI parity: local gates
+  green (632 tests/lint/tsc/build); CI additionally runs Rust/wasm gates
+  (no Cargo/wasm file changed by the slices).
+- **Server v0.4.4** (tag `v0.4.4`, WITH v-prefix): F3b. Version bump in
+  Cargo.toml (+lock). Deploy chain per reentry (studio build → tunnel →
+  fleet, FLEET_ACTOR=vaultcrdt-plugin, ledger commit+push) under a
+  separate deploy GO.
+- **Not in these releases, explicitly:** N5, N6 (needs Richard's risk
+  decision: hold the release or accept for the friends/family beta),
+  N3/N4/N7-N14 (backlog slices), N1 (design decision), F2 result
+  (pending the manual vault open).
+
+## Remaining gaps, named
+
+This review is source-anchored static analysis plus synthetic tests; it
+claims neither completeness nor "secure". Open: CodeQL tab contents (gh
+auth), F2 real-Obsidian probe, device-level validation of F1 (one
+manual offline-edit scenario on any desktop device would upgrade the
+evidence), N5/N6 budget slices, N1 semantics decision, OS-level
+filesystem aliasing questions (marked UNKNOWN, no known trigger).
