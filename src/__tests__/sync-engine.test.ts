@@ -988,6 +988,77 @@ describe('SyncEngine', () => {
       expect(mockVault.read).not.toHaveBeenCalled();
     });
 
+    // Security review 2026-09-08, finding 1 (docs/security-review-2026-09-08.md).
+    // An edit made while Obsidian was CLOSED (external editor, git, Syncthing)
+    // produces no vault event, so nothing marks the doc dirty; the clean-skip
+    // branch never reads disk text, and a later peer delta reaches
+    // writeToVault, which compares disk only for EQUALITY and otherwise
+    // overwrites — losing the offline edit without a conflict copy, contrary
+    // to the README promise that offline edits merge. it.fails pins the bug:
+    // flip to it() when the broadcast path preserves differing disk text
+    // (writeServerText-style) instead of burying it.
+    it.fails('offline edit made while the plugin was down survives a later remote delta', async () => {
+      const tfile = Object.create(TFile.prototype);
+      tfile.path = 'offline.md';
+      mockVault.getMarkdownFiles.mockReturnValue([tfile]);
+      // Disk holds an edit written while the plugin was NOT running — no
+      // vault event ever fired for it (that is the whole scenario).
+      mockVault.read.mockResolvedValue('offline edit v2');
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'offline.md' ? tfile : null);
+
+      const expectedHash = fnv1aHash64('steady state');
+      mockAdapter.exists.mockResolvedValue(true);
+      mockAdapter.read.mockResolvedValue(JSON.stringify({
+        _version: 5,
+        'offline.md': { vv: '{"peer1":10}', contentHash: expectedHash },
+      }));
+      mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
+
+      await engine.start();
+      const syncPromise = engine.initialSync();
+      await flush();
+      fireMessage({
+        type: 'doc_list',
+        docs: [{ doc_uuid: 'offline.md', updated_at: '2026-03-16T00:00:00Z', server_vv: new TextEncoder().encode('{"peer1":10}') }],
+        tombstones: [],
+      });
+      await syncPromise;
+      // Positive control: the clean-skip branch really ran — initial sync
+      // completed without reading the file from disk (the trace report only
+      // lists paths with observed vault events, and this scenario produces
+      // none by design). Snapshot the read count BEFORE the broadcast.
+      const readsAfterSync = mockVault.read.mock.calls.length;
+      expect(readsAfterSync).toBe(0);
+
+      // A peer edits the note later; the delta arrives after initial sync.
+      mockDocInstance.get_text.mockReturnValue('remote text v2');
+      mockDocInstance.import_and_diff.mockReturnValue('[]');
+      mockDocInstance.export_vv_json.mockReturnValue('{"peer1":10,"peer2":5}');
+      mockDocInstance.text_matches.mockImplementation((c: string) => c === 'remote text v2');
+      const internal = engine as any;
+      const modify = mockVault.modify.mockClear();
+      const create = mockVault.create.mockClear();
+      await internal.onDeltaBroadcast({
+        doc_uuid: 'offline.md',
+        delta: new Uint8Array(8),
+        peer_id: 'peer2',
+        server_vv: new TextEncoder().encode('{"peer1":10,"peer2":5}'),
+      });
+      await flush();
+
+      // DESIRED: the offline edit survives in the file, or a discoverable
+      // conflict copy is created. TODAY (bug): vault.modify overwrites the
+      // file with the remote text and no conflict copy appears.
+      const overwritten = modify.mock.calls.some(
+        (c: unknown[]) => c[1] === 'remote text v2' && c[0] === tfile,
+      );
+      const conflicted = create.mock.calls.some(
+        (c: unknown[]) => typeof c[0] === 'string' && c[0].includes('offline') && c[0] !== 'offline.md',
+      );
+      expect(overwritten && !conflicted).toBe(false);
+    });
+
     it('rejects a legacy v4 (32-bit hash) cache → full re-sync on next start', async () => {
       const { textFiles } = installVirtualStateStore();
       const tfile = Object.create(TFile.prototype);
