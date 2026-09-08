@@ -997,7 +997,7 @@ describe('SyncEngine', () => {
     // to the README promise that offline edits merge. it.fails pins the bug:
     // flip to it() when the broadcast path preserves differing disk text
     // (writeServerText-style) instead of burying it.
-    it.fails('offline edit made while the plugin was down survives a later remote delta', async () => {
+    it('offline edit made while the plugin was down survives a later remote delta', async () => {
       const tfile = Object.create(TFile.prototype);
       tfile.path = 'offline.md';
       mockVault.getMarkdownFiles.mockReturnValue([tfile]);
@@ -1057,6 +1057,87 @@ describe('SyncEngine', () => {
         (c: unknown[]) => typeof c[0] === 'string' && c[0].includes('offline') && c[0] !== 'offline.md',
       );
       expect(overwritten && !conflicted).toBe(false);
+    });
+
+    // Detail assertions for the preservation contract above (the pin alone
+    // only proves "something happened").
+    describe('broadcast preserves unseen disk text', () => {
+      const setupBroadcast = async (diskText: string) => {
+        const tfile = Object.create(TFile.prototype);
+        tfile.path = 'unseen.md';
+        // Path-aware: conflictPath() loops over candidate names and would
+        // spin forever against a mock returning a TFile for EVERY path.
+        mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+          p === 'unseen.md' ? tfile : null);
+        mockVault.read.mockResolvedValue(diskText);
+
+        await engine.start();
+
+        // textBefore (pre-import) = 'known text', post-import = remote text.
+        let text = 'known text';
+        mockDocInstance.get_text.mockImplementation(() => text);
+        mockDocInstance.import_and_diff.mockImplementation(() => {
+          text = 'remote text v2';
+          return '[]';
+        });
+        mockDocInstance.export_vv_json.mockReturnValue('{"peer1":10,"peer2":5}');
+        mockDocInstance.text_matches.mockImplementation((c: string) => c === text);
+
+        const inbox = { add: vi.fn() };
+        (engine as any).inbox = inbox;
+        const modify = mockVault.modify.mockClear();
+        const create = mockVault.create.mockClear();
+
+        await (engine as any).onDeltaBroadcast({
+          doc_uuid: 'unseen.md',
+          delta: new Uint8Array(8),
+          peer_id: 'peer2',
+          server_vv: new TextEncoder().encode('{"peer1":10,"peer2":5}'),
+        });
+        await flush();
+        return { tfile, modify, create, inbox };
+      };
+
+      it('copies the exact disk bytes to a conflictPath copy before overwriting', async () => {
+        const { tfile, modify, create, inbox } = await setupBroadcast('offline edit v2');
+
+        const conflictCall = create.mock.calls.find(
+          (c: unknown[]) => typeof c[0] === 'string' && c[0].includes('(conflict'),
+        );
+        expect(conflictCall).toBeDefined();
+        // Exact preserved bytes.
+        expect(conflictCall![1]).toBe('offline edit v2');
+        // Real conflictPath pattern: `<base> (conflict YYYY-MM-DD)<ext>`.
+        const date = new Date().toISOString().slice(0, 10);
+        expect(conflictCall![0]).toBe(`unseen (conflict ${date}).md`);
+        // Conflict copy is created BEFORE the destructive overwrite.
+        expect(create.mock.invocationCallOrder[0])
+          .toBeLessThan(modify.mock.invocationCallOrder[0]);
+        // The original path still receives the remote text.
+        expect(modify).toHaveBeenCalledWith(tfile, 'remote text v2');
+        // Inbox entry, same shape as initial sync.
+        expect(inbox.add).toHaveBeenCalledWith(expect.objectContaining({
+          kind: 'conflict',
+          path: `unseen (conflict ${date}).md`,
+          relatedPath: 'unseen.md',
+        }));
+      });
+
+      it('preserves whitespace-only disk text too (unlike initial sync)', async () => {
+        const { create } = await setupBroadcast('   \n  ');
+        const conflictCall = create.mock.calls.find(
+          (c: unknown[]) => typeof c[0] === 'string' && c[0].includes('(conflict'),
+        );
+        expect(conflictCall).toBeDefined();
+        expect(conflictCall![1]).toBe('   \n  ');
+      });
+
+      it('ordinary update (disk == pre-import text) creates no conflict copy', async () => {
+        const { tfile, modify, create, inbox } = await setupBroadcast('known text');
+        expect(create).not.toHaveBeenCalled();
+        expect(inbox.add).not.toHaveBeenCalled();
+        expect(modify).toHaveBeenCalledWith(tfile, 'remote text v2');
+      });
     });
 
     it('rejects a legacy v4 (32-bit hash) cache → full re-sync on next start', async () => {
@@ -1933,7 +2014,10 @@ describe('SyncEngine', () => {
   describe('delta_broadcast', () => {
     it('imports delta via import_and_diff and writes content to vault', async () => {
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock that returns a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'remote.md' ? mockFile : null);
       mockDocInstance.get_text.mockReturnValue('broadcast content');
       mockDocInstance.import_and_diff.mockReturnValue('');
 
@@ -3303,7 +3387,10 @@ describe('SyncEngine', () => {
   describe('echo guard', () => {
     it('stores a 64-bit content hash in lastRemoteWrite, never the text', async () => {
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock that returns a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'hash.md' ? mockFile : null);
       mockDocInstance.get_text.mockReturnValue('remote content');
 
       await engine.start();
@@ -3322,7 +3409,10 @@ describe('SyncEngine', () => {
 
     it('suppresses push when content matches last remote write', async () => {
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock that returns a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'echo.md' ? mockFile : null);
       mockDocInstance.get_text.mockReturnValue('remote content');
 
       await engine.start();
@@ -3349,7 +3439,10 @@ describe('SyncEngine', () => {
 
     it('allows push when content differs from last remote write', async () => {
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock returning a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'echo2.md' ? mockFile : null);
       mockDocInstance.get_text.mockReturnValue('remote content');
 
       await engine.start();
@@ -3376,7 +3469,10 @@ describe('SyncEngine', () => {
 
     it('echo guard is one-shot — second push with same content goes through', async () => {
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock that returns a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'echo3.md' ? mockFile : null);
       mockDocInstance.get_text.mockReturnValue('remote content');
 
       await engine.start();
@@ -3494,7 +3590,10 @@ describe('SyncEngine', () => {
 
       mockDocInstance.get_text.mockReturnValue('remote fallback');
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock that returns a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'closed.md' ? mockFile : null);
       mockVault.read.mockResolvedValue('old');
 
       fireMessage({
@@ -3605,7 +3704,10 @@ describe('SyncEngine', () => {
 
       mockDocInstance.get_text.mockReturnValue('read mode content');
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock that returns a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'readonly.md' ? mockFile : null);
       mockVault.read.mockResolvedValue('old');
 
       fireMessage({
@@ -4429,7 +4531,10 @@ describe('SyncEngine', () => {
   describe('delta_broadcast VV gap detection', () => {
     it('triggers SyncStart catch-up when server_vv has missing peers', async () => {
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock returning a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'gap.md' ? mockFile : null);
       mockDocInstance.get_text.mockReturnValue('broadcast text');
       // Local VV missing peer 888
       mockDocInstance.export_vv_json.mockReturnValue('{"999":5}');
@@ -4471,7 +4576,10 @@ describe('SyncEngine', () => {
 
     it('does NOT trigger catch-up when local VV covers server VV', async () => {
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock returning a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'ok.md' ? mockFile : null);
       mockDocInstance.get_text.mockReturnValue('covered text');
       // Local VV covers server VV
       mockDocInstance.export_vv_json.mockReturnValue('{"999":5,"888":3}');
@@ -4497,7 +4605,10 @@ describe('SyncEngine', () => {
 
     it('handles missing server_vv gracefully (backward compat)', async () => {
       const mockFile = Object.create(TFile.prototype);
-      mockVault.getAbstractFileByPath.mockReturnValue(mockFile);
+      // Path-aware mock: conflictPath() probes candidate names in a loop and
+      // would spin forever against a mock that returns a TFile for EVERY path.
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        p === 'compat.md' ? mockFile : null);
       mockDocInstance.get_text.mockReturnValue('compat text');
 
       await engine.start();

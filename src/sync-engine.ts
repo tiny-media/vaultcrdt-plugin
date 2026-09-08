@@ -801,6 +801,34 @@ export class SyncEngine {
 
     const textBefore = doc.get_text();
 
+    // Security review finding #1: an edit made while Obsidian was CLOSED
+    // produces no vault event, so nothing marks the doc dirty and the
+    // startup clean-skip never reads the disk. Discriminate with the
+    // PRE-import text only:
+    //   disk == text we are writing      → nothing to do (writeToVault skips)
+    //   disk == textBefore               → ordinary update, we know that state
+    //   disk differs from BOTH           → an edit we never saw → conflict copy
+    // Difference to initial sync (writeServerText): NO blank/whitespace
+    // exclusion here — a whitespace-only external edit is user data too, and
+    // unlike cold start we have a trustworthy pre-import baseline.
+    const preserveUnseenDiskText = async (path: string, diskText: string): Promise<boolean> => {
+      if (diskText === textBefore) return false;
+      const cPath = conflictPath(this.app, path);
+      warn(`${this.tag} broadcast overwrite refused — unseen local disk change`, {
+        path, conflictPath: cPath,
+      });
+      this.trace.markPath('broadcast.unseen-disk-conflict', path, {
+        diskLen: diskText.length, conflictPath: cPath,
+      });
+      await this.app.vault.create(cPath, diskText);
+      this.inbox?.add({
+        kind: 'conflict', path: cPath, relatedPath: path,
+        note: conflictNoticeMessage(cPath),
+      });
+      return true;
+    };
+    const preserveOpts = { preserveUnseenDiskText };
+
     let diffJson: string | null = null;
     try {
       diffJson = doc.import_and_diff(delta);
@@ -870,11 +898,11 @@ export class SyncEngine {
                   this.lastRemoteWrite.set(docUuid, fnv1aHash64(postContent ?? catchUpText));
                 } else {
                   this.trace.markPath('broadcast.catch-up-write-to-vault', docUuid, { textLen: catchUpText.length });
-                  await this.editor.writeToVault(docUuid, catchUpText);
+                  await this.editor.writeToVault(docUuid, catchUpText, preserveOpts);
                 }
               } else {
                 this.trace.markPath('broadcast.catch-up-write-to-vault', docUuid, { textLen: catchUpText.length });
-                await this.editor.writeToVault(docUuid, catchUpText);
+                await this.editor.writeToVault(docUuid, catchUpText, preserveOpts);
               }
             }
             if (result) {
@@ -936,7 +964,7 @@ export class SyncEngine {
     }
 
     this.trace.markPath('broadcast.write-to-vault', docUuid, { textLen: textAfter.length });
-    await this.editor.writeToVault(docUuid, textAfter);
+    await this.editor.writeToVault(docUuid, textAfter, preserveOpts);
     await this.docs.persist(docUuid);
     if (serverVVStr !== null) this.rememberVVCache(docUuid, serverVVStr, doc.get_text());
   }

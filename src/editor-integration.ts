@@ -18,6 +18,23 @@ export function codepointOffsetToUtf16(text: string, cpOffset: number): number {
   return utf16;
 }
 
+/**
+ * Narrow, optional hook set (broadcast-scoped opt-in). Absent hook →
+ * unchanged legacy behaviour for every other writeToVault caller.
+ */
+export interface WriteToVaultOptions {
+  /**
+   * Called with the current DISK text before it would be overwritten, when
+   * that text differs from the text about to be written and no editor is
+   * open for the path. The callee decides whether the text is unseen user
+   * data and, if so, preserves it (conflict copy). Return value is advisory.
+   */
+  preserveUnseenDiskText?: (
+    path: string,
+    diskText: string,
+  ) => boolean | null | Promise<boolean | null>;
+}
+
 export class EditorIntegration {
   private updatingEditorFromRemote = new Set<string>();
 
@@ -50,9 +67,26 @@ export class EditorIntegration {
     return content;
   }
 
-  async writeToVault(filePath: string, content: string): Promise<void> {
+  async writeToVault(
+    filePath: string,
+    content: string,
+    opts?: WriteToVaultOptions,
+  ): Promise<void> {
     log(`${this.tag} writeToVault`, { filePath, contentLen: content.length });
     const existing = this.app.vault.getAbstractFileByPath(filePath);
+
+    // Opt-in preservation hook (only the sync-engine broadcast flow passes
+    // one). Without a hook this method behaves EXACTLY as before. The hook
+    // owns the decision AND the conflict copy; we only guarantee it runs
+    // BEFORE any disk overwrite, and only when no editor holds the file
+    // (an open editor buffer is authoritative — see applyToEditor).
+    if (opts?.preserveUnseenDiskText && existing instanceof TFile
+      && this.readCurrentContent(filePath) === null) {
+      const diskText = await this.app.vault.read(existing);
+      if (diskText !== content) {
+        await opts.preserveUnseenDiskText(filePath, diskText);
+      }
+    }
 
     // If an open editor already shows the target content, do NOT touch the
     // editor again. On mobile startup the visible buffer may already be the
