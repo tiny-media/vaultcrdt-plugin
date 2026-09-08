@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.11] - 2026-09-08
+
+### Fixed
+- **Offline edits survive remote broadcasts**: an edit written while
+  Obsidian was closed is now preserved as a conflict copy (plus an inbox
+  entry) instead of being silently overwritten when a peer's delta
+  arrives (security review finding 1).
+- **Malformed WebSocket frames no longer crash the message handler**
+  silently; they are logged and dropped (finding 14).
+- **The blob lane refuses servers whose protocol version differs** from
+  the client's (absent version field keeps compatibility) (finding 7).
+
+### Security
+- **Download-side allocation caps**: attachment downloads are bounded by
+  the attachment cap and the index entry size across all response paths
+  (finding 8).
+- **Received SVG attachments are sanitized on the receiving device**
+  before any write — previously only the sending device sanitized
+  (finding 6).
+- **The `.obsidian` sync toggles now bind at effect time**: switching a
+  category off stops pending hydrations, remote tombstone removals and
+  republishes, and in-flight upload/reference/delete/rename POSTs;
+  switching it back on re-collects skipped entries (findings N15-N17).
+- Docs: the app-settings toggle also governs theme and snippet
+  activation via `appearance.json` (finding 13).
+
+### Docs
+- Pre-submission security review record with triage, flow reviews,
+  dependency triage, fix evidence and the disposition matrix
+  (`docs/security-review-2026-09-08.md`).
+
 ## [0.5.10] - 2026-09-08
 
 ### Fixed
