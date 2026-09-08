@@ -7,10 +7,15 @@ maintainer's global setup live in the untracked `AGENTS.override.md`.
 
 ## Session entry and exit
 
-- Enter through `_setup/01-reentry.md` (current focus, state, learnings;
-  local, untracked); afterwards read only the files a task touches.
-- Exit = distill: update `_setup/01-reentry.md` (what was done, how
-  verified, new focus; file stays ≤ 1 page).
+- Enter locally through `dev/next.md` (goal, open work, last
+  verification; untracked, ≤60 lines, rewritten not appended). Without
+  local files, the public docs are the entry: `docs/architecture.md`,
+  `docs/development.md`, `docs/decisions/`.
+- History is append-only in `dev/log.md` (one entry per session, run ids
+  as evidence). Frozen history lives in `dev/archive/` (read-only).
+- Exit = distill: rewrite `dev/next.md`, append one `dev/log.md` entry,
+  and update the durable doc that owns any fact that changed (write
+  from the code, not from session notes).
 
 ## Checks (gate before every commit)
 
@@ -34,7 +39,7 @@ maintainer's global setup live in the untracked `AGENTS.override.md`.
 - The executing session commits itself, after checks exit 0 and a diff
   review. Worker runs never commit.
 - No push/tag/release/deploy without the maintainer's explicit release; no
-  irreversible git operations on tracked files — archive to `_setup/_archive/`
+  irreversible git operations on tracked files — freeze to `dev/archive/`
   instead.
 - One slice per run: no drive-by refactors, no speculative variants without a
   consumer, no new dependency or policy without an order, re-expressions never
