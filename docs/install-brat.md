@@ -67,6 +67,22 @@ Files above these caps stay local. SVGs are sanitised before upload; changed san
 
 Desktop downloads pending attachments eagerly. Mobile downloads attachments linked or embedded in the opened note rather than downloading the entire attachment collection. The active note is checked again after catch-up and relevant metadata changes. Keep Obsidian in the foreground; background sync is not guaranteed. See [missing attachments](recovery-runbook.md#missing-attachments-on-mobile) if a link remains unavailable.
 
+## Messages and conflict files
+
+The number next to the VaultCRDT ribbon icon counts entries in the review inbox — things that deserve a look, not necessarily errors. Entries can include conflict copies, deletion notices and sync failures. When the inbox is empty, a dot means VaultCRDT is offline; a number shows inbox entries whether online or offline.
+
+**Why a file is called `Note (conflict 2026-06-06).md`:** a conflict copy preserves content the plugin could not safely merge or replace. This can happen with independently created notes, changes made outside Obsidian, or missing local sync data. Ordinary simultaneous text edits usually merge automatically. The original note keeps its name; the preserved text gets the conflict name. The copy is kept for you to review — conflict copies are not a version history, they appear only when merging is unsafe.
+
+**How to resolve one:**
+
+1. Open the inbox (command palette: *Open conflict inbox*).
+2. Open the conflict copy and the original note. For some entries found at startup, the button opens only the conflict copy — look in the same folder for the filename without ` (conflict …)`, keeping the file extension.
+3. Read both, and copy anything you want to keep into the original note. For drawings or attachments, compare the files themselves rather than copying text.
+4. After reviewing the result, delete the conflict copy. Check Obsidian's deleted-file setting first if you want to use Trash. The inbox entry clears when the file is deleted — dismiss only removes the notice; a remaining conflict file will be listed again at startup.
+5. Keep Obsidian open on both devices until syncing finishes, then check the original note on the other device.
+
+If conflicts appear repeatedly for the same note without a cause you recognise, see the [recovery runbook](recovery-runbook.md) before deleting anything.
+
 ## Optional Obsidian settings and styles
 
 Under **Settings → VaultCRDT → Sync**, both toggles default to off and apply independently on each device. Enable the desired category on each device that should send and receive it.
