@@ -363,6 +363,12 @@ class MiniServer {
   readonly tombstones = new Set<string>();
   readonly tombstoneHashes = new Map<string, string>();
   readonly omitTombstoneHashUuids = new Set<string>();
+  /**
+   * Pre-fix server regime: refuse any push/create for a tombstoned path even
+   * when a live documents row exists. Default false = post-fix server (the
+   * live row wins).
+   */
+  refuseOnAnyTombstone = false;
   /** Test hook: record inbound `doc_delete` then discard it (no tombstone/ack). */
   readonly dropDocDeletes = new Set<string>();
   readonly conns = new Map<MockWebSocket, ConnState>();
@@ -498,7 +504,7 @@ class MiniServer {
         const delta = asBytes(msg.delta);
         const peerId = fieldString(msg.peer_id, conn.peerId);
         if (!delta) { this.reply(ws, { type: 'ack' }); return; }
-        if (this.tombstones.has(uuid) && !this.docs.has(uuid)) {
+        if (this.tombstones.has(uuid) && (this.refuseOnAnyTombstone || !this.docs.has(uuid))) {
           this.reply(ws, { type: 'doc_tombstoned', doc_uuid: uuid });
           return;
         }
@@ -530,7 +536,7 @@ class MiniServer {
         const peerId = fieldString(msg.peer_id, conn.peerId);
         const replaceTombstone = msg.replace_tombstone === true;
         if (!snapshot) { this.reply(ws, { type: 'ack' }); return; }
-        if (this.tombstones.has(uuid) && !this.docs.has(uuid) && !replaceTombstone) {
+        if (this.tombstones.has(uuid) && (this.refuseOnAnyTombstone || !this.docs.has(uuid)) && !replaceTombstone) {
           this.reply(ws, { type: 'doc_tombstoned', doc_uuid: uuid });
           return;
         }
@@ -1380,5 +1386,99 @@ describe('long-divergence (real CRDT)', () => {
     expect(a.fs.has(path), 'server-only pass must restore the file').toBe(true);
     expect(a.fs.readText(path)).toBe(seedText(12));
     expect(a.engine.getDiagnosticsCounts().pendingDeletes).toBe(0);
+  }, 60_000);
+
+  /** Both rows for one path (tombstone + live doc) — the state an old server left behind. */
+  function addStaleTombstone(path: string): void {
+    expect(activeServer!.docs.has(path), 'live row expected before staging tombstone').toBe(true);
+    activeServer!.tombstones.add(path);
+  }
+
+  it('both-rows startup: a tombstoned path with a live doc row materialises as a plain note', async () => {
+    const path = notePath(13);
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, seedText(13));
+    await startEngine(a);
+    await untilQuiet();
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    a.fs.writeText(path, seedText(13));
+    a.engine.onFileChangedImmediate(path, seedText(13));
+    await untilQuiet();
+    addStaleTombstone(path);
+
+    const b = createHarness('peer-B');
+    await startEngine(b);
+    await untilQuiet();
+
+    expect(b.fs.has(path), 'live server row must materialise').toBe(true);
+    expect(b.fs.mdPaths().filter((p) => p.includes('(deleted-remote'))).toEqual([]);
+    expect(b.inbox.filter((e) => e.kind === 'tombstone-rename')).toEqual([]);
+
+    const edited = `${seedText(13)}\nB_EDIT`;
+    b.fs.writeText(path, edited);
+    b.engine.onFileChangedImmediate(path, edited);
+    await untilQuiet();
+    expect(activeServer!.getText(path)).toContain('B_EDIT');
+    expect(a.fs.readText(path)).toContain('B_EDIT');
+    expect(a.fs.has(path)).toBe(true);
+  }, 60_000);
+
+  it('old-server regime: a stale doc_tombstoned refusal keeps the re-created file (liveness guard)', async () => {
+    const path = notePath(14);
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, seedText(14));
+    await startEngine(a);
+    await untilQuiet();
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    a.fs.writeText(path, seedText(14));
+    a.engine.onFileChangedImmediate(path, seedText(14));
+    await untilQuiet();
+    addStaleTombstone(path);
+    activeServer!.refuseOnAnyTombstone = true;
+
+    const edited = `${seedText(14)}\nA_EDIT_AFTER_RECREATE`;
+    a.fs.writeText(path, edited);
+    a.engine.onFileChangedImmediate(path, edited);
+    await untilQuiet();
+
+    expect(a.fs.has(path), 'liveness guard must keep the re-created file').toBe(true);
+    expect(a.fs.mdPaths().filter((p) => p.includes('(deleted-remote'))).toEqual([]);
+    expect(a.inbox.filter((e) => e.kind === 'tombstone-rename')).toEqual([]);
+    expect(activeServer!.getText(path)).toContain('A_EDIT_AFTER_RECREATE');
+  }, 60_000);
+
+  it('journal gap: a re-create after reconnect-reconcile goes out as doc_create(replace)', async () => {
+    const path = notePath(15);
+    const a = createHarness('peer-A');
+    a.fs.writeText(path, seedText(15));
+    await startEngine(a);
+    await untilQuiet();
+    a.fs.remove(path);
+    a.engine.onFileDeleted(path);
+    await untilQuiet();
+    expect(activeServer!.tombstones.has(path)).toBe(true);
+
+    // Reconnect: reconcilePendingDeletes drops the confirmed journal entry.
+    await a.engine.stop();
+    await startEngine(a);
+    await untilQuiet();
+    expect(a.engine.getDiagnosticsCounts().pendingDeletes).toBe(0);
+
+    activeServer!.checkpoint();
+    const recreated = `${seedText(15)}\nA_RECREATE`;
+    a.fs.writeText(path, recreated);
+    a.engine.onFileChangedImmediate(path, recreated);
+    await untilQuiet();
+
+    const frames = activeServer!.mutatingSinceCheckpoint().filter((m) => m.docUuid === path);
+    expect(frames.map((m) => m.type), JSON.stringify(frames)).toContain('doc_create');
+    expect(frames.map((m) => m.type)).not.toContain('sync_push');
+    expect(a.fs.has(path), 're-created file keeps its name').toBe(true);
+    expect(a.fs.mdPaths().filter((p) => p.includes('(deleted-remote'))).toEqual([]);
+    expect(activeServer!.getText(path)).toContain('A_RECREATE');
   }, 60_000);
 });

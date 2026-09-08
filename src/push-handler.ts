@@ -43,6 +43,14 @@ export class PushHandler {
   private pushFirstChangeAt = new Map<string, number>();
   private pendingDeletes = new Map<string, { acked: boolean }>();
   /**
+   * Paths the server reported as tombstoned in the last doc_list. The delete
+   * journal entry is dropped on reconcile once the tombstone is confirmed, so
+   * without this set a later re-create of the same path would go out as a plain
+   * sync_push and be refused. Consulted by the branch choice in
+   * pushFileDeltaAsync; an entry is consumed by the doc_create it triggers.
+   */
+  private serverTombstones = new Set<string>();
+  /**
    * Sent-but-unacknowledged pushes (session-state only, never persisted).
    * A send() into a half-dead socket counts as sent client-side but may
    * never reach the server (no per-push ack correlation). Keeps the delete
@@ -207,6 +215,11 @@ export class PushHandler {
   }
 
   /** Snapshot of the pending delete set. */
+  /** Record the tombstone set of the latest doc_list (called by initial sync). */
+  noteServerTombstones(paths: Iterable<string>): void {
+    this.serverTombstones = new Set(paths);
+  }
+
   pendingDeletePaths(): string[] {
     return [...this.pendingDeletes.keys()];
   }
@@ -303,6 +316,7 @@ export class PushHandler {
         replace_tombstone: options.replaceTombstone === true,
       });
       this.sentUnacked.add(filePath);
+      this.serverTombstones.delete(filePath);
     } catch (err) {
       error(`${this.tag} export_snapshot failed:`, filePath, err);
     }
@@ -457,7 +471,7 @@ export class PushHandler {
 
     if (await this.holdExcalidrawConcurrent(path, doc, content)) return;
 
-    const recreatePendingDelete = this.pendingDeletes.has(path);
+    const recreatePendingDelete = this.pendingDeletes.has(path) || this.serverTombstones.has(path);
 
     // Capture VV before applying disk change
     const vvBefore = doc.export_vv_json();

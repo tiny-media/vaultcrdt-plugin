@@ -144,6 +144,16 @@ export async function runInitialSync(
   // Reconcile first so already-tombstoned / resurrected (acked + live) entries
   // never generate a doc_delete replay. Then resend only what remains unacked.
   push.reconcilePendingDeletes(tombstoneSet, serverUuidSet);
+  // A tombstoned path that ALSO has a live documents row is a re-create the
+  // server kept: the live row wins. Such a path must stay a normal sync
+  // candidate (serverOnly / overlapping) instead of dropping out of every
+  // partition. Remember the remaining tombstones for the push branch choice
+  // (re-create must go out as doc_create-replace even after the journal entry
+  // was reconciled away).
+  const effectiveTombstoneSet = new Set(
+    [...tombstoneSet].filter((uuid) => !serverUuidSet.has(uuid)),
+  );
+  push.noteServerTombstones(effectiveTombstoneSet);
   push.resendPendingDeletes(recreatePathSet);
   const pendingDeleteSet = new Set(push.pendingDeletePaths());
 
@@ -183,14 +193,14 @@ export async function runInitialSync(
   // pendingDeleteSet is the post-reconcile remainder (unacked deletes we will resend).
   const serverOnlyUuids = [...serverDocMap.keys()].filter(
     (uuid) =>
-      !tombstoneSet.has(uuid) &&
+      !effectiveTombstoneSet.has(uuid) &&
       !localPathSet.has(uuid) &&
       !pendingDeleteSet.has(uuid) &&
       isSyncablePath(uuid),
   );
   const overlappingFiles = localFiles.filter(
     (f) =>
-      !tombstoneSet.has(f.path) &&
+      !effectiveTombstoneSet.has(f.path) &&
       !pendingDeleteSet.has(f.path) &&
       !recreatePathSet.has(f.path) &&
       serverDocMap.has(f.path),
@@ -198,7 +208,7 @@ export async function runInitialSync(
   const recreateFiles = localFiles.filter((f) => recreatePathSet.has(f.path));
   const localOnlyFiles = localFiles.filter(
     (f) =>
-      !tombstoneSet.has(f.path) &&
+      !effectiveTombstoneSet.has(f.path) &&
       !pendingDeleteSet.has(f.path) &&
       !recreatePathSet.has(f.path) &&
       !serverDocMap.has(f.path),
@@ -571,7 +581,7 @@ export async function runInitialSync(
   for (const entry of tombstone_hashes ?? []) {
     tombstoneHashByUuid.set(entry.doc_uuid, entry.content_hash);
   }
-  for (const uuid of tombstoneSet) {
+  for (const uuid of effectiveTombstoneSet) {
     if (serverDocMap.has(uuid)) continue;
     // U37 keep-promise: paths the recreate pass (step 3) just re-uploaded via
     // doc_create(replace_tombstone). The doc_list snapshot above predates

@@ -33,6 +33,9 @@ interface DocEntry {
 
 const HEARTBEAT_MS = 30_000;
 
+/** Bound for the sync_start liveness probe behind a `doc_tombstoned` refusal. */
+const TOMBSTONE_LIVENESS_TIMEOUT_MS = 5_000;
+
 /** Text of an untyped protocol field; non-strings never reach user-visible text. */
 function fieldText(value: unknown): string {
   return typeof value === 'string' ? value : '';
@@ -122,6 +125,8 @@ export class SyncEngine {
   private stopped = false;
   /** Paths we have already shown a tombstone Notice for in this session. */
   private notifiedTombstones = new Set<string>();
+  /** Docs whose tombstone refusal we already probed for liveness (once per session, per doc). */
+  private tombstoneLivenessChecked = new Set<string>();
   private trace = new SyncTrace();
   private advertisedFeatures: string[] = [];
   private blobCatchUpTimer: number | null = null;
@@ -323,6 +328,7 @@ export class SyncEngine {
     this.vvCache.clear();
     this.startupDirty.clearAll();
     this.notifiedTombstones.clear();
+    this.tombstoneLivenessChecked.clear();
   }
 
   /**
@@ -945,6 +951,7 @@ export class SyncEngine {
    */
   private async handleDocTombstoned(docUuid: string): Promise<void> {
     warn(`${this.tag} doc is tombstoned on server — push refused`, { doc: docUuid });
+    if (await this.tombstoneRefusalIsStale(docUuid)) return;
     if (this.notifiedTombstones.has(docUuid)) return;
     this.notifiedTombstones.add(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
@@ -964,6 +971,68 @@ export class SyncEngine {
       warn(`${this.tag} rename of tombstoned file failed`, { doc: docUuid, keptPath, err });
       this.noteTombstoneEditLost(docUuid);
     }
+  }
+
+  /**
+   * A `doc_tombstoned` refusal can be stale: an older server answers from the
+   * tombstone row even though a live documents row for the same path exists
+   * (delete + re-create while reconnects happened in between). Ask the server
+   * for the doc's current state over the existing sync_start request before
+   * destroying the local file's identity. A live snapshot ⇒ keep the file and
+   * re-send the change as doc_create with replace semantics.
+   * The probe runs at most once per doc_uuid per session.
+   */
+  private async tombstoneRefusalIsStale(docUuid: string): Promise<boolean> {
+    if (this.tombstoneLivenessChecked.has(docUuid)) return false;
+    const f = this.app.vault.getAbstractFileByPath(docUuid);
+    if (!(f instanceof TFile)) return false;
+    let live: { delta: Uint8Array; serverVV: string } | null;
+    try {
+      live = await this.probeServerDoc(docUuid);
+    } catch (err) {
+      // A failed or timed-out probe is NOT a delete confirmation: defer the
+      // rename and leave the file as-is. The liveness set is only marked on
+      // definitive answers, so the next refusal may probe again.
+      warn(`${this.tag} tombstone liveness probe failed — deferring rename`, { doc: docUuid, err });
+      this.trace.markPath('tombstoned.liveness-unknown', docUuid);
+      return true;
+    }
+    if (live === null || live.delta.length === 0) {
+      // Definitive no-live-row answer: this (and only this) consumes the
+      // once-per-session slot — after the rename, notifiedTombstones dedups.
+      this.tombstoneLivenessChecked.add(docUuid);
+      this.trace.markPath('tombstoned.liveness-confirmed', docUuid);
+      return false;
+    }
+    // Stale refusal (server still has the live doc): do NOT consume the slot.
+    // If the recovery doc_create below is lost (e.g. socket death), the next
+    // refusal must re-probe instead of renaming without a definitive answer.
+    this.trace.markPath('tombstoned.stale-refusal', docUuid);
+    warn(`${this.tag} tombstone refusal is stale — server still has a live doc`, { doc: docUuid });
+    try {
+      const doc = await this.docs.getOrLoad(docUuid);
+      const current = this.editor.readCurrentContent(docUuid);
+      if (current !== null && !doc.text_matches(current)) doc.sync_from_disk(current);
+      this.push.pushDocCreate(docUuid, doc, { replaceTombstone: true });
+      await this.docs.persist(docUuid);
+    } catch (err) {
+      warn(`${this.tag} re-send after stale tombstone failed`, { doc: docUuid, err });
+    }
+    return true;
+  }
+
+  /** sync_start probe with a bounded wait so a silent server cannot stall the refusal path. */
+  private probeServerDoc(docUuid: string): Promise<{ delta: Uint8Array; serverVV: string } | null> {
+    const request = this.requestSyncStart(docUuid, null);
+    let timer = 0;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = window.setTimeout(
+        () => { reject(new Error('tombstone liveness probe timeout')); },
+        TOMBSTONE_LIVENESS_TIMEOUT_MS,
+      );
+    });
+    request.catch(() => { /* settled below or already reported */ });
+    return Promise.race([request, timeout]).finally(() => { window.clearTimeout(timer); });
   }
 
   /** Lost edit on a tombstoned doc: inbox entry + one short notice (design §E). */

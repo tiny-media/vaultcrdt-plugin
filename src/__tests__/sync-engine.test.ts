@@ -4032,12 +4032,77 @@ describe('SyncEngine', () => {
       await engine.start();
       fireMessage({ type: 'doc_tombstoned', doc_uuid: 'doomed.md' });
       await flush();
+      // Liveness probe: server confirms there is no live doc behind the tombstone.
+      expect(renameFile, 'rename must wait for the liveness answer').not.toHaveBeenCalled();
+      fireMessage({ type: 'doc_unknown', doc_uuid: 'doomed.md' });
+      await flush();
 
       expect(renameFile).toHaveBeenCalledWith(tfile, 'doomed (deleted-remote).md');
       expect(mockFileManager.trashFile).not.toHaveBeenCalled();
       expect(add).toHaveBeenCalledWith(expect.objectContaining({
         kind: 'tombstone-rename', path: 'doomed (deleted-remote).md', relatedPath: 'doomed.md',
       }));
+    });
+
+    it('defers the rename when the liveness probe fails, and re-probes on the next refusal', async () => {
+      const tfile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) => (p === 'doomed.md' ? tfile : null));
+      const renameFile = vi.fn().mockResolvedValue(undefined);
+      const app = makeApp();
+      app.fileManager = { renameFile };
+      engine = new SyncEngine(app, makeSettings());
+      const add = vi.fn();
+      engine.inbox = { add };
+
+      await engine.start();
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: 'doomed.md' });
+      await flush();
+      // The probe fails: a server error naming the doc rejects the pending
+      // sync_start promise. A failed probe must NOT confirm the delete.
+      fireMessage({ type: 'error', code: 'internal', message: 'probe blew up', doc_uuid: 'doomed.md' });
+      await flush();
+      expect(renameFile, 'a failed probe must not confirm the delete').not.toHaveBeenCalled();
+      expect(add).not.toHaveBeenCalled();
+
+      // A failed probe does not consume the once-per-session slot: the next
+      // refusal probes again and a definitive answer may rename.
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: 'doomed.md' });
+      await flush();
+      fireMessage({ type: 'doc_unknown', doc_uuid: 'doomed.md' });
+      await flush();
+      expect(renameFile).toHaveBeenCalledWith(tfile, 'doomed (deleted-remote).md');
+    });
+
+    it('re-probes after a stale answer instead of renaming on the next refusal', async () => {
+      const tfile = Object.create(TFile.prototype);
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) => (p === 'doomed.md' ? tfile : null));
+      const renameFile = vi.fn().mockResolvedValue(undefined);
+      const app = makeApp();
+      app.fileManager = { renameFile };
+      engine = new SyncEngine(app, makeSettings());
+      engine.inbox = { add: vi.fn() };
+
+      await engine.start();
+      // First refusal: the server still HAS the live doc (stale refusal) —
+      // answered via sync_delta with content. No rename.
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: 'doomed.md' });
+      await flush();
+      fireMessage({
+        type: 'sync_delta', doc_uuid: 'doomed.md', delta: new Uint8Array([1, 2, 3]),
+        server_vv: '{}', client_vv: '{}',
+      });
+      await flush();
+      expect(renameFile, 'a stale refusal must not rename').not.toHaveBeenCalled();
+
+      // The recovery doc_create is lost; the server refuses again. The stale
+      // answer must NOT have consumed the once-slot: re-probe, and only a
+      // definitive doc_unknown may rename.
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: 'doomed.md' });
+      await flush();
+      expect(renameFile, 'second refusal must wait for the re-probe').not.toHaveBeenCalled();
+      fireMessage({ type: 'doc_unknown', doc_uuid: 'doomed.md' });
+      await flush();
+      expect(renameFile).toHaveBeenCalledWith(tfile, 'doomed (deleted-remote).md');
     });
 
     it('adds a tombstone-edit inbox entry when the local file is gone', async () => {
