@@ -542,3 +542,47 @@ Richard authenticates `gh` or eyeballs the tabs**; re-adjudication is a
   (was: listed only redeem/device as rate-limited) — corrected.
 - S1 open question (receive-toggle enforcement point): answered (index
   time), see N15-N17 for the actual gaps.
+
+---
+
+# Session appendix 2026-09-08 (security session) — S4 fix slices (all under Richard's GO 2026-09-08)
+
+Process per slice: brief → gpt-6 (astra) medium counter-read (ALL four
+first drafts came back REVISE with concrete corrections — anchors, gates,
+semantics; every correction was incorporated as v2 before coding) →
+opus-cpa-a (low) coded in a pinned worktree → coordinator acceptance:
+patch apply on the real tree, ALL gates rerun locally, diff spot-read,
+then commit. Evidence: worker run ids F1 `0187bd96`, F3b `72ed1de7`,
+F3a `60a9ac4d`, F3c `e1e6450b` (all exit 0); local gate exits below.
+
+| Slice | Content | Commits | Local gates (coordinator rerun) |
+| --- | --- | --- | --- |
+| F1 (#1) | broadcast path preserves unseen offline edits as conflict copies (pre-import-text discriminator) + inbox entry; pinned it.fails flipped to it() with extended assertions | plugin `a025824` | test 600/600 rc0 · lint rc0 (6 pre-existing warnings elsewhere) · tsc rc0 |
+| F3b (#5, #9, N2, N19) | WS identifier caps (doc_uuid 1024 B, peer_id/device 128 B at message, query, invite, auth-device, blob-path ingress), startup+hourly expired-upload sweeper, device_auth revocation recheck after argon2 | server `e657244` | fmt rc0 · clippy -D warnings rc0 · tests 141+2 rc0 |
+| F3a (#6, #7, #8, #14) | msgpack decode guard, blob-lane protocol-version gate (absent field = compatible), download caps on all three body paths (AUDIO_CAP + entry.size), receiver-side SVG sanitize before any write effect with sanitized-bytes index baseline | plugin `cb893e3` | test 620/620 rc0 · lint rc0 · tsc rc0 · build rc0 |
+| F3c (N15-N17, #13) | effect-time toggle gates (hydrate/tombstone/upload/reference/delete/rename/sweep), OFF→ON resume, doc line on appearance.json | plugin `f065a77` | test 632/632 rc0 · lint rc0 · tsc rc0 |
+
+Red-test evidence: each coder observed its new tests fail before the fix
+(details in the worker reports; F3c additionally produced a stash-based
+11-red/1-green run of the new suite). Coordinator acceptance included
+reading the discriminator placement (F1: pre-import textBefore at all
+three write sites), the gate placements (F3a: sanitize after hash check
+before any write effect), and the N16 no-removal branch (F3c).
+
+Known residuals carried into the release decision (all named in the
+worker reports and code comments): F3a cannot prevent one oversized
+response from being buffered by the transport before the cap check
+(allocation/write/copy prevented); blob lane does not proactively retry
+parked uploads after a protocol mismatch→match transition; the N2
+recheck narrows but does not close the revocation race (needs N1
+device binding); skipped-state in the index does not distinguish
+"toggle off" from quota/422 park reasons.
+
+F2 (validation of #2 against real Obsidian) is PREPARED but BLOCKED on
+one manual step: the throwaway vault is registered
+(~/Downloads/obsidianTest/vcrdt-t-f2-vault with a self-disabling probe
+plugin); the running Obsidian instance ignores obsidian:// URIs for
+newly registered vaults, so the vault must be opened once by hand from
+the vault switcher. Result lands in
+vcrdt-t-f2-vault/_results/f2-probe-result.json. obsidian.json was
+backed up before registration (backup-f2 beside it).
