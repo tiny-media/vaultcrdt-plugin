@@ -43,6 +43,19 @@ describe('isSyncablePath', () => {
     expect(isSyncablePath('./note.md')).toBe(false);
   });
 
+  it('rejects Windows separators inside a segment (post-normalize traversal)', () => {
+    // A server-supplied doc_uuid is a single POSIX segment here; normalizePath
+    // turns \\ into / AFTER this gate, which would mint real '..' segments
+    // downstream (vault.create). Mirrors hasIllegalSegments' rule.
+    expect(isSyncablePath('..\\..\\evil.md')).toBe(false);
+    expect(isSyncablePath('notes\\..\\..\\evil.md')).toBe(false);
+    expect(isSyncablePath('..\\plugins\\evil.js')).toBe(false);
+    // Plain backslash in an otherwise legal name stays a legal single segment
+    // only if it survives normalization; the gate is conservative and
+    // rejects any segment containing a backslash.
+    expect(isSyncablePath('a\\b.md')).toBe(false);
+  });
+
   it('rejects absolute paths', () => {
     expect(isSyncablePath('/etc/passwd.md')).toBe(false);
     expect(isSyncablePath('/home/user/note.md')).toBe(false);

@@ -189,6 +189,10 @@ export function isSyncablePath(path: string): boolean {
   const segments = path.split('/');
   for (const seg of segments) {
     if (seg === '' || BLOCKED_SEGMENTS.includes(seg)) return false;
+    // Windows separator inside a POSIX segment: normalizePath() converts \ to
+    // / AFTER this gate, minting real '..' segments downstream. Mirrors
+    // hasIllegalSegments' rule for the server-supplied doc_uuid lane.
+    if (seg.includes('\\')) return false;
   }
 
   return true;
