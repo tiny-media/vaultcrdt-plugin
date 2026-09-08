@@ -701,3 +701,65 @@ Consequences:
 (One probe artifact noted: `obsidianVersion` came back null — the
 appVersion field is not exposed the way the probe assumed; the hash
 6b15b73d12694dada2ed1418d3ed507b was captured instead.)
+
+---
+
+# Session appendix 2026-09-08 (security session) — direction decisions (astra medium, run ids 2802e5fb / c450e341) and release execution
+
+## N1 — retirement semantics: OPTION (c), full security boundary
+
+The stolen-device adversary is in scope today; (a)/(b) let a retired
+device convert temporary access into permanent access (invite minting
+survives; only an inviter-status check at redeem would close part of it).
+Cheapest (c) design: immutable device-key ID in JWT claims + active/
+revoked check on every authenticated request and WS handshake (no
+separate epoch needed if replacement credentials get fresh IDs); index
+sockets by device-key ID and close them on retirement; bind invites to
+the authenticated inviter and check inviter status at redeem; retire
+directly from device_keys, idempotent, immutable-identifier confirmation
+(empty names no longer block); reject identity-less legacy JWTs at
+cutover and disconnect their sockets. Interim operator lever that exists
+TODAY: rotating VAULTCRDT_JWT_SECRET invalidates every token instantly
+(all devices re-auth). Effort M-L; scheduled as a design slice, not in
+0.5.11/v0.4.4. Residual (accepted by the choice): retirement cannot
+erase notes already copied, and cannot remove a device the thief
+enrolled before retirement without a separate retire.
+
+## N5/N6 — soft-cap ladders (design parameters, UNMEASURED proposals)
+
+N5 server (≈ 9–16 days total): per-vault document budget 512 MiB
+(snapshot bytes in place, not cumulative) + 10 000 documents; ladder
+80/95/100 % = one-time notice / persistent warning + daily reminder /
+refuse only growth-causing operations (reads, deletes, equal-or-smaller
+snapshots and metadata upkeep keep working); HTTP 413 quota_exceeded +
+versioned WS storage_status; atomic counter upkeep (new−old size) with
+periodic reconciliation; plugin copy must become class-specific (today's
+says attachments generally). Sharpen only with compatible client error
+handling (v0.4.5 + 0.5.12 together).
+N6 device (≈ 5–8 days, own slice after N5): per-device receive governor,
+defaults 1 GiB received blob bytes + 5 000 new paths; same ladder;
+atomic reservation before download/index insert, conservative reservation
+up to the 25 MiB single-item cap when size unknown; blocked paths held
+as bounded cursors, not unbounded pending lists; note sync continues;
+escape hatch is local-only (raise budget / re-baseline after cleanup),
+never a hostile-server-controllable reset.
+Not capped for the beta: metadata row counts (visible via stats, cleaned
+orphaned rows, admission-coupled); re-examine cardinality/rate limits
+before unknown self-hosters arrive.
+
+## S3 — accepts confirmed (family beta)
+
+rsa: accept (S, documentation only; HS256-only reachability). im-family:
+accept FOR THE FAMILY BETA with mandatory re-review BEFORE the store
+release and at every loro release, at the latest 2026-12-08. Both need a
+risk register entry (owner, advisory ids, versions, recheck trigger).
+atomic-polyfill: no runtime acceptance needed (unreachable); optional
+targeted lock cleanup (S ≤0.5 d, no incidental upgrades).
+
+## Release execution (Richard's GO 2026-09-08)
+
+- Plugin 0.5.11 tagged `0.5.11` (no v-prefix) and pushed (`fde276b..53192ac`);
+  Release/CI/Security workflows running on the tag.
+- Server v0.4.4 tagged `v0.4.4` and pushed (`c7332ba..ea7e35a`); CI/
+  Security/Docker running. The tunnel deployment (studio build → load →
+  fleet) awaits a separate deploy GO.
