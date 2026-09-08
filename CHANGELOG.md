@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.10] - 2026-09-08
+
+### Fixed
+- A file that was deleted and re-created under the same path keeps its
+  identity. A `doc_tombstoned` refusal no longer renames the local file
+  on faith: the plugin first asks the server whether the document is
+  still live, keeps the file when it is, defers the rename when the
+  answer is unknown (a timeout is not a delete confirmation), and only
+  renames after a definitive no-live answer. The initial-sync partition
+  and the push path recognise the tombstone-plus-live-row state.
+
 ## [0.5.9] - 2026-09-08
 
 ### Changed
