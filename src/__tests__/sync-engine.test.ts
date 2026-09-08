@@ -4260,12 +4260,28 @@ describe('SyncEngine', () => {
       // answered via sync_delta with content. No rename.
       fireMessage({ type: 'doc_tombstoned', doc_uuid: 'doomed.md' });
       await flush();
+      mockEncode.mockClear();
       fireMessage({
         type: 'sync_delta', doc_uuid: 'doomed.md', delta: new Uint8Array([1, 2, 3]),
-        server_vv: '{}', client_vv: '{}',
+        server_vv: new TextEncoder().encode('{}'), client_vv: '{}',
       });
       await flush();
       expect(renameFile, 'a stale refusal must not rename').not.toHaveBeenCalled();
+      // Distinguish live recovery from malformed-response deferral: a live
+      // answer must produce an outbound doc_create with replace semantics.
+      expect(
+        mockEncode.mock.calls.filter(
+          (c: any[]) => c[0]?.type === 'doc_create' && c[0]?.doc_uuid === 'doomed.md'
+            && c[0]?.replace_tombstone === true,
+        ),
+        'a live answer must trigger replacement recovery',
+      ).toHaveLength(1);
+      expect(
+        mockWsInstance.send.mock.calls.map(([bytes]) =>
+          JSON.parse(new TextDecoder().decode(bytes))),
+      ).toContainEqual(expect.objectContaining({
+        type: 'doc_create', doc_uuid: 'doomed.md', replace_tombstone: true,
+      }));
 
       // The recovery doc_create is lost; the server refuses again. The stale
       // answer must NOT have consumed the once-slot: re-probe, and only a
@@ -4289,6 +4305,136 @@ describe('SyncEngine', () => {
       await flush();
 
       expect(add).toHaveBeenCalledWith(expect.objectContaining({ kind: 'tombstone-edit', path: 'gone.md' }));
+    });
+
+    // ── N10a: path containment for tombstone-refusal effects ─────────────────
+
+    /** Start an engine whose vault holds TFiles for exactly the given paths. */
+    const startContainmentEngine = async (paths: string[]) => {
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
+        paths.includes(p)
+          ? Object.assign(Object.create(TFile.prototype), { path: p })
+          : null);
+      const renameFile = vi.fn().mockResolvedValue(undefined);
+      const app = makeApp();
+      app.fileManager = { renameFile };
+      engine = new SyncEngine(app, makeSettings());
+      const add = vi.fn();
+      engine.inbox = { add };
+      await engine.start();
+      await flush();
+      // Reset startup effects so only refusal-induced effects are observed.
+      mockVault.getAbstractFileByPath.mockClear();
+      mockEncode.mockClear();
+      add.mockClear();
+      renameFile.mockClear();
+      notices.length = 0;
+      const getOrLoad = vi.spyOn((engine as any).docs, 'getOrLoad');
+      return { renameFile, add, getOrLoad };
+    };
+
+    const expectNoRefusalEffects = (
+      ctx: { renameFile: any; add: any; getOrLoad: any },
+      label: string,
+    ) => {
+      expect(ctx.renameFile, `${label}: no rename`).not.toHaveBeenCalled();
+      expect(ctx.add, `${label}: no inbox entry`).not.toHaveBeenCalled();
+      expect(ctx.getOrLoad, `${label}: no document load`).not.toHaveBeenCalled();
+      expect(mockVault.getAbstractFileByPath, `${label}: no path lookup`).not.toHaveBeenCalled();
+      expect(
+        mockEncode.mock.calls.filter((c: any[]) =>
+          c[0]?.type === 'sync_start' || c[0]?.type === 'doc_create'),
+        `${label}: no probe or recovery send`,
+      ).toHaveLength(0);
+      expect(notices, `${label}: no user-facing notice`).toHaveLength(0);
+    };
+
+    it('N10a: ignores doc_tombstoned frames with a missing or non-string doc_uuid', async () => {
+      const ctx = await startContainmentEngine([]);
+      const secretish = { doc_uuid: 'vcrdt-t-secret.md' };
+
+      fireMessage({ type: 'doc_tombstoned' });
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: null });
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: 42 });
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: secretish });
+      await flush(50);
+
+      expectNoRefusalEffects(ctx, 'malformed doc_uuid');
+    });
+
+    it('N10a: does not log the contents of rejected paths or malformed payloads', async () => {
+      await startContainmentEngine([]);
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const marker = 'vcrdt-t-rejected-payload-marker';
+        fireMessage({ type: 'doc_tombstoned', doc_uuid: { marker } });
+        fireMessage({ type: 'doc_tombstoned', doc_uuid: `${marker}.txt` });
+        await flush(50);
+        // Observe the actual logger sink, not MessagePack encoding: logging
+        // must not serialize an arbitrary rejected object or echo its contents.
+        expect(warnSpy).toHaveBeenCalled();
+        for (const args of warnSpy.mock.calls) {
+          expect(args.join(' ')).not.toContain(marker);
+        }
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('N10a: ignores doc_tombstoned for non-note and excluded paths even when a TFile exists', async () => {
+      const blocked = [
+        '.obsidian/vcrdt-t-blocked.md',
+        '.trash/vcrdt-t-blocked.md',
+        'vcrdt-t-blocked.txt',
+        '/etc/vcrdt-t-blocked.md',
+        '../vcrdt-t-blocked.md',
+        'dir/./vcrdt-t-blocked.md',
+        'dir//vcrdt-t-blocked.md',
+        'dir\\vcrdt-t-blocked.md',
+        '',
+      ];
+      for (const path of blocked) {
+        const ctx = await startContainmentEngine([path]);
+        fireMessage({ type: 'doc_tombstoned', doc_uuid: path });
+        await flush(50);
+        expectNoRefusalEffects(ctx, `blocked path ${JSON.stringify(path)}`);
+        await engine.stop?.();
+      }
+    });
+
+    it('N10a: a later doc_unknown cannot rename a file for an excluded path', async () => {
+      const ctx = await startContainmentEngine(['.obsidian/vcrdt-t-blocked.md']);
+
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: '.obsidian/vcrdt-t-blocked.md' });
+      await flush(50);
+      // The pre-fix handler is waiting for a liveness answer here; supplying it
+      // must not produce a rename.
+      fireMessage({ type: 'doc_unknown', doc_uuid: '.obsidian/vcrdt-t-blocked.md' });
+      await flush(50);
+
+      expect(ctx.renameFile, 'excluded path must never be renamed').not.toHaveBeenCalled();
+      expect(
+        mockEncode.mock.calls.filter((c: any[]) => c[0]?.type === 'sync_start'),
+        'the liveness query must never be issued for an excluded path',
+      ).toHaveLength(0);
+      expect(ctx.add).not.toHaveBeenCalled();
+    });
+
+    it('N10a: positive control — a valid note path still reaches the liveness probe and rename', async () => {
+      const ctx = await startContainmentEngine(['vcrdt-t-valid.md']);
+
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: 'vcrdt-t-valid.md' });
+      await flush(50);
+      expect(
+        mockEncode.mock.calls.filter((c: any[]) =>
+          c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'vcrdt-t-valid.md'),
+      ).toHaveLength(1);
+      fireMessage({ type: 'doc_unknown', doc_uuid: 'vcrdt-t-valid.md' });
+      await flush(50);
+
+      expect(ctx.renameFile).toHaveBeenCalledWith(
+        expect.anything(), 'vcrdt-t-valid (deleted-remote).md',
+      );
     });
   });
 

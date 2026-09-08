@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **Tombstone-refusal path checks**: `doc_tombstoned`
+  frames are admitted only for syncable note paths, and the derived
+  rename destination is validated under the same policy before the
+  rename. Malformed or excluded paths cause no lookup, liveness probe,
+  document load, recovery send, rename, notice or inbox entry.
+  Correlation of a refusal with a pending local operation remains open
+  work.
+
 ## [0.5.11] - 2026-09-08
 
 ### Fixed

@@ -688,7 +688,7 @@ export class SyncEngine {
         break;
 
       case 'doc_tombstoned':
-        void this.handleDocTombstoned(msg.doc_uuid as string);
+        void this.handleDocTombstoned(msg.doc_uuid);
         break;
 
       case 'create_conflict':
@@ -993,7 +993,15 @@ export class SyncEngine {
    * notices the situation and can recover the content manually.
    * If the file still exists locally it is renamed to `(deleted-remote)` so the content lives on as a new synced note.
    */
-  private async handleDocTombstoned(docUuid: string): Promise<void> {
+  private async handleDocTombstoned(docUuid: unknown): Promise<void> {
+    // Admission check at the handler boundary. A refusal names a path,
+    // and every effect below (lookup, liveness probe, document load, recovery
+    // send, rename, Notice, inbox entry) acts on it. Non-note or excluded
+    // paths must produce no effect at all — reject before anything happens.
+    if (typeof docUuid !== 'string' || !isSyncablePath(docUuid)) {
+      warn(`${this.tag} rejected doc_tombstoned for invalid path`);
+      return;
+    }
     warn(`${this.tag} doc is tombstoned on server — push refused`, { doc: docUuid });
     if (await this.tombstoneRefusalIsStale(docUuid)) return;
     if (this.notifiedTombstones.has(docUuid)) return;
@@ -1004,6 +1012,13 @@ export class SyncEngine {
       return;
     }
     const keptPath = remoteDeletedPath(this.app, docUuid);
+    // Defense in depth: the destination is derived, so validate it under the
+    // same note policy immediately before the native rename is initiated.
+    if (!isSyncablePath(keptPath)) {
+      warn(`${this.tag} refusing tombstone rename to non-syncable destination`, { doc: docUuid });
+      this.noteTombstoneEditLost(docUuid);
+      return;
+    }
     try {
       await this.app.fileManager.renameFile(f, keptPath);
       this.trace.markPath('tombstoned.renamed', docUuid, { keptPath });

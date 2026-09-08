@@ -1,7 +1,8 @@
 # Plugin architecture
 
-This document describes the plugin at the current released version
-(`manifest.json:version`; last source-checked 2026-09-08).
+This document describes the current plugin source (last source-checked
+2026-09-08). `manifest.json:version` is still 0.5.11; the tombstone-refusal
+path checks described below are unreleased.
 Anchors use `file:symbol`; server details belong to the [server architecture](https://github.com/tiny-media/vaultcrdt-server/blob/main/docs/ARCHITECTURE.md).
 
 ## What the plugin is
@@ -143,6 +144,12 @@ Copies use a date suffix and collision counter, not version-history storage
 or divergent local content and records recreate intent; otherwise it trashes
 the file. A tombstoned push refusal probes for live server state before
 renaming a retained file (`src/sync-engine.ts:onDocDeleted`, `handleDocTombstoned`).
+That handler admits only server-supplied paths accepted by `isSyncablePath`
+and re-validates the derived rename destination under the same policy before
+calling `renameFile`; frames with a missing or non-string `doc_uuid` are
+dropped without any lookup, probe, rename, notice or inbox effect. The
+refusal is still NOT correlated with a pending local operation, so a valid
+note path can be processed without a prior local push (open work).
 
 ### Blobs: content plus a path registry
 
@@ -190,8 +197,9 @@ lowercasing, whereas canonical keys use full Unicode folding
 - SVG receiver boundary: transport hash check, then `sanitize_svg`, then conflict/mkdir/write effects; sanitized bytes become the local hash baseline — `src/blob-downloader.ts:hydrateOne`, `crates/vaultcrdt-wasm/src/lib.rs:sanitize_svg_bytes` (`svg-hush`, standard-image data URLs allowed).
 - MessagePack guard: decode failures, non-object/array frames and missing string `type` are logged and dropped before activity/state changes; this is not full payload-schema validation — `src/sync-engine.ts:onMessage`.
 
-These are not universal sink guards: `handleDocTombstoned` lacks a path-policy
-check, conflict destinations are not revalidated, and persisted blob-index
+These are not universal sink guards: `handleDocTombstoned` now checks source
+and destination note policy but still lacks pending-operation correlation.
+Other conflict-copy destinations are not revalidated, and persisted blob-index
 paths are not recanonicalised on load (`src/sync-engine.ts:handleDocTombstoned`,
 `src/conflict-utils.ts:conflictPath`, `src/blob-index.ts:parse`).
 
