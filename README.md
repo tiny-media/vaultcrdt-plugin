@@ -33,6 +33,11 @@ See the [installation guide](docs/install-brat.md) for setup and update instruct
 
 Initial sync pulls server notes, uploads local notes, or merges when both sides have content. See [connection details](docs/install-brat.md#connect) before changing an existing connection.
 
+**A note on Obsidian's built-in Sync:** the red crossed-out sync icon some
+users see belongs to Obsidian's own paid *Sync* core plugin, not to VaultCRDT.
+Switch it off under **Settings → Core plugins → Sync** and the icon (and its
+error message) disappears.
+
 ## Keyword overview
 
 - **Offline-first:** local edits merge on reconnect; [recovery and external edits](docs/recovery-runbook.md).

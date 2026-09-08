@@ -84,6 +84,13 @@ Workspace state (`workspace.json`, `workspace-mobile.json`) and `.obsidian/plugi
 
 ## Settings and status
 
+**The red crossed-out sync icon is not VaultCRDT.** Obsidian ships with its own
+paid *Sync* core plugin. When it is enabled without a subscription it shows a
+red crossed-out sync icon that looks like a sync failure. VaultCRDT is
+unrelated to it: under **Settings → Core plugins** you can switch Obsidian's
+*Sync* off and the icon disappears. VaultCRDT's own status lives in the status
+bar (desktop) and the status panel.
+
 - **Connection:** server, reachability, vault secret or device-key authentication status, device name, add-device and reconfiguration actions.
 - **Sync:** status bar indicator, the two optional configuration categories and **Run full sync**.
 - **About:** plugin/server details, documentation and the trust notice.
