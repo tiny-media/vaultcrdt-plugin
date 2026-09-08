@@ -108,6 +108,42 @@ describe('ServerFeatureCache probe bound (Gap 1)', () => {
   });
 });
 
+describe('ServerFeatureCache protocol version scoping (#7)', () => {
+  it('caches version and features together per server key', async () => {
+    mockRequestUrl.mockResolvedValueOnce({ json: { features: [FEATURE_BLOBS], protocol_version: 9 } });
+    const cache = new ServerFeatureCache();
+    expect(await cache.get('https://a.example.com')).toEqual([FEATURE_BLOBS]);
+    expect(cache.protocolVersion()).toBe(9);
+
+    // Different server: a version from the old server must not leak.
+    mockRequestUrl.mockResolvedValueOnce({ json: { features: [FEATURE_BLOBS] } });
+    expect(await cache.get('https://b.example.com')).toEqual([FEATURE_BLOBS]);
+    expect(cache.protocolVersion()).toBeUndefined();
+  });
+
+  it('keeps the previous version when a later probe of the same server omits the field', async () => {
+    vi.useFakeTimers();
+    mockRequestUrl.mockResolvedValueOnce({ json: { features: [FEATURE_BLOBS], protocol_version: 4 } });
+    const cache = new ServerFeatureCache();
+    await cache.get('https://a.example.com');
+    expect(cache.protocolVersion()).toBe(4);
+
+    vi.setSystemTime(Date.now() + 6 * 60 * 1000);
+    mockRequestUrl.mockResolvedValueOnce({ json: { features: [FEATURE_BLOBS] } });
+    await cache.get('https://a.example.com');
+    expect(cache.protocolVersion()).toBe(4);
+    vi.useRealTimers();
+  });
+
+  it('clear() drops the cached version as well', async () => {
+    mockRequestUrl.mockResolvedValue({ json: { features: [FEATURE_BLOBS], protocol_version: 4 } });
+    const cache = new ServerFeatureCache();
+    await cache.get('https://a.example.com');
+    cache.clear();
+    expect(cache.protocolVersion()).toBeUndefined();
+  });
+});
+
 describe('BlobUploader gate-blocked retry (Gap 2)', () => {
   it('records the path instead of dropping it and posts nothing', async () => {
     const gate = { open: false };

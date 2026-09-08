@@ -12,6 +12,7 @@ vi.mock('obsidian', async () => {
 import initWasmModule, { blake3_hex, blob_path_key } from '../../wasm/vaultcrdt_wasm';
 import { BlobIndex } from '../blob-index';
 import { BlobDownloader } from '../blob-downloader';
+import { AUDIO_CAP } from '../path-policy';
 import { BlobUploader } from '../blob-uploader';
 import { ObsidianSync } from '../obsidian-sync';
 
@@ -226,13 +227,15 @@ describe('BlobDownloader (hydration S3)', () => {
   it('3. desktop eager order: 1, 3, 5 MiB (smallest first), concurrency ≤ 2', async () => {
     const { index, downloader } = makePair();
     const payloads: Record<string, Uint8Array> = {
-      'a.jpg': new Uint8Array([1]),
-      'c.jpg': new Uint8Array([3]),
-      'b.jpg': new Uint8Array([5]),
+      'a.jpg': new Uint8Array(1).fill(1),
+      'c.jpg': new Uint8Array(3).fill(3),
+      'b.jpg': new Uint8Array(5).fill(5),
     };
-    index.update('a.jpg', { hash: blake3_hex(payloads['a.jpg']), size: 1 * MIB, hydrated: false, seq: 1, generation: 1 });
-    index.update('c.jpg', { hash: blake3_hex(payloads['c.jpg']), size: 3 * MIB, hydrated: false, seq: 2, generation: 1 });
-    index.update('b.jpg', { hash: blake3_hex(payloads['b.jpg']), size: 5 * MIB, hydrated: false, seq: 3, generation: 1 });
+    // Sizes must match the served bodies (receive-side cap check, #8); the
+    // ordering assertion below is what this test pins.
+    index.update('a.jpg', { hash: blake3_hex(payloads['a.jpg']), size: 1, hydrated: false, seq: 1, generation: 1 });
+    index.update('c.jpg', { hash: blake3_hex(payloads['c.jpg']), size: 3, hydrated: false, seq: 2, generation: 1 });
+    index.update('b.jpg', { hash: blake3_hex(payloads['b.jpg']), size: 5, hydrated: false, seq: 3, generation: 1 });
 
     const byHash = new Map(Object.entries(payloads).map(([p, b]) => [blake3_hex(b), { path: p, bytes: b }]));
     const started: string[] = [];
@@ -665,5 +668,145 @@ describe('post-catch-up active-file hydration', () => {
     });
     await uploader.catchUp();
     expect(hydrateActiveFile).not.toHaveBeenCalled();
+  });
+});
+
+describe('receive-side allocation cap (#8)', () => {
+  const CAPPED = 'Bilder/big.mp3';
+
+  function armEntry(index: BlobIndex, bytes: Uint8Array, size: number, path = CAPPED) {
+    index.update(path, {
+      hash: blake3_hex(bytes), size, hydrated: false, seq: 1, generation: 1,
+    });
+  }
+
+  it('proceeds when the claimed total equals the index size and is within the cap', async () => {
+    const { index, downloader, vault } = makePair();
+    armEntry(index, BYTES, BYTES.length);
+    mockRequestUrl.mockImplementation(async (opts: Call) => serveRange(BYTES, opts));
+    await downloader.hydratePending();
+    expect(vault.files.get(CAPPED)).toEqual(BYTES);
+  });
+
+  it('rejects a Content-Range total above AUDIO_CAP before allocating segments', async () => {
+    const { index, downloader, vault } = makePair();
+    armEntry(index, BYTES, AUDIO_CAP + 1);
+    mockRequestUrl.mockImplementation(async (opts: Call) => ({
+      status: 206,
+      arrayBuffer: new ArrayBuffer(1),
+      headers: { 'Content-Range': `bytes 0-0/${AUDIO_CAP + 1}` },
+      json: {},
+    }));
+    await downloader.hydratePending();
+    expect(vault.files.has(CAPPED)).toBe(false);
+    // Only the 1-byte probe was issued; no range follow-ups.
+    expect(blobGets().length).toBe(1);
+  });
+
+  it('rejects when the claimed total differs from the index entry size', async () => {
+    const { index, downloader, vault } = makePair();
+    armEntry(index, BYTES, BYTES.length);
+    mockRequestUrl.mockImplementation(async () => ({
+      status: 206,
+      arrayBuffer: new ArrayBuffer(1),
+      headers: { 'Content-Range': `bytes 0-0/${BYTES.length + 7}` },
+      json: {},
+    }));
+    await downloader.hydratePending();
+    expect(vault.files.has(CAPPED)).toBe(false);
+    expect(blobGets().length).toBe(1);
+  });
+
+  it('rejects an HTTP 200 full body that exceeds the cap', async () => {
+    const { index, downloader, vault } = makePair();
+    armEntry(index, BYTES, AUDIO_CAP + 1);
+    mockRequestUrl.mockImplementation(async () => ({
+      status: 200,
+      arrayBuffer: new ArrayBuffer(AUDIO_CAP + 1),
+      headers: {},
+      json: {},
+    }));
+    await downloader.hydratePending();
+    expect(vault.files.has(CAPPED)).toBe(false);
+  });
+
+  it('rejects a 206 body without a parseable Content-Range that exceeds the cap', async () => {
+    const { index, downloader, vault } = makePair();
+    armEntry(index, BYTES, AUDIO_CAP + 1);
+    mockRequestUrl.mockImplementation(async () => ({
+      status: 206,
+      arrayBuffer: new ArrayBuffer(AUDIO_CAP + 1),
+      headers: {},
+      json: {},
+    }));
+    await downloader.hydratePending();
+    expect(vault.files.has(CAPPED)).toBe(false);
+  });
+
+  it('keeps the zero-total short-circuit (empty file)', async () => {
+    const { index, downloader, vault } = makePair();
+    const empty = new Uint8Array(0);
+    armEntry(index, empty, 0);
+    mockRequestUrl.mockImplementation(async () => ({
+      status: 206,
+      arrayBuffer: new ArrayBuffer(0),
+      headers: { 'Content-Range': 'bytes 0-0/0' },
+      json: {},
+    }));
+    await downloader.hydratePending();
+    expect(vault.files.get(CAPPED)).toEqual(empty);
+  });
+});
+
+describe('receiver-side SVG sanitize (#6)', () => {
+  const SVG_PATH = 'Bilder/icon.svg';
+  const RAW_SVG = new TextEncoder().encode(
+    '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect width="1" height="1"/></svg>',
+  );
+
+  function arm(index: BlobIndex, bytes: Uint8Array, path = SVG_PATH) {
+    index.update(path, {
+      hash: blake3_hex(bytes), size: bytes.length, hydrated: false, seq: 1, generation: 1,
+    });
+  }
+
+  it('writes sanitized bytes and records them as the index/echo baseline', async () => {
+    const { index, downloader, vault, uploader } = makePair();
+    arm(index, RAW_SVG);
+    mockRequestUrl.mockImplementation(async (opts: Call) => serveRange(RAW_SVG, opts));
+    await downloader.hydratePending();
+
+    const written = vault.files.get(SVG_PATH)!;
+    expect(written).not.toEqual(RAW_SVG);
+    expect(new TextDecoder().decode(written)).not.toContain('<script');
+    const entry = index.get(SVG_PATH)!;
+    expect(entry.hydrated).toBe(true);
+    expect(entry.hash).toBe(blake3_hex(written));
+    expect(entry.size).toBe(written.byteLength);
+    expect(entry.lastRemoteHash).toBe(blake3_hex(written));
+
+    // No re-upload churn: the local change check sees the sanitized baseline.
+    mockRequestUrl.mockClear();
+    uploader.onFileChanged(SVG_PATH);
+    await uploader.flush();
+    expect(puts()).toEqual([]);
+  });
+
+  it('writes nothing when sanitize throws on an unparseable SVG', async () => {
+    const { index, downloader, vault } = makePair();
+    const broken = new TextEncoder().encode('not an svg at all');
+    arm(index, broken);
+    mockRequestUrl.mockImplementation(async (opts: Call) => serveRange(broken, opts));
+    await downloader.hydratePending();
+    expect(vault.files.has(SVG_PATH)).toBe(false);
+    expect(index.get(SVG_PATH)!.hydrated).toBe(false);
+  });
+
+  it('bypasses sanitize for non-SVG paths (bytes written verbatim)', async () => {
+    const { index, downloader, vault } = makePair();
+    arm(index, RAW_SVG, PATH);
+    mockRequestUrl.mockImplementation(async (opts: Call) => serveRange(RAW_SVG, opts));
+    await downloader.hydratePending();
+    expect(vault.files.get(PATH)).toEqual(RAW_SVG);
   });
 });

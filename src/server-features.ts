@@ -26,9 +26,9 @@ export const FEATURES_PROBE_TIMEOUT_MS = 10_000;
  * caller fall back to today's secret-paste behaviour.
  */
 export class ServerFeatureCache {
-  private entry: { key: string; features: string[]; at: number } | null = null;
-  /** protocol_version from the last successful /health probe (status panel). */
-  private lastProtocolVersion: number | undefined;
+  private entry: {
+    key: string; features: string[]; at: number; protocolVersion: number | undefined;
+  } | null = null;
   /** Timestamp of the last failed/timed-out probe (failure→success is observable). */
   private lastErrorAtMs: number | null = null;
 
@@ -40,6 +40,7 @@ export class ServerFeatureCache {
       return this.entry.features;
     }
     let features: string[] = [];
+    let protocolVersion: number | undefined;
     try {
       const resp = await withTimeout(
         requestUrl({ url: `${key}/health`, method: 'GET' }),
@@ -48,7 +49,13 @@ export class ServerFeatureCache {
       const body = resp.json as { features?: unknown; protocol_version?: unknown } | undefined;
       const raw = body?.features;
       if (Array.isArray(raw)) features = raw.filter((f): f is string => typeof f === 'string');
-      if (typeof body?.protocol_version === 'number') this.lastProtocolVersion = body.protocol_version;
+      // Version and features are cached TOGETHER per server key, so a version
+      // learned from an earlier server can never gate a new one. A response
+      // WITHOUT the field keeps the previous version for the same key.
+      const previous = this.entry && this.entry.key === key ? this.entry.protocolVersion : undefined;
+      protocolVersion = typeof body?.protocol_version === 'number'
+        ? body.protocol_version
+        : previous;
     } catch {
       // A transient failure must not pose as an authoritative empty list: keep
       // the last-known-good entry (stale beats empty for gating) and do NOT
@@ -57,7 +64,7 @@ export class ServerFeatureCache {
       return this.entry && this.entry.key === key ? this.entry.features : [];
     }
     this.lastErrorAtMs = null;
-    this.entry = { key, features, at: this.now() };
+    this.entry = { key, features, at: this.now(), protocolVersion };
     return features;
   }
 
@@ -68,11 +75,12 @@ export class ServerFeatureCache {
 
   /** Cached server protocol version, or undefined if never probed successfully. */
   protocolVersion(): number | undefined {
-    return this.lastProtocolVersion;
+    return this.entry?.protocolVersion;
   }
 
   /** Drop the cached list (e.g. after the user points at a different server). */
   clear(): void {
+    // Drops the cached protocol version with it (both live in one entry).
     this.entry = null;
   }
 }

@@ -5121,6 +5121,43 @@ describe('SyncEngine', () => {
     });
   });
 
+  describe('undecodable / malformed frame guard (#14)', () => {
+    it('does not let a decode throw escape onMessage and updates nothing', async () => {
+      await engine.start();
+      openAndAuth();
+      const before = engine.getPanelStats().lastActivityAt;
+      mockDecode.mockImplementationOnce(() => { throw new Error('bad msgpack'); });
+      expect(() => {
+        mockWsInstance.onmessage!({ data: new ArrayBuffer(7) } as MessageEvent);
+      }).not.toThrow();
+      expect(engine.getPanelStats().lastActivityAt).toBe(before);
+    });
+
+    it.each([
+      ['null', null],
+      ['array', [1, 2, 3]],
+      ['missing type', { doc_uuid: 'x' }],
+      ['non-string type', { type: 5 }],
+    ])('drops a decoded %s frame without activity update', async (_label, decoded) => {
+      await engine.start();
+      openAndAuth();
+      const before = engine.getPanelStats().lastActivityAt;
+      expect(() => { fireMessage(decoded); }).not.toThrow();
+      expect(engine.getPanelStats().lastActivityAt).toBe(before);
+    });
+
+    it('still routes a valid frame after a bad one', async () => {
+      await engine.start();
+      openAndAuth();
+      mockDecode.mockImplementationOnce(() => { throw new Error('bad msgpack'); });
+      mockWsInstance.onmessage!({ data: new ArrayBuffer(7) } as MessageEvent);
+      const before = engine.getPanelStats().lastActivityAt;
+      await new Promise((r) => setTimeout(r, 2));
+      fireMessage({ type: 'pong' });
+      expect(engine.getPanelStats().lastActivityAt).toBeGreaterThan(before);
+    });
+  });
+
   describe('oversized send guard', () => {
     it('does not send when encoded message exceeds 50 MiB', async () => {
       await engine.start();

@@ -632,9 +632,20 @@ export default class VaultCRDTPlugin extends Plugin {
     }
   }
 
+  /**
+   * Blob lane gate: engine up, server advertises 'blobs', and the server's
+   * /health protocol_version either matches ours or was never reported
+   * (older/offline servers stay compatible).
+   *
+   * Accepted limitation: after a mismatch→matching transition the lane does
+   * not proactively retry parked uploads; the existing recovery paths (next
+   * file event, startup backfill, quota-pause semantics) cover them.
+   */
   private async blobsEnabled(): Promise<boolean> {
-    return this.syncEngineInitialized
-      && (await this.getServerFeatures()).includes(FEATURE_BLOBS);
+    if (!this.syncEngineInitialized) return false;
+    if (!(await this.getServerFeatures()).includes(FEATURE_BLOBS)) return false;
+    const version = this.serverFeatures.protocolVersion();
+    return version === undefined || version === PROTOCOL_VERSION;
   }
 
   /**

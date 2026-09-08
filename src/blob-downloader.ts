@@ -1,8 +1,8 @@
 import type { App, TFile } from 'obsidian';
-import { blake3_hex, blob_path_key } from '../wasm/vaultcrdt_wasm';
+import { blake3_hex, blob_path_key, sanitize_svg } from '../wasm/vaultcrdt_wasm';
 import { conflictPath } from './conflict-utils';
 import { log, error } from './logger';
-import { obsidianSyncCategoryOf, pathCaseKey } from './path-policy';
+import { AUDIO_CAP, isSvgPath, obsidianSyncCategoryOf, pathCaseKey } from './path-policy';
 import { blobRequest, headerValue } from './blob-uploader';
 import type { BlobIndex, BlobIndexEntry } from './blob-index';
 
@@ -173,15 +173,24 @@ export class BlobDownloader {
     if (!entry || entry.hydrated || entry.skipped || !entry.hash) return;
     this.inflight.add(path);
     try {
-      const bytes = await this.download(entry.hash);
+      const bytes = await this.download(entry.hash, path, entry.size);
       if (!bytes) return;
-      const hash = blake3_hex(bytes);
-      if (hash !== entry.hash) {
+      const remoteHash = blake3_hex(bytes);
+      if (remoteHash !== entry.hash) {
         // Mismatch: nothing was written (in-memory assembly only). Leave
         // hydrated: false so the next catch-up retries.
         log('blob.hydrate.hash-mismatch', path);
         return;
       }
+      // Receiver-side SVG sanitize: runs AFTER the transport hash check and
+      // BEFORE any write effect (conflict copy, mkdir, writeBinary), so a
+      // throw leaves zero side effects (handled by the catch below).
+      // Non-SVG paths bypass it entirely.
+      const local = isSvgPath(path) ? sanitize_svg(bytes) : bytes;
+      // The index/echo baseline is the LOCAL truth (sanitized bytes); the
+      // remote comparison above already happened against transport bytes.
+      const hash = isSvgPath(path) ? blake3_hex(local) : remoteHash;
+
       await this.maybeConflictCopy(path, entry, hash);
       await this.mkdirParents(path);
       const prevLastRemoteHash = entry.lastRemoteHash;
@@ -190,13 +199,13 @@ export class BlobDownloader {
       // leaves hydrated:false so the next pass retries.
       this.deps.index.update(path, {
         hash,
-        size: bytes.byteLength,
+        size: local.byteLength,
         generation: entry.generation,
         seq: entry.seq,
         lastRemoteHash: hash,
       });
       try {
-        await this.deps.writeBinary(path, bufferOf(bytes));
+        await this.deps.writeBinary(path, bufferOf(local));
       } catch (e) {
         this.deps.index.update(path, {
           lastRemoteHash: prevLastRemoteHash,
@@ -233,19 +242,27 @@ export class BlobDownloader {
    * Content-Range bytes 0-0/total, or 416 with bytes star/total.
    * Segment restart from offset 0 after abort is acceptable.
    */
-  private async download(hash: string): Promise<Uint8Array | null> {
+  private async download(
+    hash: string, path: string, expectedSize: number,
+  ): Promise<Uint8Array | null> {
     const probe = await this.getRange(hash, 0, 0);
     if (probe.status === 200) {
+      // Full body on a Range request: bound it before copying.
+      if (!this.sizeAllowed(path, probe.arrayBuffer.byteLength, expectedSize)) return null;
       return new Uint8Array(copyBuffer(probe.arrayBuffer));
     }
     const total = parseContentRangeTotal(headerValue(probe.headers, 'Content-Range'));
     if (total === null || (probe.status !== 206 && probe.status !== 416)) {
       if (probe.status === 206 && probe.arrayBuffer.byteLength > 0) {
+        if (!this.sizeAllowed(path, probe.arrayBuffer.byteLength, expectedSize)) return null;
         return new Uint8Array(copyBuffer(probe.arrayBuffer));
       }
       return null;
     }
     if (total === 0) return new Uint8Array(0);
+    // Reject a bogus/oversized claim BEFORE allocating the assembly buffer or
+    // issuing any range follow-up.
+    if (!this.sizeAllowed(path, total, expectedSize)) return null;
 
     const out = new Uint8Array(total);
     let received = 0;
@@ -259,6 +276,22 @@ export class BlobDownloader {
     }
     if (received !== total) return null;
     return out;
+  }
+
+  /**
+   * Receive-side bound: a claimed/actual body must stay within AUDIO_CAP (the
+   * largest attachment class cap) and match the index entry's size.
+   *
+   * Known residual: requestUrl/blobRequest buffers a whole response before we
+   * can inspect it, so the cap prevents copies, writes and OOM-by-assembly,
+   * but not the transport buffering of one oversized body.
+   */
+  private sizeAllowed(path: string, claimed: number, expected: number): boolean {
+    if (claimed > AUDIO_CAP || claimed !== expected) {
+      log('blob.hydrate.size-rejected', path, claimed, expected);
+      return false;
+    }
+    return true;
   }
 
   private async getRange(hash: string, from: number, to: number) {

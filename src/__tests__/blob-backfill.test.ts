@@ -28,6 +28,7 @@ import VaultCRDTPlugin from '../main';
 import { SyncEngine } from '../sync-engine';
 import { TFile } from 'obsidian';
 import { FEATURE_BLOBS } from '../server-features';
+import { PROTOCOL_VERSION } from '../protocol';
 import type { BlobIndexEntry } from '../blob-index';
 
 function fileAt(path: string): TFile {
@@ -128,6 +129,33 @@ describe('backfillAttachments', () => {
 
     await (plugin as any).backfillAttachments();
     expect(changed.mock.calls.map((c) => c[0]).sort()).toEqual([missing, skipped]);
+  });
+});
+
+describe('blob lane protocol gate (#7)', () => {
+  it('enables the lane on a matching version and disables it on a mismatch', async () => {
+    const { plugin } = await setup();
+    vi.spyOn(plugin.serverFeatures, 'get').mockResolvedValue([FEATURE_BLOBS]);
+    const version = vi.spyOn(plugin.serverFeatures, 'protocolVersion');
+
+    version.mockReturnValue(PROTOCOL_VERSION);
+    expect(await (plugin as any).blobsEnabled()).toBe(true);
+
+    version.mockReturnValue(PROTOCOL_VERSION + 1);
+    expect(await (plugin as any).blobsEnabled()).toBe(false);
+
+    // Absent field (older/offline server): the flags decide.
+    version.mockReturnValue(undefined);
+    expect(await (plugin as any).blobsEnabled()).toBe(true);
+  });
+
+  it('blocks download hydration on a version mismatch', async () => {
+    const { plugin } = await setup();
+    vi.spyOn(plugin.serverFeatures, 'get').mockResolvedValue([FEATURE_BLOBS]);
+    vi.spyOn(plugin.serverFeatures, 'protocolVersion').mockReturnValue(PROTOCOL_VERSION + 1);
+    const one = vi.spyOn(plugin.blobDownloader as any, 'hydrateOne');
+    await plugin.blobDownloader.hydratePending();
+    expect(one).not.toHaveBeenCalled();
   });
 });
 

@@ -572,8 +572,24 @@ export class SyncEngine {
   // ── Message handling ────────────────────────────────────────────────────────
 
   private onMessage(data: ArrayBuffer): void {
-    const msg = decode(new Uint8Array(data)) as Record<string, unknown>;
-    const type = msg.type as string;
+    // A malformed/undecodable frame must not throw out of ws.onmessage.
+    // There is no documented recovery for an unparseable frame: warn with the
+    // byte length, change no state, drop it. Scope: this entry point only —
+    // the TextDecoder sites keep their richer semantics (rejecting waiters).
+    let msg: Record<string, unknown>;
+    let type: string;
+    try {
+      const decoded: unknown = decode(new Uint8Array(data));
+      if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
+        throw new Error('frame is not an object');
+      }
+      msg = decoded as Record<string, unknown>;
+      if (typeof msg.type !== 'string') throw new Error('frame has no string type');
+      type = msg.type;
+    } catch (err) {
+      warn(`${this.tag} dropping undecodable frame (${data.byteLength} bytes):`, err);
+      return;
+    }
     this.lastServerActivityAt = Date.now();
     this.onServerActivity?.();
 

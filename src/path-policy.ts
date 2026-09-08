@@ -37,7 +37,14 @@ export type ObsidianSyncCategory = 'settings' | 'styles';
 const MIB = 1024 * 1024;
 const IMAGE_CAP = 10 * MIB;
 const PDF_CAP = 10 * MIB;
-const AUDIO_CAP = 25 * MIB;
+/** Largest attachment class cap (audio) — also the receive-side allocation bound. */
+export const AUDIO_CAP = 25 * MIB;
+/** True when `path` names an SVG (both lanes must sanitize those bytes). */
+export function isSvgPath(path: string): boolean {
+  const key = pathCaseKey(path);
+  return key.slice(key.lastIndexOf('.') + 1) === 'svg';
+}
+
 /** Category files (.obsidian json/css) — 2 MiB. */
 export const OBSIDIAN_CAP = 2 * MIB;
 

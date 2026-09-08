@@ -1,6 +1,6 @@
 import { requestUrl } from 'obsidian';
 import { blake3_hex, sanitize_svg } from '../wasm/vaultcrdt_wasm';
-import { attachmentCap, obsidianSyncCategoryOf, pathCaseKey, type ObsidianSyncEnabled } from './path-policy';
+import { attachmentCap, isSvgPath, obsidianSyncCategoryOf, pathCaseKey, type ObsidianSyncEnabled } from './path-policy';
 import { toHttpBase } from './url-policy';
 import { log, error, warn } from './logger';
 import { attachmentTooLargeMessage, quotaExceededMessage, remoteDeleteKeptNoticeMessage, remoteDeleteRemovedNoticeMessage, remoteDeleteTrashedNoticeMessage, svgRejectedMessage } from './user-facing-copy';
@@ -318,8 +318,7 @@ export class BlobUploader {
    * Non-SVG: return `bytes` unchanged. Sanitize failure parks and returns null.
    */
   private async canonicalSvgBytes(path: string, bytes: Uint8Array): Promise<Uint8Array | null> {
-    const ext = pathCaseKey(path).slice(pathCaseKey(path).lastIndexOf('.') + 1);
-    if (ext !== 'svg') return bytes;
+    if (!isSvgPath(path)) return bytes;
     const before = bytes.byteLength;
     try {
       const sanitized = sanitize_svg(bytes);
