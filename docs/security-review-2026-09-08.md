@@ -227,3 +227,318 @@ depends on the deployment's server URL, not on the plugin.
 4. Whether device retirement should end established WS sessions (JWTs carry
    vault identity only, `server:src/auth.rs:49`, and sockets never re-validate
    expiry).
+
+---
+
+# Session appendix 2026-09-08 (security session) — Prüfgrundlage vor S1
+
+Read-only basis for the triage and flow reviews that follow. Nothing above
+was rewritten; where this appendix corrects the review text it says so.
+Every claim below was measured in this session (commands or file reads at
+plugin `fde276b` / server `c7332ba`) unless marked otherwise.
+
+## A. Verified repo state
+
+| Repo | main | Clean | vs origin | Last Security run | Fixes on main, in NO release |
+| --- | --- | --- | --- | --- | --- |
+| plugin | `fde276b` (0.5.10 `0cdebb1` + security CI + fixes + docs) | yes (`git status --short` empty) | 0/0 | #6 on `fde276b`, success, 2026-09-08T10:42Z | `0f3b78e` (#2 fix), `7bd76cb` (#1 it.fails pin) — `git tag --contains` = 0 tags each |
+| server | `c7332ba` (v0.4.3 `88662d8` + `d315afc` + advisory-mode CI) | yes | 0/0 | #5 on `c7332ba`, success, 2026-09-08T09:57Z | `d315afc` (#3 fix) — 0 tags contain it |
+
+Plugin Security jobs: CodeQL javascript-typescript, CodeQL rust (wasm crate),
+osv-scanner (bun.lock + Cargo.lock, `continue-on-error` advisory mode),
+bun audit (hard), cargo audit (wasm crate, hard), Scorecard. Server Security
+jobs: CodeQL rust buildless, `cargo build --locked`, osv-scanner + cargo audit
+(both `continue-on-error`, advisory mode).
+
+Correction to the review text above (substance unaffected): the server reads
+`VAULTCRDT_JWT_SECRET` / `VAULTCRDT_ADMIN_TOKEN`, not `NOTESYNC_*` (verified
+at snapshot `88662d8`, `git show 88662d8:src/main.rs` lines 16/18). Finding
+3's mechanism — `.expect()` rejects only UNSET, an empty string passed — was
+correct and is fixed on main (`require_non_empty`, `server:src/main.rs`,
+rejects unset AND empty, with unit tests).
+
+Gap, named: the GitHub **Security-tab alert lists** (CodeQL + osv SARIF) are
+not readable from this session (`gh` unauthenticated here); the advisory
+inventory below is reconstructed from the workflow comments, both lockfiles
+and `cargo tree -i`. If alert-level adjudication is needed, Richard must open
+the tabs or authenticate `gh`.
+
+## B. Deployment under review (live tunnel stack, fleet)
+
+`fleet/hosts/tunnel/stacks/vaultcrdt/compose.yaml`: image
+`git.fryy.de/tinymedia/vaultcrdt-server:v0.4.3` (ARM64, private registry),
+exposure `kind: public` via `obsidian-sync.tinymedia.de` (Cloudflare Tunnel →
+traefik entrypoint `tunnel`, middleware `public-secure@file`, NO rate-limit/
+compress middleware — langlebiges WSS), **Authelia bypass** (service has its
+own auth). Container: `cap_drop: ALL`, `no-new-privileges`, 256 MiB limit,
+uid 1000, `VAULTCRDT_TRUST_PROXY=true` (rate-limit key = CF-Connecting-IP,
+10 req/60 s), `VAULTCRDT_TOMBSTONE_DAYS=365`, secrets via sops
+(`VAULTCRDT_JWT_SECRET`, `VAULTCRDT_ADMIN_TOKEN`). State `./data` = SQLite
+`data.db` + blob dir; backup = consistent SQLite dump + restic. Server binds
+`0.0.0.0:8080` without TLS — TLS terminates at the edge; the shipped
+`docker-compose.yml` publishes `3737:8080` on all interfaces (review
+observation above stands for self-hosters).
+
+## C. Roles and tenant boundary (from code, server `c7332ba`)
+
+- **Server operator** — holds `ADMIN_TOKEN` (vault registration via
+  `/auth/verify` on new vault_id, `/debug/connections`, `/debug/vault-stats`)
+  and `JWT_SECRET` (signs every token; compromise = all vaults).
+- **Vault secret holder** (setup device) — `api_key` → argon2 verify → JWT via
+  `/auth/verify`.
+- **Invited device peer** — invite redeem (`/invite/redeem`, public,
+  rate-limited) → `device_key` (32 chars) + JWT; device re-auth via
+  `/auth/device` (argon2, `revoked_at IS NULL` check). JWT carries `sub =
+  vault_id` ONLY (no peer identity, no role) — every in-vault peer can mint
+  invites (`/invite` = VaultAuth + IP rate limit). Peer retirement
+  (`DELETE /vault/peers/{peer_id}`) is **admin-token** gated + exact
+  `device_name` confirmation (`server:src/lib.rs:345-404` — corrected by
+  flow a/b against this session's first draft, re-verified by coordinator
+  read).
+- **Anonymous** — `/health`, `/invite/redeem`, `/auth/device` (the latter two
+  rate-limited 10/60 s per IP; limiter fails closed at 65 536 keys).
+- Tenant boundary = `vault_id` from JWT verification (WS first frame + all
+  `/vault/*` routes). WS query `vault_id` parameter is logged but not used
+  for authorization (`server:src/ws.rs` auth block).
+
+## D. Protection goals (Schutzgüter)
+
+1. Note contents + attachments — server-side PLAINTEXT (no E2EE; v2 parked).
+2. Metadata — paths (`doc_uuid`, `display_path`), peer list, timestamps are
+   server-readable; uuid obfuscation deferred to v2.
+3. Client secrets — `vaultSecret`/`deviceKey` stored plaintext in plugin
+   `data.json` (device boundary = OS user; diagnostics scrub via
+   `assertNoSecret`).
+4. Server secrets — `JWT_SECRET`, `ADMIN_TOKEN` (operator boundary).
+5. Invite tokens — 22 chars from 64-alphabet (≈132 bit), SHA-256-hashed at
+   rest, 15 min expiry, single-use.
+6. Availability / quota — 5 GiB default per vault, blob storage, SQLite
+   durability; DoS surfaces = frame size (50 MiB), auth rate limiter.
+
+## E. Cryptography decisions checked (no change proposed here)
+
+- JWT HS256 (`Header::default()`), 1 h expiry, claims `sub`+`exp` only;
+  `Validation::default()` of jsonwebtoken v11 — **algorithm pinning and
+  leeway defaults remain Open Question 3 above** (crate internals; to settle
+  in S3 from the vendored crate source, not from memory).
+- argon2 for vault secrets and device keys (`server:Cargo.toml` `argon2
+  0.6.0`); SHA-256 for invite hashes — KDF deliberately dropped for 128-bit
+  random tokens (rationale in `server:src/invites.rs:13-16`).
+- `constant_time_eq` for admin-token comparisons (3 call sites).
+- BLAKE3 both sides for blob content hashing (plugin via wasm `blake3_hex`,
+  server `server:src/blobs.rs:620`).
+- FNV-1a (UTF-16 code units) tombstone content hash — non-cryptographic
+  content match, parity client↔server OBSERVED (disproved candidate, above).
+- No TLS in the server itself; no OS-keychain use; E2EE v2 parked with its
+  six wire-format rules (Stand-Bericht §4) — not built, not re-litigated here.
+
+## F. Advisory inventory (lockfile-verified 2026-09-08)
+
+Server `Cargo.lock`: `rsa 0.9.10` ← `jsonwebtoken v11.0.0` ← vaultcrdt-server
+(`cargo tree -i rsa`, exit 0) — server signs/verifies HS256 only, no RSA
+operation in tree (exposure analysis is S3). Plugin `Cargo.lock`: no `rsa`,
+no `jsonwebtoken`; shares `loro` chain (`im`, `bitmaps`, `sized-chunks`) and
+`atomic-polyfill` with the server. Workflow comments name **7 RustSec
+advisories, all transitive, none with fixed versions** (server security.yml
+osv job comment). Precise advisory IDs/severities: S3 (local lockfiles +
+RustSec DB lookup; cargo-audit not installed locally — installing it would
+be a dependency change and needs GO).
+
+## G. Coverage matrix — the five S2 flows vs. prior review
+
+| S2 flow | Prior coverage (2026-09-08 review + fixes) | Open angles for the fresh run |
+| --- | --- | --- |
+| a) WS authorization per operation | WS auth gate described (seam workstream); no per-operation finding | whether every WS op checks vault scope; peer retirement authz; JWT expiry vs. socket lifetime (Open Question 4) |
+| b) Invite lifecycle | none (server-authz workstream raised none) | mint→redeem→expiry→revocation, single-use race (TX looks sound, verify), invite-mint authority = any peer, admin-mint ≠ key rights |
+| c) Blob admission + quota | #4 admission race, #9 abandoned uploads, #8 receiver allocation (plugin) | chains end-to-end incl. finalization re-checks; #8's missing attack prose |
+| d) Path/blob boundaries | #2 (fixed `0f3b78e`, validation open = F2), #10 casefold asymmetry | display_path leaks, remaining normalisation asymmetries after the #2 fix |
+| e) `.obsidian` lane | #13 appearance.json, #10 overlap | toggle semantics vs. path-policy categories, whole-file LWW blast radius |
+
+Scanner alerts: CodeQL SARIF lands in both Security tabs (runs green since
+`d7400ce`/`89995ce`); osv findings ride in advisory mode. S2/S3 adjudicate
+what the tabs hold (per the gap in A: from workflow output + lockfiles, or
+Richard authenticates `gh`).
+
+---
+
+# Session appendix 2026-09-08 (security session) — S1 triage of #4–#14
+
+Method: three glm-5.3-flash (effort low) read-only runs against pinned trees
+(plugin `fde276b`, server `c7332ba`; run ids `035e0cb9` server #4/#5/#9/#11/#12,
+`7ece5399` plugin #6/#8/#10/#13/#14, `9478fe62` seam #7 — the last exit 6
+form-only, report usable). Worker verified anchors; the coordinator re-read
+the one anchor the seam worker could not reach (`server:src/ws.rs:179-189`,
+mismatch → error frame → close: CONFIRMED) and owns every disposition below.
+"Triage erzeugt keine Umsetzung" — nothing here was fixed.
+
+| # | Anchor state | Chain state | Disposition (coordinator) |
+| --- | --- | --- | --- |
+| 4 | CONFIRMED, but claim overstates: cap is `MAX_OPEN_UPLOADS = 4` (`server:src/blobs.rs:33`), not 5 | race CODE-VERIFIED **and documented as accepted**: `blobs.rs:369-371` "Concurrent creates can overshoot by at most 4 open uploads × 25 MiB; that window is accepted"; finalization checks size+hash, never aggregate quota | **Verwerfen als Hochbefund** (bounded + design-accepted). Optional small hardening: aggregate-quota re-check at finalization → F3 pool |
+| 5 | CONFIRMED (`server:src/db.rs:470-476` unconditional insert, no doc_uuid validation in dispatch `handlers.rs:88-107`, no CHECK in `001_init.sql`) | CODE-VERIFIED; `ON CONFLICT(vault_id, doc_uuid) DO UPDATE` semantics confirmed (distinct UUIDs grow, repeats don't) | **Fix-Kandidat (klein)**: length/shape cap on `doc_uuid` at WS dispatch. Requires only synthetic unit test |
+| 6 | CONFIRMED (sole `sanitize_svg` call site = upload `plugin:src/blob-uploader.ts:325`; download writes after self-attested-hash compare `blob-downloader.ts:199`; 413 → `quotaExceededUntil` at `:380/:482` gates BEFORE sanitize `:279`) | CODE-VERIFIED; `<img>`-inert tempering stays ASSUMED (Obsidian runtime) | **Fix-Kandidat (klein)**: receiver-side `sanitize_svg` before `writeBinary` — the hash is server-attested, so sender-side-only is no defence against the threat model the review assumed (hostile server) |
+| 7 | plugin side CONFIRMED (`main.ts:500` unconditional init, `blobsEnabled()` = flag + health features, no version gate in blob lane, JWT via HTTP `:290`); server side re-read by coordinator: CONFIRMED | full chain CODE-VERIFIED (both sides now) | **Fix-Kandidat (klein)**: gate blob lane on the `/health` protocol_version the probe already parses, or unset `syncEngineInitialized` on mismatch notice |
+| 8 | CONFIRMED and narrowed: `Content-Range` total is digits-only (no negative/fractional), `Number.isFinite` redundant, **no upper bound**; upload caps absent on receive path; concurrency 2 (desktop) / 1 (mobile); `hydrateOne` try/catch contains the throw | CODE-VERIFIED | **Fix-Kandidat (klein)**: clamp/reject `total` against the blob-index entry size + a constant cap. Mobile OOM (2 × hostile total) plausible, not demonstrated |
+| 9 | CONFIRMED (24 h windows `blobs.rs:344/:383`; delete-on-touch `:450-455`, `:537-542`; hourly task only tombstones+peers, weekly only maintenance) | CODE-VERIFIED; no startup cleanup either (worker checked main.rs only — startup path untested) | **Fix-Kandidat (klein)**: abandoned-upload sweeper in the hourly task + startup sweep |
+| 10 | CONFIRMED as asymmetry: Rust allowlist on NFC+casefold (`blob_path.rs:87-89`), TS category on `toLocaleLowerCase('en-US')` (no U+017F fold), write uses RAW display path | CODE-VERIFIED asymmetry; exploit effect INERT unless a filesystem folds `ſ`→`s` (no known FS does; APFS behaviour UNKNOWN, untested) | **Verwerfen** (effect inert without FS folding). Recorded: mobile skips (TS null category), desktop hydrate path's toggle enforcement point is unverified → handed to S2e |
+| 11 | core claim WRONG: `list_docs_with_vv` (`server:src/db.rs:313-316`) returns doc_uuid/updated_at/vv only — no snapshot bytes in `doc_list` (`handlers.rs:53-66`) | snapshot amplification exists only via `sync_start` for unknown-vv clients (by design, initial sync); removal IS possible (`WS DocDelete` → `delete_doc_and_tombstone`, `handlers.rs:109-117`) | **Verwerfen** (doc_list amplification disproven). Open remnant for S2c: are document snapshots counted against the 5 GiB vault quota at all? |
+| 12 | CONFIRMED with drift (`db.rs:549-562` upsert raw, `db.rs:633-646` NOT EXISTS gate) | CODE-VERIFIED; blocking bounded for idle peers by hourly `expire_stale_peers`; keep-guard semantics documented as "UPPER BOUND, not a guarantee" (`db.rs:611-614`) | **Verwerfen** (design tradeoff; abuser must be an authenticated in-vault peer and harms own vault's GC). Optional: cap `peer_id` length together with #5 |
+| 13 | CONFIRMED; doc anchor drifted: "apply independently" sits at `docs/install-brat.md:88`, table at `:92`; category `settings` covers `appearance.json` (`path-policy.ts:44`) | whole-file LWW CODE-VERIFIED (`blob-downloader.ts:199`, comment `:213-215`); the cssTheme/enabledCssSnippets key names are an Obsidian-format fact, not in plugin code | **Fix-Kandidat (Doku, klein)**: disclose that the settings toggle includes theme/snippet activation. Code split (own category) = separate slice, Restliste |
+| 14 | CONFIRMED (`sync-engine.ts:575` first line of `onMessage`, no try; `ws.onmessage` `:377-379` synchronous; only msgpack decode site) | CODE-VERIFIED: malformed frame ⇒ uncaught handler error, no reconnect/notice, lane continues on next valid frame | **Fix-Kandidat (klein)**: try/catch + log + drop frame. Synthetic regression test (malformed bytes) possible without any device |
+
+Test-erforderlich-Verdicts: every Fix-Kandidat above is unit/integration
+testable with synthetic data only (no device, no tunnel, no invite minting).
+No finding among #4–#14 requires a live-system test to disposition.
+
+Unresolved observations handed forward:
+- #10/#13: the receive-side enforcement point of the `.obsidian` toggles on
+  DESKTOP hydrate was not located by the triage worker (mobile checks
+  category, desktop `runHydratePending` returned true unconditionally in the
+  read) — S2 flow e must pin this down.
+- #11 remnant: document-snapshot quota accounting — S2 flow c.
+
+---
+
+# Session appendix 2026-09-08 (security session) — S3 dependency triage (SCA)
+
+Method: OSV API querybatch against both lockfiles (live, 2026-09-08),
+`cargo tree -i` for chains (exit codes captured), crate sources read from
+the local cargo registry for jsonwebtoken 11.0.0. No dependency was
+changed; every "ignore" below is a PROPOSAL awaiting Richard's GO with the
+stated expiry.
+
+## Exact inventory (OSV, both repos)
+
+| Advisory | Crate (version) | Kind | Fixed | Chain (server) | Also in plugin lock |
+| --- | --- | --- | --- | --- | --- |
+| RUSTSEC-2023-0089 | atomic-polyfill 1.0.3 | unmaintained | none | **stale lock entry** — `cargo tree -i --target all`: "nothing to print" in BOTH repos (not compiled, not reachable) | yes (same stale status) |
+| RUSTSEC-2026-0247 | bitmaps 2.1.0 | unmaintained | none | im ← loro-internal ← loro 1.16.0 | yes |
+| RUSTSEC-2023-0126 | im 15.1.0 | soundness (aliasing violation in `OrdSet` insertion) | none | loro-internal | yes |
+| RUSTSEC-2026-0248 | im 15.1.0 | unmaintained | none | loro-internal | yes |
+| RUSTSEC-2023-0071 | rsa 0.9.10 | Marvin Attack, timing side channel (CVSS 3.1 5.9 Medium, AV:N/AC:H/PR:N/UI:N/S:U/C:H) | none | jsonwebtoken 11.0.0, feature `rust_crypto` (optional `dep:rsa`) | **no** (no jsonwebtoken) |
+| RUSTSEC-2026-0251 | sized-chunks 0.6.5 | unmaintained | none | im | yes |
+| RUSTSEC-2026-0255 | sized-chunks 0.6.5 | soundness (panic-safety unsoundness, UAF/double-free in Chunk/RingBuffer/InlineArray) | none | im | yes |
+
+Server = 7 (matches the workflow comment), plugin = 6 (same minus rsa).
+
+## Exposure assessment
+
+**rsa / RUSTSEC-2023-0071 — no reachable operation.** The server signs and
+verifies HS256 exclusively: `Header::default()` (HS256) at signing,
+`Validation::default()` = `vec![HS256]` (jsonwebtoken src/validation.rs:161-165),
+and decode rejects any header alg outside `validation.algorithms`
+(src/decoding.rs:278, :342 — closes alg confusion). `grep -rn "Algorithm::"
+server/src/` → rc=1 (no use). The advisory's vulnerable operation (RSA
+PKCS#1 v1.5 decryption) is never executed; rsa is compiled in as dead code
+because feature `rust_crypto` bundles all backends — jsonwebtoken 11 offers
+no hmac-only feature set (features: default=use_pem, rust_crypto, aws_lc_rs;
+hmac is optional via rust_crypto only). Timing side channels need the
+vulnerable operation to run: exposure = none. Residual risk = future code
+starts using RS* algs (no such code exists).
+
+**im family (bitmaps/im/sized-chunks) — latent soundness + maintenance risk
+inside the CRDT engine, unresolvable upstream today.** loro 1.16.0 is the
+newest release (crates.io, checked 2026-09-08) and still depends on
+im 15.1.0. Whether loro-internal's usage touches the affected `OrdSet`
+insertion (RUSTSEC-2023-0126) or can panic inside sized-chunks ops
+(RUSTSEC-2026-0255) is UNKNOWN without auditing loro-internal — no known
+network-reachable trigger exists against loro. If triggered: memory
+corruption in the server process (native) / inside the wasm sandbox in the
+plugin. The 2026-0247/0248/0251 unmaintained flags are the forward-looking
+risk: no maintainer to fix the soundness bugs.
+
+**atomic-polyfill — scanner artifact.** Unreachable in both resolution
+graphs; a lockfile regeneration would drop it (needs GO since it touches
+Cargo.lock).
+
+## Options (proposal, each needs Richard's GO)
+
+1. **Accept rsa as compiled-dead** with the exposure analysis above recorded
+   here; revisit when jsonwebtoken ships a leaner feature set or a fixed
+   rsa. Expiry: re-adjudicate at the next jsonwebtoken release or
+   2026-12-08, whichever first.
+2. **Accept the im family** as carried by loro, tracked: re-run this triage
+   on every loro bump (they own the im dependency). Expiry: re-adjudicate
+   at the next loro release or 2026-12-08.
+3. **Optional cleanup**: regenerate both Cargo.locks to drop the stale
+   atomic-polyfill entry (removes 1 of 7 scanner rows; zero code effect).
+4. **Not proposed**: patching jsonwebtoken via `[patch]` to strip rsa
+   (fragile, version-coupled), or replacing the JWT crate (code change with
+   crypto review — no exposure today justifies it).
+
+---
+
+# Session appendix 2026-09-08 (security session) — S2 flow reviews (new findings N1–N19)
+
+Method: five gpt-6 (astra) medium read-only runs, one per control flow, per
+the defensive review template (no PoCs, repo-content-as-data, static only;
+run ids: a `ca588b46`, b `b670910d`, c `14e35016`, d `ea878c87`, e
+`0d33beef`; all exit 0). Cross-flow agreement is high where flows overlap
+(a/b on retirement, c/d on key/display binding) — no glm-5.3-max second
+opinion was needed (no dispute). The coordinator re-verified the two
+context corrections the runs produced (retire = admin token + name
+confirmation, `server:src/lib.rs:345-404`; invite mint sits behind the IP
+rate limiter) by direct code read. All patches below are UNVERIFIED
+proposals from the reviewers.
+
+## Consolidated new findings
+
+| # | Finding | Where | Sev | Confidence | Disposition (coordinator) |
+| --- | --- | --- | --- | --- | --- |
+| N1 | Retirement does not end membership: JWT (≤1 h + 60 s leeway) keeps full HTTP/WS surface; live sockets unlimited; retired peer's old JWT can still MINT invites → redeem (checks invite only, not inviter) → new permanent device key. Outstanding invites survive retirement. CWE-613 | server | high | high (two flows independently; anchors re-read by coordinator for the retire gate) | **Richard decision**: is retirement a security boundary (stolen-device case) or retention tool (current docs/ops-daily.md:103)? Full fix = device identity in JWT + revocation epoch + socket termination + invite invalidation (design slice). Interim: document the ≤1h mint window |
+| N2 | `device_auth` TOCTOU: key hash read under lock → argon2 verify outside → retirement may commit between → JWT minted for a revoked key. CWE-367 | server `invites.rs:198-214` | medium | high static | Fix-Kandidat (small): re-check revoked state after verify, before sign |
+| N3 | Device keys without a peers row cannot be retired (redeem creates only device_keys; peers row appears on WS connect; retire 404s without it; empty stored device_name makes confirmation impossible). CWE-841 | server | medium | high | Fix-Kandidat (small-medium): revoke keys independent of retention peers |
+| N4 | No invite inventory quota (IP rate limit only, shared across onboarding routes); redeem scan materializes all last-day invites linearly. A leaked invite = permanent vault membership incl. delegation, not 15 minutes. CWE-770 | server | medium | high | Fix-Kandidat (small): per-vault open-invite cap; accept + document the leaked-invite semantics |
+| N5 | The 5 GiB quota covers ONLY blobs (+24 h inflight). Documents, VVs, blob-path rows, tombstones are unquota'd → authenticated peer can grow storage unboundedly (50 MiB per frame is not an aggregate cap). REOPENS #11 in corrected form (doc_list amplification itself disproven). CWE-770 | server `handlers.rs:245/349`, `db.rs:254/466` | high | high | Fix-Kandidat (medium slice): total-budget check on snapshot/VV growth |
+| N6 | No cumulative receive budget in the plugin: hostile server + many small valid files → unbounded disk + index growth; and no finite download cap (Content-Range total #8 OR plain HTTP-200 full body). CWE-770/400 | plugin | high (vs hostile server) | high | Fix-Kandidat (small-medium): device byte/count budget + finite download cap |
+| N7 | Catch-up pagination loses pages: with >1000 pending path states the client adopts the server's global max_seq after ONE page → later states skipped until re-touched. Correctness bug, honest server suffices | plugin+server | medium | high | Fix-Kandidat (small): cursor from processed states, paginate fully |
+| N8 | 413 quota pause parks permanently (no timed retry after 60 s); a 413 can also strand an uploaded blob before referencing; delete/rename paths ignore the pause. Availability | plugin | medium | high | Fix-Kandidat (small): timed retry/backoff, scoped park reasons |
+| N9 | `path_key`/`display_path` and claimed size are not bound to the actual blob (registration checks each independently; size caps test the CLAIM, not the blob row) → receiver resolves differently than sender; type caps unreliable | server+plugin | medium | high (c+d agree) | Fix-Kandidat (small): server canonicalizes and enforces key==blob_path_key(display), size from blob row |
+| N10 | `doc_tombstoned` handler renames a remote-named TFile without any path-policy check (unsolicited tombstone → renameFile of non-syncable existing file possible). CWE-20 | plugin `sync-engine.ts:952-985` | medium | high | Fix-Kandidat (small): gate rename through isSyncablePath + correlate with pending push |
+| N11 | Conflict copies: `getAbstractFileByPath` check + async write window (no atomic no-clobber), suffix can exceed the 1024-byte key budget before upload-side rejection. CWE-367/20 | plugin `conflict-utils.ts:68` | medium | medium | Fix-Kandidat (small): no-clobber create + length budget |
+| N12 | `hasIllegalSegments` misses control chars / Windows-reserved names (no traversal — portability/alias risk only). Context correction to #2-era assumptions | plugin+server | low-med | high | Verwerfen für Release; note in hardening backlog |
+| N13 | Diagnostics export can leak raw display paths (redaction covers secrets, not paths; ring 50×300 units; console uncapped). CWE-532 | plugin | low-med | high | Fix-Kandidat (small, Doku or pseudonymization opt-in) |
+| N14 | Persisted blob-index not re-validated on load (old/tampered index data reaches mkdir/writeBinary without a fresh gate). CWE-20 hardening gap | plugin `blob-index.ts:44` | medium | high | Fix-Kandidat (small): re-validate entries at load |
+| N15 | Styles/settings toggle OFF does not stop pending or in-flight hydrations (entry indexed under ON; OFF updates settings only) → category file written despite OFF. CWE-863 | plugin | medium | high | Fix-Kandidat (small): check current toggle at write time |
+| N16 | Remote tombstones bypass OFF: unskipped category entry + OFF → local file REMOVED (adapter trash), locally-modified file REPUBLISHED without toggle gate. CWE-863 | plugin | medium | high | Fix-Kandidat (small, same slice as N15): gate remove/republish on current toggle |
+| N17 | Uploads that passed the gate under ON continue publishing after OFF (no re-check before network effect). CWE-863 | plugin | medium | high | Fix-Kandidat (same slice as N15/N16): re-check before POST/reference |
+| N18 | peer_id collision on redeem → SQL constraint error instead of defined 409 (safe rollback, poor UX) | server | low | high | Verwerfen für Release (note) |
+| N19 | device_name/peer_id unvalidated → log interpolation (CWE-117) + large metadata rows | server | low | high | Bundle with #5 caps slice (length/charset) |
+
+## Positive confirmations (no finding, recorded to close open questions)
+
+- Invite single-use is race-safe (conditional UPDATE is the FIRST statement
+  of the transaction; single mutex-guarded connection; multi-process
+  serialized by SQLite write locks) — flow b, and the existing test.
+- Broadcast fan-out is vault-scoped on every event type (delta/delete/blob).
+- No cross-vault upload/blob access found (same-vault cooperation by design).
+- The #10 `.obſidian` chain: NO software remap to the real `.obsidian`
+  exists (flow d traced index, pathForKey, sweeps); current server rejects
+  the registration outright → #10 disposition "verwerfen (inert)" stands.
+- `.obsidian` receive-side toggle enforcement EXISTS at index time
+  (`applyRemoteLive` → `categoryDetached` → `skipped:true`) — this closes
+  the S1 open question from #10/#13; the gaps are the transitions (N15-N17).
+- plugins/** and workspace* stay excluded on BOTH gates (Rust allowlist
+  verified; no code-execution surface beyond CSS identified).
+- #2's gates hold on all REGULAR entrances (flow d); the ungated sinks are
+  NEW paths (N10 tombstone-rename, N11 conflict-copy), not #2 regressions.
+- JWT leeway: settled from crate source — `Validation::default()` = HS256
+  only + leeway 60 s (jsonwebtoken src/validation.rs:126, :161-165;
+  decoding.rs:278/:342 reject foreign algs). Closes review Open Question 3
+  for our usage; upper bound on any JWT = exp + 60 s.
+
+## Scanner alerts adjudication
+
+osv/RustSec: adjudicated in the S3 section above (exact IDs, chains,
+exposure). CodeQL: both Security tabs are UNREADABLE from this session
+(gh unauthenticated; API 401 — measured). Runs are green since `d7400ce`/
+`89995ce`, but green upload ≠ zero alerts. **Explicitly out of scope until
+Richard authenticates `gh` or eyeballs the tabs**; re-adjudication is a
+5-minute follow-up.
+
+## Corrections issued during S2 (already applied above)
+
+- Appendix C: retire = admin token (was: VaultAuth) — corrected.
+- Appendix C: `/invite` mint is behind the onboarding IP rate limiter
+  (was: listed only redeem/device as rate-limited) — corrected.
+- S1 open question (receive-toggle enforcement point): answered (index
+  time), see N15-N17 for the actual gaps.
