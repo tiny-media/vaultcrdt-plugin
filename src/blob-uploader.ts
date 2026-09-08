@@ -1,6 +1,6 @@
 import { requestUrl } from 'obsidian';
 import { blake3_hex, sanitize_svg } from '../wasm/vaultcrdt_wasm';
-import { attachmentCap, isSvgPath, obsidianSyncCategoryOf, pathCaseKey, type ObsidianSyncEnabled } from './path-policy';
+import { attachmentCap, isCategoryWriteAllowed, isSvgPath, obsidianSyncCategoryOf, pathCaseKey, type ObsidianSyncEnabled } from './path-policy';
 import { toHttpBase } from './url-policy';
 import { log, error, warn } from './logger';
 import { attachmentTooLargeMessage, quotaExceededMessage, remoteDeleteKeptNoticeMessage, remoteDeleteRemovedNoticeMessage, remoteDeleteTrashedNoticeMessage, svgRejectedMessage } from './user-facing-copy';
@@ -115,6 +115,15 @@ export class BlobUploader {
     return this.deps.obsidianSyncEnabled?.() ?? { settings: false, styles: false };
   }
 
+  /**
+   * N17 gate: may this path still cause a network/file effect right now?
+   * Reads the CURRENT toggle state (never a snapshot) and only ever blocks
+   * categorizable .obsidian paths — ordinary attachments pass unchanged.
+   */
+  private writeAllowed(path: string): boolean {
+    return isCategoryWriteAllowed(path, this.enabled());
+  }
+
   /** Vault create/modify for an attachment path. */
   onFileChanged(path: string): void {
     const cat = obsidianSyncCategoryOf(path);
@@ -176,6 +185,13 @@ export class BlobUploader {
       return;
     }
 
+    // Toggle may have flipped OFF during the awaits above.
+    if (!this.writeAllowed(newPath) || !this.writeAllowed(oldPath)) {
+      this.deps.index.move(oldPath, newPath);
+      this.deps.index.update(newPath, { skipped: true });
+      return;
+    }
+
     const generation = old.generation + 1;
     if (old.key === newKey) {
       const resp = await this.postPath({
@@ -227,7 +243,7 @@ export class BlobUploader {
       this.deps.index.remove(path);
       return;
     }
-    if (await this.deps.blobsEnabled()) {
+    if ((await this.deps.blobsEnabled()) && this.writeAllowed(path)) {
       const generation = entry.generation + 1;
       const resp = await this.postPath({
         path, key: entry.key, hash: entry.hash, size: entry.size, generation, state: 'deleted',
@@ -303,6 +319,13 @@ export class BlobUploader {
     // Echo suppression: the server already has exactly these bytes for this path.
     const entry = this.deps.index.get(path);
     if (entry && entry.lastRemoteHash === hash) return;
+
+    // Gate immediately before the first POST effect (getJwt() sits between
+    // this decision and the request, so re-check here, not earlier).
+    if (!this.writeAllowed(path)) {
+      this.deps.index.update(path, { skipped: true });
+      return;
+    }
 
     const uploaded = await this.ensureBlob(path, hash, size, bytes);
     if (!uploaded) {
@@ -383,6 +406,10 @@ export class BlobUploader {
 
   /** Upload the bytes unless the server already stores this hash. Returns false on quota or 422. */
   private async ensureBlob(path: string, hash: string, size: number, bytes: Uint8Array): Promise<boolean> {
+    if (!this.writeAllowed(path)) {
+      this.deps.index.update(path, { skipped: true });
+      return false;
+    }
     const start = await this.http('POST', '/vault/blobs/uploads', { hash, size });
     if (start.status === 413) {
       this.applyQuotaPause(start.json);
@@ -411,6 +438,11 @@ export class BlobUploader {
     while (offset < size) {
       const end = Math.min(offset + segment, size);
       let resp: HttpResult;
+      // Mid-cycle flip: no further segment PUT once the category is OFF.
+      if (!this.writeAllowed(path)) {
+        this.deps.index.update(path, { skipped: true });
+        return false;
+      }
       try {
         resp = await this.putSegment(uploadId, bytes, offset, end, size);
         if (resp.status === 422) {
@@ -461,6 +493,11 @@ export class BlobUploader {
     retriedUpload = false,
   ): Promise<void> {
     if (this.now() < this.quotaExceededUntil) {
+      this.deps.index.update(path, { skipped: true });
+      return;
+    }
+    // Gate immediately before the reference POST.
+    if (!this.writeAllowed(path)) {
       this.deps.index.update(path, { skipped: true });
       return;
     }
@@ -662,6 +699,12 @@ export class BlobUploader {
       this.deps.index.remove(path);
       return;
     }
+    // N16: category toggle OFF right now — detach only. No trash, no
+    // adapter.remove, no republish; just drop the index entry.
+    if (!this.writeAllowed(path)) {
+      this.deps.index.remove(path);
+      return;
+    }
 
     const remoteGen = typeof s.generation === 'number' ? s.generation : local.generation;
     const stat = await this.deps.stat(path);
@@ -710,6 +753,10 @@ export class BlobUploader {
     const hash = blake3_hex(bytes);
     const uploaded = await this.ensureBlob(path, hash, size, bytes);
     if (!uploaded) return;
+    if (!this.writeAllowed(path)) {
+      this.deps.index.update(path, { skipped: true });
+      return;
+    }
     const generation = Math.max(local.generation, remoteGen) + 1;
     const resp = await this.postPath({
       path, key: local.key, hash, size, generation, state: 'live',

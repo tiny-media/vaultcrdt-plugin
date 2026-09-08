@@ -6,6 +6,7 @@ import type { BlobDownloader } from './blob-downloader';
 import { warn } from './logger';
 import {
   OBSIDIAN_CAP,
+  isCategoryWriteAllowed,
   obsidianSyncCategory,
   obsidianSyncCategoryOf,
   type ObsidianSyncCategory,
@@ -186,6 +187,9 @@ export class ObsidianSync {
     const presentSet = new Set(present);
 
     for (const path of present) {
+      // Per-item re-check: `enabled` above is a snapshot taken before async
+      // work; the toggle may have flipped OFF since.
+      if (!isCategoryWriteAllowed(path, this.deps.enabled())) continue;
       const st = await this.deps.stat(path);
       if (!st) continue;
       const entry = this.deps.index.get(path);
@@ -199,6 +203,7 @@ export class ObsidianSync {
     for (const [path, entry] of this.deps.index.entries()) {
       if (obsidianSyncCategory(path, enabled) === null) continue;
       if (presentSet.has(path)) continue;
+      if (!isCategoryWriteAllowed(path, this.deps.enabled())) continue;
       if (entry.hydrated && !entry.skipped) {
         await this.deps.onFileDeleted(path);
       }

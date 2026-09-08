@@ -92,6 +92,8 @@ Under **Settings → VaultCRDT → Sync**, both toggles default to off and apply
 | **Keep app settings the same on all devices** | `.obsidian/app.json`, `.obsidian/appearance.json` |
 | **Carry themes & CSS snippets over** | `.obsidian/snippets/<name>.css`, `.obsidian/themes/<theme>/theme.css`, `.obsidian/themes/<theme>/manifest.json` |
 
+The app-settings toggle also governs which theme and which CSS snippets are active on the other devices, because `appearance.json` carries Obsidian's `cssTheme` and `enabledCssSnippets` keys.
+
 Snippet files must be directly inside `snippets`; theme files must be directly inside a single theme folder. Each file has a 2 MiB cap. The standard `.obsidian` folder name is required; a custom configuration directory is not synced.
 
 These files use whole-file last-write-wins: concurrent changes keep one side, without JSON-key merging or conflict copies. Enabled category files download eagerly on both desktop and mobile. Turning a category off stops its sync without deleting local files.

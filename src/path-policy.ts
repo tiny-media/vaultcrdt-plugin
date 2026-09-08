@@ -115,6 +115,21 @@ export function obsidianSyncCategory(
 }
 
 /**
+ * Receive/send-side effect gate for the .obsidian lane: false only when
+ * `path` is CATEGORIZABLE and its category is currently disabled. Ordinary
+ * attachments and enabled categories always return true. Callers must pass
+ * the CURRENT toggle state (read at the moment of the effect, not a snapshot).
+ */
+export function isCategoryWriteAllowed(
+  path: string,
+  enabled: ObsidianSyncEnabled = OBSIDIAN_SYNC_OFF,
+): boolean {
+  const cat = obsidianSyncCategoryOf(path);
+  if (!cat) return true;
+  return (enabled ?? OBSIDIAN_SYNC_OFF)[cat] === true;
+}
+
+/**
  * Cheap gate for routing attachment events. Structure rules mirror
  * isSyncablePath; the canonical key (NFC + casefold) is the Rust
  * blob_path_key — deliberately NOT replicated here.

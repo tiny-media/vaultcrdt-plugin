@@ -109,8 +109,12 @@ function makePair(opts: {
   cache?: { embeds?: { link: string }[]; links?: { link: string }[] } | null;
   cacheFor?: (file: TFile) => { embeds?: { link: string }[]; links?: { link: string }[] } | null;
   enabled?: { settings: boolean; styles: boolean };
+  /** Dynamic toggles (mid-flight flips); overrides `enabled` when given. */
+  categoryEnabled?: () => { settings: boolean; styles: boolean };
   hydrateActiveFile?: () => void;
 } = {}) {
+  const enabledNow = () =>
+    opts.categoryEnabled?.() ?? opts.enabled ?? { settings: false, styles: false };
   const vault = makeVault();
   const index = new BlobIndex(memStorage());
   const enqueue = vi.fn();
@@ -124,6 +128,7 @@ function makePair(opts: {
     writeBinary: (p, data) => vault.writeBinary(p, data),
     readBinary: vault.readBinary,
     enqueueUpload: enqueue,
+    categoryEnabled: enabledNow,
     app: makeApp(vault.files),
     isMobile: opts.isMobile ?? false,
     getFileCache: (file) => (opts.cacheFor ? opts.cacheFor(file) : opts.cache ?? null),
@@ -142,7 +147,7 @@ function makePair(opts: {
     sleep: async () => undefined,
     now: () => 0,
     hydratePending: () => downloader.hydratePending(),
-    obsidianSyncEnabled: () => opts.enabled ?? { settings: false, styles: false },
+    obsidianSyncEnabled: enabledNow,
     hydrateActiveFile: opts.hydrateActiveFile,
   });
   return { vault, index, downloader, uploader, enqueue };

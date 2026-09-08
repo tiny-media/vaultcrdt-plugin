@@ -110,6 +110,7 @@ export default class VaultCRDTPlugin extends Plugin {
       writeBinary: (path, data) => this.app.vault.adapter.writeBinary(path, data),
       readBinary: (path) => this.app.vault.adapter.readBinary(path),
       enqueueUpload: (path) => this.blobUploader.onFileChanged(path),
+      categoryEnabled: () => this.settings?.obsidianSync ?? { settings: false, styles: false },
       app: this.app,
       isMobile: Platform.isMobile,
       getFileCache: (file) => this.app.metadataCache.getFileCache(file),

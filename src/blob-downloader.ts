@@ -2,7 +2,14 @@ import type { App, TFile } from 'obsidian';
 import { blake3_hex, blob_path_key, sanitize_svg } from '../wasm/vaultcrdt_wasm';
 import { conflictPath } from './conflict-utils';
 import { log, error } from './logger';
-import { AUDIO_CAP, isSvgPath, obsidianSyncCategoryOf, pathCaseKey } from './path-policy';
+import {
+  AUDIO_CAP,
+  isCategoryWriteAllowed,
+  isSvgPath,
+  obsidianSyncCategoryOf,
+  pathCaseKey,
+  type ObsidianSyncEnabled,
+} from './path-policy';
 import { blobRequest, headerValue } from './blob-uploader';
 import type { BlobIndex, BlobIndexEntry } from './blob-index';
 
@@ -19,6 +26,8 @@ export interface BlobDownloaderDeps {
   writeBinary(path: string, data: ArrayBuffer): Promise<void>;
   readBinary(path: string): Promise<ArrayBuffer>;
   enqueueUpload(path: string): void;
+  /** Current per-device .obsidian category toggles (read at effect time). */
+  categoryEnabled(): ObsidianSyncEnabled;
   app: App;
   isMobile: boolean;
   getFileCache(file: TFile): { embeds?: { link: string }[]; links?: { link: string }[] } | null;
@@ -190,6 +199,15 @@ export class BlobDownloader {
       // The index/echo baseline is the LOCAL truth (sanitized bytes); the
       // remote comparison above already happened against transport bytes.
       const hash = isSvgPath(path) ? blake3_hex(local) : remoteHash;
+
+      // N15 gate: the category toggle may have flipped OFF while this download
+      // ran. Checked right before the first write effect, against the CURRENT
+      // toggle state. Non-categorizable paths are never gated here.
+      if (!isCategoryWriteAllowed(path, this.deps.categoryEnabled())) {
+        log('blob.hydrate.category-off', path);
+        this.deps.index.update(path, { skipped: true, hydrated: false });
+        return;
+      }
 
       await this.maybeConflictCopy(path, entry, hash);
       await this.mkdirParents(path);
