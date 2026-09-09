@@ -4331,6 +4331,122 @@ describe('SyncEngine', () => {
   });
 
   describe('doc_tombstoned', () => {
+    it.each([null, { delta: new Uint8Array([1]), serverVV: '{}' }])('fences controlled probe survivors (%j)', async live => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      let release!: (value: any) => void;
+      let resumed = false;
+      vi.spyOn(internal, 'probeServerDoc').mockImplementation(async () => {
+        const value = await new Promise(resolve => { release = resolve; });
+        resumed = true;
+        return value;
+      });
+      const push = vi.spyOn(internal.push, 'pushDocCreate');
+      const persist = vi.spyOn(internal.docs, 'persist');
+      const trace = vi.spyOn(internal.trace, 'markPath');
+      const task = internal.handleDocTombstoned('doomed.md');
+      await engine.restart();
+      release(live);
+      await task;
+      expect(resumed).toBe(true);
+      expect(ctx.renameFile).not.toHaveBeenCalled();
+      expect(ctx.getOrLoad).not.toHaveBeenCalled();
+      expect(push).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+      expect(internal.tombstoneLivenessChecked.size).toBe(0);
+      expect(trace).toHaveBeenCalledWith('tombstoned.fence-stopped', 'doomed.md');
+    });
+
+    it('fences an already-issued load after restart', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      vi.spyOn(internal, 'probeServerDoc').mockResolvedValue({ delta: new Uint8Array([1]), serverVV: '{}' });
+      let release!: (value: any) => void;
+      ctx.getOrLoad.mockImplementation(() => new Promise(resolve => { release = resolve; }));
+      const trace = vi.spyOn(internal.trace, 'markPath');
+      const task = internal.handleDocTombstoned('doomed.md');
+      await flush();
+      expect(ctx.getOrLoad).toHaveBeenCalledTimes(1);
+      await engine.restart();
+      const doc = { sync_from_disk: vi.fn(), text_matches: vi.fn() };
+      release(doc);
+      await task; // Explicitly await the resumed survivor.
+      expect(doc.sync_from_disk).not.toHaveBeenCalled();
+      expect(trace).toHaveBeenCalledWith('tombstoned.fence-stopped', 'doomed.md');
+    });
+
+    it('fences the outer continuation independently after a definitive decision', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      let release!: (value: boolean) => void;
+      vi.spyOn(internal, 'tombstoneRefusalIsStale').mockImplementation(() => new Promise(resolve => { release = resolve; }));
+      const trace = vi.spyOn(internal.trace, 'markPath');
+      const task = internal.handleDocTombstoned('doomed.md');
+      // Complete the restart FIRST so the resumed continuation is caught by
+      // the generation mismatch (stopped is false again), not by stopped.
+      await engine.restart();
+      release(false);
+      await task;
+      expect(ctx.renameFile).not.toHaveBeenCalled();
+      expect(trace).toHaveBeenCalledWith('tombstoned.fence-stopped', 'doomed.md');
+    });
+
+    it('retries failed renames without re-probing until restart', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      const probe = vi.spyOn(internal, 'probeServerDoc').mockResolvedValue(null);
+      ctx.renameFile.mockRejectedValue(new Error('rename failed'));
+      await internal.handleDocTombstoned('doomed.md');
+      expect(internal.notifiedTombstones.size).toBe(0);
+      await internal.handleDocTombstoned('doomed.md');
+      expect(ctx.renameFile).toHaveBeenCalledTimes(2);
+      expect(probe).toHaveBeenCalledTimes(1);
+      await engine.restart();
+      await internal.handleDocTombstoned('doomed.md');
+      expect(probe).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps completed path dedup across restart and recreation (N7 ④/R2 residual)', async () => {
+      const paths = ['doomed.md'];
+      const ctx = await startContainmentEngine(paths);
+      const internal = engine as any;
+      vi.spyOn(internal, 'probeServerDoc').mockResolvedValue(null);
+      await internal.handleDocTombstoned('doomed.md');
+      expect(paths).not.toContain('doomed.md');
+      await engine.restart();
+      paths.push('doomed.md'); // Actual new incarnation; N7 ④/R2 supplies identity later.
+      ctx.add.mockClear();
+      await internal.handleDocTombstoned('doomed.md');
+      expect(ctx.renameFile).toHaveBeenCalledTimes(1);
+      expect(ctx.add).not.toHaveBeenCalled();
+    });
+
+    it.each([false, true])('fences rename settlement after restart (failure: %s)', async failure => {
+      const paths = ['doomed.md'];
+      const ctx = await startContainmentEngine(paths);
+      const internal = engine as any;
+      const probe = vi.spyOn(internal, 'probeServerDoc').mockResolvedValue(null);
+      let resolve!: () => void;
+      let reject!: (error: Error) => void;
+      ctx.renameFile.mockImplementationOnce(() => new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
+      const task = internal.handleDocTombstoned('doomed.md');
+      await flush();
+      expect(ctx.renameFile).toHaveBeenCalledTimes(1);
+      await engine.restart();
+      ctx.add.mockClear();
+      notices.length = 0;
+      if (failure) reject(new Error('retired rename failed'));
+      else { paths.splice(0, 1, 'doomed (deleted-remote).md'); resolve(); }
+      await task; // Settlement continuation has resumed, not merely broker rejection.
+      expect(ctx.add).not.toHaveBeenCalled();
+      expect(notices).toEqual([]);
+      expect(internal.notifiedTombstones.has('doomed.md')).toBe(!failure);
+      await internal.handleDocTombstoned('doomed.md');
+      expect(ctx.renameFile).toHaveBeenCalledTimes(failure ? 2 : 1);
+      if (failure) expect(probe).toHaveBeenCalledTimes(2);
+      else expect(ctx.add).not.toHaveBeenCalled();
+    });
+
     it('fences a definitive refusal answered immediately before stop', async () => {
       const ctx = await startContainmentEngine(['doomed.md']);
       const trace = vi.spyOn((engine as any).trace, 'markPath');
@@ -4490,7 +4606,10 @@ describe('SyncEngine', () => {
         paths.includes(p)
           ? Object.assign(Object.create(TFile.prototype), { path: p })
           : null);
-      const renameFile = vi.fn().mockResolvedValue(undefined);
+      const renameFile = vi.fn().mockImplementation(async (file, destination) => {
+        const index = paths.indexOf(file.path);
+        if (index >= 0) paths.splice(index, 1, destination);
+      });
       const app = makeApp();
       app.fileManager = { renameFile };
       engine = new SyncEngine(app, makeSettings());
@@ -4680,6 +4799,9 @@ describe('SyncEngine', () => {
       }
       const trace = vi.spyOn(internal.trace, 'mark');
       const pathTrace = vi.spyOn(internal.trace, 'markPath');
+      const add = vi.fn();
+      engine.inbox = { add };
+      notices.length = 0;
       const failure = new Error('overlap socket died');
       const syncPromise = engine.initialSync();
       const rejected = expect(syncPromise).rejects.toBe(failure);
@@ -4705,6 +4827,8 @@ describe('SyncEngine', () => {
       if (secondStarted) fireMessage({ type: 'doc_unknown', doc_uuid: 'second.md' });
       await rejected;
       expect(secondStarted).toBe(false);
+      expect(add).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'failed-docs' }));
+      expect(notices).toEqual([]);
       expect(pathTrace).toHaveBeenCalledWith('initial-sync.overlap-sync', 'first.md',
         expect.objectContaining({ reason: hashMismatch ? 'hash-mismatch' : 'no-cache' }));
       expect(pathTrace).not.toHaveBeenCalledWith('initial-sync.overlap-sync', 'second.md', expect.anything());
