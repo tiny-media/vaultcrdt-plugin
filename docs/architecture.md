@@ -50,27 +50,42 @@ publication before awaiting teardown; it does not cancel ongoing downloads.
 
 **BlobIndex — `src/blob-index.ts:BlobIndex`.** Maps raw vault paths to canonical keys, hashes, sizes, generations, sequence
 numbers, hydration/skipped flags and remote hash baselines. New updates and
-moves require a WASM path key. JSON writes are serialised. `load(ready)` reads
-stored JSON once and requires an explicit asynchronous readiness callback.
-For a v1 object with an object (not array) path map, own entries that are
-non-array objects with string key/hash fields are candidates. A nonempty
-candidate set awaits readiness before any canonical export call or admission;
-absent, malformed or candidate-free data needs neither readiness nor exports.
-Admission requires the existing WASM `blob_path_key(rawPath)` to accept the
-path and equal the stored key. Invalid paths and mismatched bindings are
-omitted without logging raw data; unrelated valid entries retain raw spelling,
-including Unicode. Index maps have no prototype-derived entries.
+moves require a WASM path key. Persistence is a serialized two-write
+protocol (`adapter.write` only): the backup file receives exactly the bytes
+just re-read as valid main, then main receives the new snapshot, and every
+write is verified by strict validation plus exact readback equality. A
+failed main write re-validates main before any backup rotation; repair
+restores main from a frozen backup (`src/blob-index.ts:step`,
+`writeVerified`). Persist failures surface as `lastPersistError` with a
+single-flight 30 s retry timer and a flush that re-attempts and rejects
+while the error stands; `dispose()` stops the timer on unload.
 
-Loading never writes repairs or migrates storage, and preserves existing
-metadata defaults, empty hashes, skipped/unhydrated states and `maxSeq`
-semantics (no cursor recomputation). Readiness failure propagates without
-replacing the prior in-memory index or writing storage; `main.ts:onload` shows
-the existing WASM failure notice and aborts before consumers/registrations.
-An explicit retry reads storage anew; there is no automatic retry loop.
-Synthetic coverage: `blob-index-load.test.ts` uses real WASM initialization
-and downloader/filesystem mocks; `blob-index-readiness.test.ts` and
-`main-blob-index-startup.test.ts` use deferred readiness/export spies to pin
-cold-start ordering. These are not native protocol-dispatch or device tests.
+`load(ready)` is an exclusive FIFO task (not a tail await): it reads main
+and backup through one strict validator (`validateIndexFile`) that admits
+WHOLE snapshots only — any invalid entry (wrong field types, key/hash
+mismatch, WASM key rejection) or envelope corruption (bad JSON, `v !== 1`,
+non-record paths, non-number maxSeq) rejects the entire snapshot; missing
+optional fields keep their defaults. A nonempty valid entry set awaits
+readiness before canonical admission; candidate-free data needs neither
+readiness nor exports. Publication happens BEFORE the inline repair
+(recovery visibility is immediate); a mutation counter keeps newer
+in-memory mutations through reload. Outcomes: `ok`, `fresh` (both files
+absent, not already poisoned), `recovered` (backup wins, main self-heals
+from it), `poisoned` (no valid snapshot: empty in-memory state including
+`maxSeq = 0`, sticky across restarts until a valid snapshot file reappears,
+corrupt main quarantined best-effort and named in the recovery notice only
+when actually written — `blobIndexRecoveryPausedMessage`). Poisoned state
+gates every blob effect path (catch-up incl. hydrate/sweep tail, watcher
+queueing, pump start/dequeue, backfill, category toggle-on) and index
+mutators refuse. Readiness failure propagates without replacing the prior
+in-memory index; `main.ts:onload` shows the existing WASM failure notice
+and aborts before consumers/registrations.
+Synthetic coverage: `blob-index-persist.test.ts` pins the save/recovery
+protocol, poison state machine and D2 retry with fault injection;
+`blob-index-load.test.ts` uses real WASM initialization and filesystem
+mocks; `blob-index-readiness.test.ts` and `main-blob-index-startup.test.ts`
+use deferred readiness/export spies to pin cold-start ordering. These are
+not native protocol-dispatch or device tests.
 
 **EditorIntegration — `src/editor-integration.ts:EditorIntegration`.** Reads open Markdown editor buffers before relying on disk. Applies Loro text
 diffs as editor transactions, converting codepoint offsets to UTF-16;
@@ -232,7 +247,8 @@ and destination note policy but still lacks pending-operation correlation.
 Other conflict-copy destinations are not revalidated
 (`src/sync-engine.ts:handleDocTombstoned`, `src/conflict-utils.ts:conflictPath`).
 Persisted blob-index paths are recanonicalised at load admission
-(`src/blob-index.ts:parse`), not via universal consumer sink guards. This uses
+(`src/blob-index.ts:validateIndexFile`, whole-snapshot), not via universal
+consumer sink guards. This uses
 the existing policy unchanged, including accepted drive-colon forms; it is not
 a new platform-specific path policy or universal filesystem-safety guarantee.
 Genuinely empty-index pre-WASM event behavior remains outside this load gate.
@@ -252,8 +268,9 @@ State comprises URI-encoded `.loro` full snapshots, schema-5 `vv-cache.json`
 storage (`src/state-storage.ts`, `src/blob-index.ts`, `src/inbox.ts`,
 `src/startup-dirty-tracker.ts`). Delete-journal `acked` can mean sent on an open
 socket, not server-confirmed (`src/push-handler.ts:PushHandler`).
-`StateStorage.cleanOrphans` exempts VV cache, delete journal and inbox, but
-not blob index; persistence across that cleanup is not guaranteed by its code.
+`StateStorage.cleanOrphans` exempts VV cache, delete journal, inbox and
+the blob-index family (`blob-index.json`, `.bak`, quarantine); their
+survival across cleanup is pinned by tests.
 
 ## Server interface
 
