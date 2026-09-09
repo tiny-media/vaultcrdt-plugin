@@ -261,7 +261,7 @@ describe('SyncEngine', () => {
       }
     });
 
-    it.each(['sync_delta', 'doc_unknown'])('logs %s after timeout, but not when a superseding waiter consumes it', async (type) => {
+    it.each(['sync_delta', 'doc_unknown'])('logs %s after timeout, but not when a registered FIFO owner consumes it', async (type) => {
       vi.useFakeTimers();
       const { log } = await import('../logger');
       const internal = engine as any;
@@ -275,14 +275,17 @@ describe('SyncEngine', () => {
         expect(() => fireMessage(frame)).not.toThrow();
         expect(log).toHaveBeenCalledExactlyOnceWith(`${internal.tag} unsolicited ${type} (no waiter): x.md`);
 
-        const first = internal.requestSyncStart('x.md', null).catch((err: Error) => err);
+        const sends = mockWsInstance.send.mock.calls.length;
+        const first = internal.requestSyncStart('x.md', null);
         const second = internal.requestSyncStart('x.md', null);
-        // A late response still consumes the replacement waiter: broker work is deferred.
-        const consumed = second.catch((err: Error) => err);
-        expect(await first).toEqual(new Error('WS request superseded: sync_delta:x.md'));
+        expect(mockWsInstance.send.mock.calls.length).toBe(sends + 1);
         vi.mocked(log).mockClear();
         fireMessage(frame);
-        expect(await consumed).toEqual(type === 'doc_unknown' ? null : { delta: frame.delta, serverVV: '{}' });
+        expect(await first).toEqual(type === 'doc_unknown' ? null : { delta: frame.delta, serverVV: '{}' });
+        expect(mockWsInstance.send.mock.calls.length).toBe(sends + 2);
+        const nextFrame = { ...frame, delta: new Uint8Array([2]), server_vv: new TextEncoder().encode('{"b":1}') };
+        fireMessage(nextFrame);
+        expect(await second).toEqual(type === 'doc_unknown' ? null : { delta: nextFrame.delta, serverVV: '{"b":1}' });
         expect(log).not.toHaveBeenCalled();
       } finally {
         internal.promises.rejectAll('test cleanup', internal.tag);
@@ -290,6 +293,15 @@ describe('SyncEngine', () => {
         vi.useRealTimers();
       }
     });
+  });
+
+  it('rejects sync requests after stop without sending or queueing', async () => {
+    await engine.start();
+    await engine.stop();
+    const sends = mockWsInstance.send.mock.calls.length;
+    await expect((engine as any).requestSyncStart('x.md', null)).rejects.toThrow('Sync engine stopped');
+    expect(mockWsInstance.send.mock.calls.length).toBe(sends);
+    expect((engine as any).broker.deliver('x.md', 'doc_unknown', null)).toBe(false);
   });
 
   // ── auth ───────────────────────────────────────────────────────────────────
@@ -5258,7 +5270,7 @@ describe('SyncEngine', () => {
       await flush();
 
       // Fail the first sync_start; succeed the second
-      (engine as any).promises.reject('sync_delta:bad.md', new Error('sync failed'));
+      expect((engine as any).broker.fail('bad.md', new Error('sync failed'))).toBe(true);
       await flush();
 
       fireMessage({
@@ -5304,6 +5316,21 @@ describe('SyncEngine', () => {
       }).not.toThrow();
       await expect(pending).rejects.toThrow(/malformed sync_delta/);
     });
+  });
+
+  it('rejects pending sync requests and empties the broker on ws close', async () => {
+    engine.onInitialSync = vi.fn();
+    try {
+      await engine.start();
+      openAndAuth();
+      const pending = (engine as any).requestSyncStart('x.md', null);
+      const rejected = expect(pending).rejects.toThrow('WebSocket closed');
+      mockWsInstance.onclose!({ code: 1006, reason: '' } as CloseEvent);
+      await rejected;
+      expect((engine as any).broker.deliver('x.md', 'doc_unknown', null)).toBe(false);
+    } finally {
+      await engine.stop();
+    }
   });
 
   describe('stale ws onclose after restart', () => {

@@ -5,6 +5,7 @@ import { createDocument, type WasmSyncDocument } from './wasm-bridge';
 import { DocumentManager } from './document-manager';
 import { vvCovers, fnv1aHash64, remoteDeletedPath, hasSharedHistory, conflictPath } from './conflict-utils';
 import { PromiseManager } from './promise-manager';
+import { SyncRequestBroker, type SyncDeltaResponse } from './sync-broker';
 import { EditorIntegration } from './editor-integration';
 import { PushHandler } from './push-handler';
 import { log, warn, error, redact } from './logger';
@@ -79,6 +80,22 @@ export class SyncEngine {
   private editor: EditorIntegration;
   private push: PushHandler;
   private promises = new PromiseManager();
+  private broker = new SyncRequestBroker((docUuid, clientVV) => {
+    this.trace.markPath('ws.sync-start', docUuid, {
+      hasClientVV: clientVV !== null,
+      clientVVLen: clientVV?.length ?? 0,
+    });
+    const clientVVBytes = clientVV !== null
+      ? new TextEncoder().encode(clientVV)
+      : null;
+    this.send({
+      type: 'sync_start',
+      doc_uuid: docUuid,
+      client_vv: clientVVBytes,
+    });
+  }, (kind, docUuid) => {
+    log(`${this.tag} unsolicited ${kind} (no waiter): ${docUuid}`);
+  });
   private ws: WebSocket | null = null;
   private token: string | null = null;
   private authedThisSocket = false;
@@ -242,6 +259,7 @@ export class SyncEngine {
     this.ws?.close();
     this.ws = null;
     this.promises.rejectAll('Sync engine stopped', this.tag);
+    this.broker.rejectAll('Sync engine stopped', this.tag);
     await this.docs.persistAll();
     await this.flushVVCache();
   }
@@ -394,6 +412,7 @@ export class SyncEngine {
       this.setStatus('offline');
       this.stopHeartbeat();
       this.promises.rejectAll('WebSocket closed', this.tag);
+      this.broker.rejectAll('WebSocket closed', this.tag);
       if (!this.stopped) this.scheduleReconnect();
     };
 
@@ -631,8 +650,8 @@ export class SyncEngine {
           const delta = msg.delta;
           const serverVv = msg.server_vv;
           if (!(delta instanceof Uint8Array) || !(serverVv instanceof Uint8Array)) {
-            this.promises.reject(
-              `sync_delta:${docUuid}`,
+            this.broker.fail(
+              docUuid,
               new Error('malformed sync_delta frame'),
             );
             break;
@@ -640,7 +659,7 @@ export class SyncEngine {
           this.trace.markPath('ws.sync-delta', docUuid, {
             deltaLen: delta.length,
           });
-          if (!this.promises.resolve(`sync_delta:${docUuid}`, {
+          if (!this.broker.deliver(docUuid, 'sync_delta', {
             delta,
             serverVV: new TextDecoder().decode(serverVv),
           })) {
@@ -649,8 +668,8 @@ export class SyncEngine {
         } catch (err) {
           warn(`${this.tag} sync_delta handler error:`, err);
           if (docUuid) {
-            this.promises.reject(
-              `sync_delta:${docUuid}`,
+            this.broker.fail(
+              docUuid,
               err instanceof Error ? err : new Error(String(err)),
             );
           }
@@ -659,7 +678,7 @@ export class SyncEngine {
       }
 
       case 'doc_unknown':
-        if (!this.promises.resolve(`sync_delta:${msg.doc_uuid as string}`, null)) {
+        if (!this.broker.deliver(msg.doc_uuid as string, 'doc_unknown', null)) {
           log(`${this.tag} unsolicited doc_unknown (no waiter): ${msg.doc_uuid as string}`);
         }
         break;
@@ -725,8 +744,8 @@ export class SyncEngine {
         // If the error names a doc, unblock the waiting sync_delta promise
         // instead of letting it stall until the 60s timeout.
         if (typeof msg.doc_uuid === 'string' && msg.doc_uuid.length > 0) {
-          this.promises.reject(
-            `sync_delta:${msg.doc_uuid}`,
+          this.broker.fail(
+            msg.doc_uuid,
             new Error(redact(redact(fieldText(msg.message) || 'server error', this.token ?? ''))),
           );
         }
@@ -1086,7 +1105,7 @@ export class SyncEngine {
   }
 
   /** sync_start probe with a bounded wait so a silent server cannot stall the refusal path. */
-  private probeServerDoc(docUuid: string): Promise<{ delta: Uint8Array; serverVV: string } | null> {
+  private probeServerDoc(docUuid: string): Promise<SyncDeltaResponse> {
     const request = this.requestSyncStart(docUuid, null);
     let timer = 0;
     const timeout = new Promise<never>((_resolve, reject) => {
@@ -1504,20 +1523,9 @@ export class SyncEngine {
   private requestSyncStart(
     docUuid: string,
     clientVV: string | null,
-  ): Promise<{ delta: Uint8Array; serverVV: string } | null> {
-    this.trace.markPath('ws.sync-start', docUuid, {
-      hasClientVV: clientVV !== null,
-      clientVVLen: clientVV?.length ?? 0,
-    });
-    const clientVVBytes = clientVV !== null
-      ? new TextEncoder().encode(clientVV)
-      : null;
-    this.send({
-      type: 'sync_start',
-      doc_uuid: docUuid,
-      client_vv: clientVVBytes,
-    });
-    return this.promises.waitFor(`sync_delta:${docUuid}`);
+  ): Promise<SyncDeltaResponse> {
+    if (this.stopped) return Promise.reject(new Error('Sync engine stopped'));
+    return this.broker.request(docUuid, clientVV);
   }
 
   private setStatus(s: SyncStatus): void {
