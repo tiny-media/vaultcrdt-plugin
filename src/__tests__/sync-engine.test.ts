@@ -241,6 +241,9 @@ describe('SyncEngine', () => {
   describe('N10b quick fixes', () => {
     it('rejects before pending persistence and does not reject again on second stop', async () => {
       const internal = engine as any;
+      engine.onInitialSync = vi.fn();
+      await engine.start();
+      openAndAuth();
       const persist = vi.spyOn(internal.docs, 'persistAll').mockImplementation(() => new Promise(() => {}));
       const rejected = vi.fn();
       const pending = internal.requestSyncStart('x.md', null).catch(rejected);
@@ -302,6 +305,71 @@ describe('SyncEngine', () => {
     await expect((engine as any).requestSyncStart('x.md', null)).rejects.toThrow('Sync engine stopped');
     expect(mockWsInstance.send.mock.calls.length).toBe(sends);
     expect((engine as any).broker.deliver('x.md', 'doc_unknown', null)).toBe(false);
+  });
+
+  it('rejects not-open requests without sending or queueing', async () => {
+    await expect((engine as any).requestSyncStart('x', null)).rejects.toThrow('WebSocket not open');
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect((engine as any).broker.deliver('x', 'doc_unknown', null)).toBe(false);
+  });
+
+  it('retires an undrained socket with healthy other-key collateral', async () => {
+    vi.useFakeTimers();
+    engine.onInitialSync = vi.fn();
+    const internal = engine as any;
+    const mark = vi.spyOn(internal.trace, 'markPath');
+    const advance = async (ms: number) => {
+      for (let t = 0; t < ms; t += 10_000) {
+        fireMessage({ type: 'pong' });
+        await vi.advanceTimersByTimeAsync(10_000);
+      }
+    };
+    try {
+      await engine.start(); openAndAuth();
+      const owner = internal.requestSyncStart('x', null).catch((e: Error) => e);
+      await advance(40_000);
+      const follower = internal.requestSyncStart('x', null).catch((e: Error) => e);
+      const other = internal.requestSyncStart('y', null).catch((e: Error) => e);
+      await advance(20_000);
+      expect(await owner).toEqual(new Error('WS request timeout: sync_delta:x'));
+      await advance(20_000); expect(mockWsInstance.close).not.toHaveBeenCalled();
+      await advance(10_000);
+      expect(mark).toHaveBeenCalledWith('ws.retire-undrained', 'x');
+      expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+      mockWsInstance.readyState = WebSocket.CLOSED;
+      mockWsInstance.onclose!({ code: 1000, reason: '' } as CloseEvent);
+      expect(await follower).toEqual(new Error('WebSocket closed'));
+      expect(await other).toEqual(new Error('WebSocket closed'));
+      await expect(internal.requestSyncStart('z', null)).rejects.toThrow('WebSocket not open');
+    } finally { await engine.stop(); vi.useRealTimers(); }
+  });
+
+  it.each(['restart', 'reconnect'] as const)('observes epoch callback values across %s construction, not open/auth', async mode => {
+    vi.useFakeTimers();
+    engine.onInitialSync = vi.fn();
+    const broker = (engine as any).broker;
+    const epoch = vi.spyOn(broker, 'epoch');
+    const sample = () => { const value = broker.epoch(); expect(epoch).toHaveLastReturnedWith(value); return value; };
+    const before = sample();
+    const nextWs = { ...mockWsInstance, send: vi.fn(), close: vi.fn() };
+    try {
+      await engine.start();
+      expect(sample()).toBe(before + 1);
+      openAndAuth(); expect(sample()).toBe(before + 1);
+      MockWebSocket.mockImplementationOnce(function () { return nextWs; });
+      if (mode === 'restart') await engine.restart();
+      else {
+        mockWsInstance.readyState = WebSocket.CLOSED;
+        mockWsInstance.onclose!({ code: 1000, reason: '' } as CloseEvent);
+        await vi.advanceTimersByTimeAsync(2_000); await flush();
+      }
+      expect((engine as any).ws).toBe(nextWs);
+      expect(sample()).toBe(before + 2);
+      nextWs.onopen!({} as Event);
+      mockDecode.mockReturnValueOnce({ type: 'auth_ok', protocol_version: 1 });
+      nextWs.onmessage!({ data: new ArrayBuffer(4) } as MessageEvent);
+      expect(sample()).toBe(before + 2);
+    } finally { await engine.stop(); vi.useRealTimers(); }
   });
 
   // ── auth ───────────────────────────────────────────────────────────────────

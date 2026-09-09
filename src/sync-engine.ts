@@ -95,7 +95,17 @@ export class SyncEngine {
     });
   }, (kind, docUuid) => {
     log(`${this.tag} unsolicited ${kind} (no waiter): ${docUuid}`);
+  }, () => this.socketEpoch, (docUuid) => {
+    if (this.stopped) return;
+    // Retire even with healthy other-key waiters: steady traffic must not
+    // postpone the 90s bound. Close may abort the whole parallel server-only
+    // download batch (wsAbortError); serial overlap keeps per-doc handling.
+    // The existing onclose path owns rejection and reconnect scheduling.
+    this.trace.markPath('ws.retire-undrained', docUuid);
+    log(`${this.tag} retiring undrained WebSocket: ${docUuid}`);
+    this.ws?.close();
   });
+  private socketEpoch = 0;
   private ws: WebSocket | null = null;
   private token: string | null = null;
   private authedThisSocket = false;
@@ -376,6 +386,7 @@ export class SyncEngine {
     const peerId = encodeURIComponent(this.settings.peerId || '');
     const url = `${this.wsUrl()}?vault_id=${encodeURIComponent(this.settings.vaultId)}&device=${device}&peer_id=${peerId}`;
     const ws = new WebSocket(url);
+    this.socketEpoch++;
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
 
@@ -1525,6 +1536,9 @@ export class SyncEngine {
     clientVV: string | null,
   ): Promise<SyncDeltaResponse> {
     if (this.stopped) return Promise.reject(new Error('Sync engine stopped'));
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('WebSocket not open'));
+    }
     return this.broker.request(docUuid, clientVV);
   }
 

@@ -5,11 +5,11 @@ vi.mock('../logger', () => ({ warn: vi.fn() }));
 beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); });
 afterEach(() => vi.useRealTimers());
 const value = { delta: new Uint8Array([1]), serverVV: '{}' };
-function setup() {
-  const send = vi.fn(); const log = vi.fn();
-  const broker = new SyncRequestBroker(send, log);
+function setup(epoch = () => 1) {
+  const send = vi.fn(); const log = vi.fn(); const retire = vi.fn();
+  const broker = new SyncRequestBroker(send, log, epoch, retire);
   const request = (key = 'x', vv: string | null = null) => broker.request(key, vv).catch(e => e);
-  return { send, log, broker, request };
+  return { send, log, broker, request, retire };
 }
 it('serializes FIFO per key and isolates keys', async () => {
   const { broker: b, send, request } = setup();
@@ -97,4 +97,34 @@ it('outer probe abandonment does not cancel queued broker work', async () => {
   await vi.advanceTimersByTimeAsync(5_000); expect(await outer).toBe('abandoned');
   b.deliver('x', 'doc_unknown', null); await owner; expect(send).toHaveBeenCalledTimes(2);
   b.deliver('x', 'doc_unknown', null); await probe;
+});
+
+it('retires an undrained owner exactly once without promoting its follower', async () => {
+  const { broker, request, send, retire } = setup();
+  const owner = request();
+  await vi.advanceTimersByTimeAsync(40_000); const follower = request();
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(await owner).toBeInstanceOf(Error); expect(retire).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(retire).toHaveBeenCalledExactlyOnceWith('x'); expect(send).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(retire).toHaveBeenCalledTimes(1); await follower;
+  broker.rejectAll('cleanup', 'tag');
+});
+it.each(['deliver', 'stale', 'rejectAll'] as const)('cleans the drain deadline via %s', async mode => {
+  let epoch = 1;
+  const { broker, request, send, retire } = setup(() => epoch);
+  const owner = request();
+  await vi.advanceTimersByTimeAsync(40_000); const follower = request();
+  await vi.advanceTimersByTimeAsync(20_000); await owner;
+  await vi.advanceTimersByTimeAsync(10_000);
+  if (mode === 'rejectAll') broker.rejectAll('closed', 'tag');
+  else if (mode === 'stale') epoch = 2;
+  else { await vi.advanceTimersByTimeAsync(5_000); broker.deliver('x', 'doc_unknown', null); }
+  await vi.advanceTimersByTimeAsync(mode === 'deliver' ? 16_000 : 21_000);
+  expect(retire).not.toHaveBeenCalled();
+  expect(send).toHaveBeenCalledTimes(mode === 'rejectAll' ? 1 : 2);
+  if (mode !== 'rejectAll') broker.deliver('x', 'doc_unknown', null);
+  await follower;
+  await vi.advanceTimersByTimeAsync(120_000); expect(retire).not.toHaveBeenCalled();
 });
