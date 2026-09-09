@@ -126,6 +126,11 @@ vi.mock('../wasm-bridge', () => ({
   createDocument: mockCreateDocument,
 }));
 
+vi.mock('../logger', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../logger')>()),
+  log: vi.fn(),
+}));
+
 vi.stubGlobal('WebSocket', MockWebSocket);
 
 import { SyncEngine } from '../sync-engine';
@@ -231,6 +236,60 @@ describe('SyncEngine', () => {
     mockAdapter.exists.mockResolvedValue(false);
     mockAdapter.list.mockResolvedValue({ files: [], folders: [] });
     engine = new SyncEngine(makeApp(), makeSettings());
+  });
+
+  describe('N10b quick fixes', () => {
+    it('rejects before pending persistence and does not reject again on second stop', async () => {
+      const internal = engine as any;
+      const persist = vi.spyOn(internal.docs, 'persistAll').mockImplementation(() => new Promise(() => {}));
+      const rejected = vi.fn();
+      const pending = internal.requestSyncStart('x.md', null).catch(rejected);
+      let stopped = false;
+      void engine.stop().then(() => { stopped = true; });
+      try {
+        await flush();
+        expect(persist).toHaveBeenCalledTimes(1);
+        expect(stopped).toBe(false);
+        expect(rejected).toHaveBeenCalledExactlyOnceWith(new Error('Sync engine stopped'));
+        void engine.stop();
+        await flush();
+        expect(rejected).toHaveBeenCalledTimes(1);
+      } finally {
+        internal.promises.rejectAll('test cleanup', internal.tag);
+        await pending;
+        persist.mockRestore();
+      }
+    });
+
+    it.each(['sync_delta', 'doc_unknown'])('logs %s after timeout, but not when a superseding waiter consumes it', async (type) => {
+      vi.useFakeTimers();
+      const { log } = await import('../logger');
+      const internal = engine as any;
+      const frame = { type, doc_uuid: 'x.md', delta: new Uint8Array(1), server_vv: new TextEncoder().encode('{}') };
+      try {
+        await engine.start();
+        const timedOut = internal.requestSyncStart('x.md', null).catch((err: Error) => err);
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(await timedOut).toEqual(new Error('WS request timeout: sync_delta:x.md'));
+        vi.mocked(log).mockClear();
+        expect(() => fireMessage(frame)).not.toThrow();
+        expect(log).toHaveBeenCalledExactlyOnceWith(`${internal.tag} unsolicited ${type} (no waiter): x.md`);
+
+        const first = internal.requestSyncStart('x.md', null).catch((err: Error) => err);
+        const second = internal.requestSyncStart('x.md', null);
+        // A late response still consumes the replacement waiter: broker work is deferred.
+        const consumed = second.catch((err: Error) => err);
+        expect(await first).toEqual(new Error('WS request superseded: sync_delta:x.md'));
+        vi.mocked(log).mockClear();
+        fireMessage(frame);
+        expect(await consumed).toEqual(type === 'doc_unknown' ? null : { delta: frame.delta, serverVV: '{}' });
+        expect(log).not.toHaveBeenCalled();
+      } finally {
+        internal.promises.rejectAll('test cleanup', internal.tag);
+        await engine.stop();
+        vi.useRealTimers();
+      }
+    });
   });
 
   // ── auth ───────────────────────────────────────────────────────────────────

@@ -34,13 +34,15 @@ export class PromiseManager {
     });
   }
 
-  resolve(key: string, value: unknown): void {
+  resolve(key: string, value: unknown): boolean {
     const entry = this.pending.get(key);
     if (entry) {
       this.pending.delete(key);
       window.clearTimeout(entry.timer);
       entry.resolve(value);
+      return true;
     }
+    return false;
   }
 
   /** Reject a single pending promise by key (no-op if absent). */

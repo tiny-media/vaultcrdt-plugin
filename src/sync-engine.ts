@@ -241,6 +241,7 @@ export class SyncEngine {
     this.trace.mark('stop.called');
     this.ws?.close();
     this.ws = null;
+    this.promises.rejectAll('Sync engine stopped', this.tag);
     await this.docs.persistAll();
     await this.flushVVCache();
   }
@@ -639,10 +640,12 @@ export class SyncEngine {
           this.trace.markPath('ws.sync-delta', docUuid, {
             deltaLen: delta.length,
           });
-          this.promises.resolve(`sync_delta:${docUuid}`, {
+          if (!this.promises.resolve(`sync_delta:${docUuid}`, {
             delta,
             serverVV: new TextDecoder().decode(serverVv),
-          });
+          })) {
+            log(`${this.tag} unsolicited sync_delta (no waiter): ${docUuid}`);
+          }
         } catch (err) {
           warn(`${this.tag} sync_delta handler error:`, err);
           if (docUuid) {
@@ -656,7 +659,9 @@ export class SyncEngine {
       }
 
       case 'doc_unknown':
-        this.promises.resolve(`sync_delta:${msg.doc_uuid as string}`, null);
+        if (!this.promises.resolve(`sync_delta:${msg.doc_uuid as string}`, null)) {
+          log(`${this.tag} unsolicited doc_unknown (no waiter): ${msg.doc_uuid as string}`);
+        }
         break;
 
       case 'delta_broadcast':
