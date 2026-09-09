@@ -395,7 +395,9 @@ export async function runInitialSync(
 
   // Process overlapping files serially — same structure as before, but reads
   // come from the pre-fetched map and clean VV matches skip the read entirely.
+  let overlapAbortError: Error | null = null;
   for (const file of overlappingFiles) {
+    if (overlapAbortError) break;
     if (syncedPaths.has(file.path)) {
       stepsDone++;
       onProgress?.(stepsDone, totalSteps, changed);
@@ -476,6 +478,9 @@ export async function runInitialSync(
       } catch (err) {
         overlappingFail++;
         warn(`${tag} overlapping sync failed for ${file.path}:`, err);
+        if (!deps.ws || deps.ws.readyState !== WebSocket.OPEN) {
+          overlapAbortError = err as Error;
+        }
       }
       stepsDone++;
       onProgress?.(stepsDone, totalSteps, changed);
@@ -496,10 +501,18 @@ export async function runInitialSync(
     } catch (err) {
       overlappingFail++;
       warn(`${tag} overlapping sync failed for ${file.path}:`, err);
+      if (!deps.ws || deps.ws.readyState !== WebSocket.OPEN) {
+        overlapAbortError = err as Error;
+      }
     }
     stepsDone++;
     onProgress?.(stepsDone, totalSteps, changed);
     overlappingProcessed++;
+  }
+
+  if (overlapAbortError instanceof Error) {
+    warn(`${tag} WS closed during overlap sync, aborting`);
+    throw overlapAbortError;
   }
 
   const overlappingMs = performance.now() - tPhase;

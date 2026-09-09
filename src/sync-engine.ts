@@ -99,7 +99,7 @@ export class SyncEngine {
     if (this.stopped) return;
     // Retire even with healthy other-key waiters: steady traffic must not
     // postpone the 90s bound. Close may abort the whole parallel server-only
-    // download batch (wsAbortError); serial overlap keeps per-doc handling.
+    // download batch (wsAbortError) or serial overlap (overlapAbortError).
     // The existing onclose path owns rejection and reconnect scheduling.
     this.trace.markPath('ws.retire-undrained', docUuid);
     log(`${this.tag} retiring undrained WebSocket: ${docUuid}`);
@@ -254,6 +254,14 @@ export class SyncEngine {
     await this.start();
   }
 
+  /**
+   * Rejects all waiters and broker entries synchronously. Already-running async
+   * continuations may still complete their current await. Only the tombstone
+   * task's rename and recovery push are explicitly fenced while stopped === true;
+   * a pre-stop task surviving start() is not fenced (residual: would require an
+   * engine lifecycle generation). Other file-writing continuations are NOT fenced:
+   * accepted weaker continuation guarantee, design 2026-09-09.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
@@ -1039,6 +1047,16 @@ export class SyncEngine {
     }
     warn(`${this.tag} doc is tombstoned on server — push refused`, { doc: docUuid });
     if (await this.tombstoneRefusalIsStale(docUuid)) return;
+    // Socket retirement preserves the decision; only a stopped engine is fenced.
+    // This fence runs AFTER tombstoneLivenessChecked consumes the once-per-session probe slot,
+    // and stop()/start() do not clear the sets, so the next refusal after restart() renames
+    // without re-probing based on the definitive pre-stop answer (intentional residual behavior).
+    // No await before dedupe/rename: synchronous JS; start() survivors are not fenced.
+    if (this.stopped) {
+      warn(`${this.tag} tombstone task fenced while stopped`, { doc: docUuid });
+      this.trace.markPath('tombstoned.fence-stopped', docUuid);
+      return;
+    }
     if (this.notifiedTombstones.has(docUuid)) return;
     this.notifiedTombstones.add(docUuid);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
@@ -1055,6 +1073,13 @@ export class SyncEngine {
       return;
     }
     try {
+      // Defensive call-site fence: no await since the earlier check or before rename.
+      // Atomic in JS only while stopped === true, not after an engine restart.
+      if (this.stopped) {
+        warn(`${this.tag} tombstone rename fenced while stopped`, { doc: docUuid });
+        this.trace.markPath('tombstoned.fence-stopped', docUuid);
+        return;
+      }
       await this.app.fileManager.renameFile(f, keptPath);
       this.trace.markPath('tombstoned.renamed', docUuid, { keptPath });
       this.inbox?.add({
@@ -1107,6 +1132,13 @@ export class SyncEngine {
       const doc = await this.docs.getOrLoad(docUuid);
       const current = this.editor.readCurrentContent(docUuid);
       if (current !== null && !doc.text_matches(current)) doc.sync_from_disk(current);
+      // No await between check and push: atomic in JS while stopped === true.
+      // Socket retirement preserves the decision; engine-restart survivors are not fenced.
+      if (this.stopped) {
+        warn(`${this.tag} tombstone recovery fenced while stopped`, { doc: docUuid });
+        this.trace.markPath('tombstoned.fence-stopped', docUuid);
+        return true;
+      }
       this.push.pushDocCreate(docUuid, doc, { replaceTombstone: true });
       await this.docs.persist(docUuid);
     } catch (err) {

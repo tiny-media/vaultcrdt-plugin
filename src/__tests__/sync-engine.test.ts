@@ -4331,6 +4331,42 @@ describe('SyncEngine', () => {
   });
 
   describe('doc_tombstoned', () => {
+    it('fences a definitive refusal answered immediately before stop', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const trace = vi.spyOn((engine as any).trace, 'markPath');
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: 'doomed.md' });
+      await flush();
+      fireMessage({ type: 'doc_unknown', doc_uuid: 'doomed.md' });
+      const stopping = engine.stop(); // No microtask drain after the definitive answer.
+      await flush(50);
+      await stopping;
+      expect(ctx.renameFile).not.toHaveBeenCalled();
+      expect((engine as any).notifiedTombstones.has('doomed.md')).toBe(false);
+      expect(trace).toHaveBeenCalledWith('tombstoned.fence-stopped', 'doomed.md');
+    });
+
+    it('fences recovery push when stopped during the document load', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const trace = vi.spyOn((engine as any).trace, 'markPath');
+      const push = vi.spyOn((engine as any).push, 'pushDocCreate');
+      let release!: (doc: any) => void;
+      ctx.getOrLoad.mockImplementation(() => new Promise(resolve => { release = resolve; }));
+      fireMessage({ type: 'doc_tombstoned', doc_uuid: 'doomed.md' });
+      await flush();
+      fireMessage({
+        type: 'sync_delta', doc_uuid: 'doomed.md', delta: new Uint8Array([1, 2, 3]),
+        server_vv: new TextEncoder().encode('{}'), client_vv: '{}',
+      });
+      await flush();
+      expect(ctx.getOrLoad).toHaveBeenCalledWith('doomed.md');
+      const stopping = engine.stop();
+      release(mockDocInstance);
+      await flush(50);
+      await stopping;
+      expect(push).not.toHaveBeenCalled();
+      expect(ctx.renameFile).not.toHaveBeenCalled();
+      expect(trace).toHaveBeenCalledWith('tombstoned.fence-stopped', 'doomed.md');
+    });
     it('renames the local file to " (deleted-remote)" instead of leaving it editable, and adds a tombstone-rename inbox entry', async () => {
       const tfile = Object.create(TFile.prototype);
       mockVault.getAbstractFileByPath.mockImplementation((p: string) => (p === 'doomed.md' ? tfile : null));
@@ -4624,6 +4660,58 @@ describe('SyncEngine', () => {
       vi.spyOn((engine as any).docs, 'removeAndClean').mockRejectedValue(new Error('clean failed'));
       await expect((engine as any).onDocDeleted('kept.md')).rejects.toThrow('clean failed');
       expect(add).toHaveBeenCalledWith(expect.objectContaining({ kind: 'deleted-remote', path: 'kept.md' }));
+    });
+
+    it.each([false, true])('aborts overlap on a dead socket (hash mismatch: %s)', async (hashMismatch) => {
+      const files = ['first.md', 'second.md'].map(path =>
+        Object.assign(Object.create(TFile.prototype), { path }));
+      mockVault.getMarkdownFiles.mockReturnValue(files);
+      mockVault.getAbstractFileByPath.mockImplementation((p: string) => files.find(f => f.path === p) ?? null);
+      mockVault.read.mockResolvedValue('local content');
+      mockDocInstance.get_text.mockReturnValue('server content');
+      await engine.start();
+      const internal = engine as any;
+      internal.vvCache.clear();
+      if (hashMismatch) {
+        for (const file of files) {
+          internal.vvCache.set(file.path, { vv: '{}', contentHash: 'different' });
+          internal.startupDirty.markDirty(file.path);
+        }
+      }
+      const trace = vi.spyOn(internal.trace, 'mark');
+      const pathTrace = vi.spyOn(internal.trace, 'markPath');
+      const failure = new Error('overlap socket died');
+      const syncPromise = engine.initialSync();
+      const rejected = expect(syncPromise).rejects.toBe(failure);
+      fireMessage({ type: 'doc_list', docs: files.map(f => ({
+        doc_uuid: f.path, updated_at: '2026-09-06T00:00:00Z',
+        server_vv: new TextEncoder().encode('{}'),
+      })), tombstones: [] });
+      await flush();
+      fireMessage({ type: 'doc_deleted', doc_uuid: 'queued.md' });
+      expect(internal.queuedBroadcasts).toHaveLength(1);
+      mockDocInstance.import_snapshot.mockImplementationOnce(() => {
+        mockWsInstance.readyState = WebSocket.CLOSED;
+        throw failure;
+      });
+      fireMessage({
+        type: 'sync_delta', doc_uuid: 'first.md', delta: new Uint8Array(64),
+        server_vv: new TextEncoder().encode('{"1":1}'),
+      });
+      await flush(50);
+      // Settle the unfenced baseline too, rather than leaving a request hanging.
+      const secondStarted = mockEncode.mock.calls.some((c: any[]) =>
+        c[0]?.type === 'sync_start' && c[0]?.doc_uuid === 'second.md');
+      if (secondStarted) fireMessage({ type: 'doc_unknown', doc_uuid: 'second.md' });
+      await rejected;
+      expect(secondStarted).toBe(false);
+      expect(pathTrace).toHaveBeenCalledWith('initial-sync.overlap-sync', 'first.md',
+        expect.objectContaining({ reason: hashMismatch ? 'hash-mismatch' : 'no-cache' }));
+      expect(pathTrace).not.toHaveBeenCalledWith('initial-sync.overlap-sync', 'second.md', expect.anything());
+      expect(trace).toHaveBeenCalledWith('initial-sync.queue-discard', { queued: 1 });
+      expect(trace).not.toHaveBeenCalledWith('initial-sync.queue-flush', expect.anything());
+      expect(trace).not.toHaveBeenCalledWith('initial-sync.overlapping.done', expect.anything());
+      expect(internal.queuedBroadcasts).toEqual([]);
     });
 
     it('collects a failed-docs inbox entry when an overlapping doc fails to sync', async () => {
