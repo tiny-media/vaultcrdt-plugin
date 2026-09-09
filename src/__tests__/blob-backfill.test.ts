@@ -54,6 +54,7 @@ async function setup() {
   const handlers = new Map<string, (...args: any[]) => unknown>();
   const app = {
     vault: {
+      adapter: { exists: vi.fn(async () => false) }, // Raw index storage: fresh install.
       on: vi.fn((event, handler) => handlers.set(event, handler)),
       read: vi.fn().mockResolvedValue(''),
       getAbstractFileByPath: vi.fn().mockReturnValue(null),
@@ -86,6 +87,16 @@ async function setup() {
 }
 
 describe('backfillAttachments', () => {
+  it('checks poison before listing or enqueueing attachments', async () => {
+    const { plugin, app } = await setup();
+    vi.spyOn(plugin.blobIndex, 'poisoned').mockReturnValue(true);
+    const enqueue = vi.spyOn(plugin.blobUploader, 'onFileChanged');
+    const enabled = vi.spyOn(plugin, 'blobsEnabled');
+    await plugin.backfillAttachments();
+    expect(enabled).not.toHaveBeenCalled();
+    expect(app.vault.getFiles).not.toHaveBeenCalled();
+    expect(enqueue).not.toHaveBeenCalled();
+  });
   it('enqueues only attachments when the index is empty, and none when blobs are off', async () => {
     const { plugin, app } = await setup();
     app.vault.getFiles.mockReturnValue([

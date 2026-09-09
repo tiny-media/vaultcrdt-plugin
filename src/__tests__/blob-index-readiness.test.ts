@@ -16,6 +16,9 @@ function setup(raw: unknown) {
   const read = vi.fn(() => JSON.parse(bytes) as unknown);
   const store = {
     read,
+    existsRaw: async (name: string) => name === 'blob-index.json',
+    readRaw: async (name: string) => name === 'blob-index.json' ? JSON.stringify(read()) : null,
+    writeRaw: vi.fn(async () => undefined),
     loadJson: async <T,>() => read() as T,
     saveJson: vi.fn(async () => undefined),
   };
@@ -30,8 +33,7 @@ describe('BlobIndex cold readiness boundary (export spy, not path-policy oracle)
     const gate = deferred();
     const ready = vi.fn(() => gate.promise);
     const loading = index.load(ready);
-    await Promise.resolve();
-    expect(ready).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(ready).toHaveBeenCalledTimes(1));
     expect(canonical).not.toHaveBeenCalled();
     expect(index.entries()).toEqual([]);
     expect(index.maxSeq()).toBe(0);
@@ -60,7 +62,7 @@ describe('BlobIndex cold readiness boundary (export spy, not path-policy oracle)
     expect(store.saveJson).not.toHaveBeenCalled();
   });
 
-  it('awaits readiness even when all candidates are ultimately rejected; preserves maxSeq', async () => {
+  it('awaits readiness even when all candidates are ultimately rejected; poisons the whole snapshot', async () => {
     const { index } = setup(candidate);
     canonical.mockReturnValue(undefined);
     const ready = vi.fn(async () => { expect(canonical).not.toHaveBeenCalled(); });
@@ -68,7 +70,8 @@ describe('BlobIndex cold readiness boundary (export spy, not path-policy oracle)
     expect(ready).toHaveBeenCalledTimes(1);
     expect(canonical).toHaveBeenCalledExactlyOnceWith(path);
     expect(index.entries()).toEqual([]);
-    expect(index.maxSeq()).toBe(9);
+    expect(index.maxSeq()).toBe(0);
+    expect(index.poisoned()).toBe(true);
   });
 
   it('rejects array containers/entries even with attached candidate fields; ignores inherited paths', async () => {
@@ -80,7 +83,7 @@ describe('BlobIndex cold readiness boundary (export spy, not path-policy oracle)
       { v: 1, paths: Object.create(candidate.paths) },
     ];
     for (const raw of rawCases) {
-      const index = new BlobIndex({ loadJson: async <T,>() => raw as T, saveJson: vi.fn() });
+      const { index } = setup(raw);
       const ready = vi.fn(async () => undefined);
       await index.load(ready);
       expect(ready).not.toHaveBeenCalled();

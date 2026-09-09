@@ -23,6 +23,9 @@ function memStorage() {
   const files = new Map<string, unknown>();
   return {
     files,
+    existsRaw: async (name: string) => files.has(name),
+    readRaw: async (name: string) => files.has(name) ? JSON.stringify(files.get(name)) : null,
+    writeRaw: async (name: string, text: string) => { files.set(name, JSON.parse(text)); },
     loadJson: async <T,>(name: string) => (files.get(name) ?? null) as T | null,
     saveJson: async (name: string, value: unknown) => { files.set(name, value); },
   };

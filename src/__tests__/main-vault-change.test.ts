@@ -34,6 +34,7 @@ async function setup(content: string) {
   const handlers = new Map<string, (file: TFile) => Promise<void>>();
   const app = {
     vault: {
+      adapter: { exists: vi.fn(async () => false) }, // Raw index storage: fresh install.
       on: vi.fn((event, handler) => handlers.set(event, handler)),
       read: vi.fn().mockResolvedValue(content),
       getAbstractFileByPath: vi.fn().mockReturnValue(null),

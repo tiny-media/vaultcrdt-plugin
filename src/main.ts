@@ -12,13 +12,13 @@ import { ReplaceConnectionModal } from './replace-connection-modal';
 import { resetConnectionState, HYDRATION_DEBOUNCE_MS } from './settings';
 import { SETUP_COPY, WASM_INIT_FAILED_NOTICE, ribbonBadgeState } from './user-facing-copy';
 import { Modal } from 'obsidian';
-import { log, error, redact, setSecretProvider, getRecentIssues } from './logger';
+import { log, error, warn, redact, setSecretProvider, getRecentIssues } from './logger';
 import { ServerFeatureCache, FEATURE_INVITE, FEATURE_BLOBS } from './server-features';
 import { buildDiagnosticsReport, assertNoSecret, type DiagnosticsInput } from './diagnostics';
 import { PROTOCOL_VERSION, jsonOf } from './protocol';
 import { toHttpBase } from './url-policy';
 import { isSyncablePath, isAttachmentPath } from './path-policy';
-import { BlobIndex } from './blob-index';
+import { BlobIndex, BLOB_INDEX_FILE } from './blob-index';
 import { BlobUploader } from './blob-uploader';
 import { BlobDownloader } from './blob-downloader';
 import { ObsidianSync, listenVaultRaw } from './obsidian-sync';
@@ -26,7 +26,7 @@ import { StateStorage } from './state-storage';
 import { Inbox } from './inbox';
 import { InboxModal } from './inbox-modal';
 import { StatusPanelModal } from './status-panel';
-import { PANEL_COPY } from './user-facing-copy';
+import { PANEL_COPY, blobIndexRecoveryPausedMessage } from './user-facing-copy';
 
 /** If no server response (pong/ack/delta) for this long, show disconnected. */
 const ACTIVITY_TIMEOUT_MS = 60_000;
@@ -77,7 +77,7 @@ export default class VaultCRDTPlugin extends Plugin {
     });
     await this.inbox.load();
     this.blobIndex = new BlobIndex(new StateStorage(this.app));
-    await this.blobIndex.load(async () => {
+    const indexLoad = await this.blobIndex.load(async () => {
       try {
         await initWasm();
       } catch (err) {
@@ -85,6 +85,12 @@ export default class VaultCRDTPlugin extends Plugin {
         throw err;
       }
     });
+    if (indexLoad.outcome === 'poisoned') {
+      this.inbox.add({
+        kind: 'blob-index-recovery', path: BLOB_INDEX_FILE,
+        note: blobIndexRecoveryPausedMessage(indexLoad.quarantine ?? null),
+      });
+    }
     this.blobUploader = new BlobUploader({
       index: this.blobIndex,
       serverUrl: () => this.settings.serverUrl,
@@ -695,6 +701,7 @@ export default class VaultCRDTPlugin extends Plugin {
    * hydrated:false (remote is newer; download is S3).
    */
   async backfillAttachments(): Promise<void> {
+    if (this.blobIndex.poisoned()) { warn('blob.backfill paused: index recovery required'); return; }
     try {
       if (!(await this.blobsEnabled())) return;
       for (const file of this.app.vault.getFiles()) {
@@ -945,6 +952,7 @@ export default class VaultCRDTPlugin extends Plugin {
     this.hydrationDestroyed = true;
     this.downloadListeners.clear();
     this.clearActivityTimer();
+    this.blobIndex?.dispose();
     if (this.hydrateTimer !== null) {
       clearTimeout(this.hydrateTimer);
       this.hydrateTimer = null;

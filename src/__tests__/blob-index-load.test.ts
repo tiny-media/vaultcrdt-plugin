@@ -22,6 +22,9 @@ function storage(raw: unknown) {
   const read = vi.fn(() => JSON.parse(bytes) as unknown);
   return {
     bytes, read,
+    existsRaw: async (name: string) => name === 'blob-index.json',
+    readRaw: async (name: string) => name === 'blob-index.json' ? JSON.stringify(read()) : null,
+    writeRaw: vi.fn(async () => undefined),
     loadJson: async <T,>() => read() as T,
     saveJson: vi.fn(async () => undefined),
   };
@@ -46,16 +49,18 @@ const invalid = [
 ];
 
 describe('persisted BlobIndex admission with real WASM and downloader', () => {
-  it('keeps valid raw paths; rejects invalid paths and key mismatches before network/filesystem effects', async () => {
+  it.each([false, true])('admits valid-only snapshots; mixed corruption poisons before effects (mixed=%s)', async (mixed) => {
     const bytes = new Uint8Array([1, 2, 3]);
     const hash = blake3_hex(bytes);
     const entry = { hash, size: 3, hydrated: false, seq: 17 };
     const paths = Object.fromEntries([
       ...valid.map((p) => [p, { ...entry, key: blob_path_key(p) }]),
-      ...invalid.map((p) => [p, { ...entry, key: 'vcrdt-t-safe.png' }]),
-      ['vcrdt-t-mismatch.png', { ...entry, key: 'vcrdt-t-other.png' }],
-      ['vcrdt-t-uppercase.PNG', { ...entry, key: 'vcrdt-t-uppercase.PNG' }],
-      ['vcrdt-t-bad.png', null],
+      ...(mixed ? [
+        ...invalid.map((p) => [p, { ...entry, key: 'vcrdt-t-safe.png' }]),
+        ['vcrdt-t-mismatch.png', { ...entry, key: 'vcrdt-t-other.png' }],
+        ['vcrdt-t-uppercase.PNG', { ...entry, key: 'vcrdt-t-uppercase.PNG' }],
+        ['vcrdt-t-bad.png', null],
+      ] : []),
     ]);
     const store = storage({ v: 1, maxSeq: 5, paths });
     const index = new BlobIndex(store);
@@ -86,13 +91,15 @@ describe('persisted BlobIndex admission with real WASM and downloader', () => {
     expect(exists).not.toHaveBeenCalled();
     expect(mkdir).not.toHaveBeenCalled();
     expect(readBinary).not.toHaveBeenCalled();
-    expect(first.map(([p]) => p)).toEqual(valid);
-    expect(index.maxSeq()).toBe(5); // Do not derive catch-up cursor from entry seq.
+    expect(first.map(([p]) => p)).toEqual(mixed ? [] : valid);
+    expect(index.poisoned()).toBe(mixed);
+    expect(index.maxSeq()).toBe(mixed ? 0 : 5); // Paths and cursor travel together.
     expect(store.saveJson).not.toHaveBeenCalled();
     expect(store.read).toHaveBeenCalledTimes(2);
     await downloader.hydratePending();
-    expect(request).toHaveBeenCalledTimes(valid.length * 2); // Probe + range per admitted path.
-    expect(writeBinary.mock.calls.map(([p]) => p).sort()).toEqual([...valid].sort());
+    expect(request).toHaveBeenCalledTimes(mixed ? 0 : valid.length * 2); // Probe + range per admitted path.
+    expect(writeBinary.mock.calls.map(([p]) => p).sort()).toEqual(mixed ? [] : [...valid].sort());
+    index.dispose();
   });
 
   it('preserves empty hashes, skipped/unhydrated metadata and existing numeric states without new bounds', async () => {

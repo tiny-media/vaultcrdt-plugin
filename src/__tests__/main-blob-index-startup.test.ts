@@ -25,9 +25,15 @@ vi.mock('../setup-modal', () => ({ SetupModal: class {} }));
 vi.mock('../wasm-bridge', () => ({ createDocument: vi.fn(), initWasm: spies.ready }));
 vi.mock('../../wasm/vaultcrdt_wasm', () => ({ blob_path_key: spies.canonical }));
 vi.mock('../document-manager', () => ({ DocumentManager: class {} }));
-vi.mock('../inbox', () => ({ Inbox: class { async load() {} } }));
 vi.mock('../state-storage', () => ({ StateStorage: class {
   loadJson = spies.loadJson; saveJson = spies.saveJson;
+  async existsRaw(name: string) { return name === 'blob-index.json'; }
+  async readRaw(name: string) {
+    if (name !== 'blob-index.json') return null;
+    const value = await spies.loadJson(name);
+    return value === null ? null : JSON.stringify(value);
+  }
+  async writeRaw() {}
 } }));
 vi.mock('../blob-uploader', () => ({ BlobUploader: class {
   constructor() { spies.order.push('uploader'); }
@@ -39,12 +45,12 @@ vi.mock('../obsidian-sync', () => ({ ObsidianSync: class {
   constructor() { spies.order.push('categories'); }
 } }));
 import VaultCRDTPlugin from '../main';
-import { WASM_INIT_FAILED_NOTICE } from '../user-facing-copy';
+import { WASM_INIT_FAILED_NOTICE, blobIndexRecoveryPausedMessage } from '../user-facing-copy';
 
 const path = 'vcrdt-t-startup.png';
 const candidate = { v: 1, maxSeq: 4, paths: { [path]: { key: path, hash: '' } } };
 function setup() {
-  const app = { workspace: { onLayoutReady: spies.layout }, vault: { adapter: {} } };
+  const app = { workspace: { onLayoutReady: spies.layout }, vault: { adapter: {}, getAbstractFileByPath: () => null } };
   const plugin = new VaultCRDTPlugin(app as unknown as App, {} as PluginManifest);
   Object.assign(plugin, {
     app, loadSettings: vi.fn(async () => undefined), refreshInboxIndicators: vi.fn(),
@@ -67,6 +73,43 @@ beforeEach(() => {
 });
 
 describe('main cold-start persisted index wiring (synthetic registration, not native dispatch)', () => {
+  it.each(['saved', 'absent', 'quarantine-failed'])('poison notification persists and deduplicates on restart (%s)', async variant => {
+    let inbox: unknown = null;
+    spies.loadJson.mockImplementation(async name => name === 'inbox.json' ? inbox : variant === 'absent' ? null : { v: 0 });
+    spies.saveJson.mockImplementation(async (name, value) => { if (name === 'inbox.json') inbox = value; });
+    // Absent-main poisoning needs an invalid backup; quarantine failure must not claim a diagnostic.
+    const { StateStorage } = await import('../state-storage');
+    const read = vi.spyOn(StateStorage.prototype, 'readRaw');
+    read.mockImplementation(async name => name === 'blob-index.json' && variant === 'absent' ? null : '{');
+    const write = vi.spyOn(StateStorage.prototype, 'writeRaw');
+    if (variant === 'quarantine-failed') write.mockRejectedValue(new Error('diagnostic denied'));
+    const plugin = setup();
+    await plugin.onload();
+    expect(plugin.blobIndex.poisoned()).toBe(true);
+    expect(plugin.inbox.list()).toHaveLength(1);
+    expect(plugin.inbox.list()[0]).toMatchObject({ kind: 'blob-index-recovery', path: 'blob-index.json' });
+    expect(plugin.inbox.list()[0].note).toContain(variant !== 'saved' ? 'see console' : 'saved diagnostic');
+    await plugin.inbox.flush();
+    const restarted = setup();
+    await restarted.onload();
+    expect(restarted.blobIndex.poisoned()).toBe(true);
+    expect(restarted.inbox.list()).toHaveLength(1);
+    expect(spies.notice).toHaveBeenCalledTimes(1);
+    read.mockResolvedValue(null);
+    const outcome = await restarted.blobIndex.load();
+    expect(outcome.outcome).toBe('poisoned');
+    restarted.inbox.add({ kind: 'blob-index-recovery', path: 'blob-index.json',
+      note: blobIndexRecoveryPausedMessage(outcome.quarantine ?? null) });
+    restarted.inbox.scanExisting([]);
+    restarted.inbox.onFileDeleted('blob-index.json');
+    expect(restarted.inbox.list()).toHaveLength(1);
+    expect(spies.notice).toHaveBeenCalledTimes(1);
+    restarted.inbox.dismiss(restarted.inbox.list()[0].id);
+    expect(restarted.blobIndex.poisoned()).toBe(true);
+    await restarted.inbox.flush();
+    plugin.blobIndex.dispose(); restarted.blobIndex.dispose();
+    read.mockRestore(); write.mockRestore();
+  });
   it('waits before canonical admission, consumers, both setup handlers, commands/events and layout scheduling', async () => {
     const gate = deferred();
     spies.ready.mockImplementation(() => gate.promise);
@@ -113,7 +156,7 @@ describe('main cold-start persisted index wiring (synthetic registration, not na
     expect(spies.handlers).not.toHaveBeenCalled();
     expect(spies.events).not.toHaveBeenCalled();
     expect(spies.layout).not.toHaveBeenCalled();
-    expect(spies.saveJson).not.toHaveBeenCalled();
+    expect(spies.saveJson.mock.calls.every(([name]) => name === 'inbox.json')).toBe(true);
     expect(spies.notice).toHaveBeenCalledExactlyOnceWith(WASM_INIT_FAILED_NOTICE, 0);
   });
 

@@ -1,5 +1,11 @@
 import { redact } from './logger';
 
+export function blobIndexRecoveryPausedMessage(quarantine: string | null): string {
+  return quarantine
+    ? `Attachment sync paused: index recovery required — saved diagnostic: ${quarantine}`
+    : 'Attachment sync paused: index recovery required — see console log for details';
+}
+
 export const TRUST_NOTICE_TEXT =
   'VaultCRDT does not currently use end-to-end encryption. The server operator can technically read the paths and contents of synced Markdown notes. Use only a server operator you trust.';
 
@@ -72,6 +78,7 @@ export const INBOX_COPY = {
     'tombstone-edit': 'Edit will not sync (deleted on another device)',
     'tombstone-rename': 'Renamed because it was deleted on another device',
     'failed-docs': 'Documents failed to sync',
+    'blob-index-recovery': 'Attachment sync paused: index recovery required',
   },
 };
 

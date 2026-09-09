@@ -82,6 +82,9 @@ function memStorage() {
   const files = new Map<string, unknown>();
   return {
     files,
+    existsRaw: async (name: string) => files.has(name),
+    readRaw: async (name: string) => files.has(name) ? JSON.stringify(files.get(name)) : null,
+    writeRaw: async (name: string, text: string) => { files.set(name, JSON.parse(text)); },
     loadJson: async <T,>(name: string) => (files.get(name) ?? null) as T | null,
     saveJson: async (name: string, value: unknown) => { files.set(name, value); },
   };
@@ -100,7 +103,8 @@ function makeUploader(opts: {
   writeBinary?: (path: string, data: ArrayBuffer) => Promise<void>;
   now?: () => number;
 } = {}) {
-  const index = new BlobIndex(memStorage());
+  const storage = memStorage();
+  const index = new BlobIndex(storage);
   const notify = vi.fn();
   const readBinary: (path: string) => Promise<ArrayBuffer> =
     opts.readBinary ?? (async (path: string) => {
@@ -133,7 +137,7 @@ function makeUploader(opts: {
     removeFile: opts.removeFile,
     obsidianSyncEnabled: opts.obsidianSyncEnabled,
   });
-  return { uploader, index, notify, readBinary, writeBinary };
+  return { uploader, index, storage, notify, readBinary, writeBinary };
 }
 
 const resp = (status: number, json: Record<string, unknown> = {}) => ({ status, json });
@@ -202,6 +206,106 @@ beforeEach(() => {
 });
 
 describe('BlobUploader (attachment lane S2)', () => {
+  it.each(['pending', 'failed', 'recovered'])('catch-up awaits real persistence retry: %s', async mode => {
+    const hydratePending = vi.fn();
+    const { uploader, index, storage } = makeUploader({ hydratePending });
+    mockRequestUrl.mockResolvedValue(resp(200, { states: [], max_seq: 12 }));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const original = storage.writeRaw;
+    let attempts = 0;
+    vi.spyOn(storage, 'writeRaw').mockImplementation(async (name, text) => {
+      attempts++;
+      if (attempts === 1 || mode === 'failed') throw new Error('persist denied');
+      if (mode === 'pending') await gate;
+      await original(name, text);
+    });
+    let settled = false;
+    const work = uploader.catchUp().then(() => { settled = true; return null; }, e => { settled = true; return e; });
+    try {
+      await vi.waitFor(() => expect(attempts).toBeGreaterThanOrEqual(2));
+      if (mode === 'pending') {
+        expect(settled).toBe(false);
+        expect(hydratePending).not.toHaveBeenCalled();
+        release();
+      }
+      const result = await work;
+      if (mode === 'failed') {
+        expect(result).toBeInstanceOf(Error);
+        expect(index.lastPersistError).toBeTruthy();
+        expect(hydratePending).not.toHaveBeenCalled();
+      } else {
+        expect(result).toBeNull();
+        expect(index.lastPersistError).toBeNull();
+        expect(storage.files.get('blob-index.json')).toMatchObject({ maxSeq: 12 });
+        expect(hydratePending).toHaveBeenCalledTimes(1);
+      }
+    } finally { release(); index.dispose(); }
+  });
+
+  it.each(['catch-up', 'queue', 'pump-start', 'dequeue'])('poison blocks all effects at %s', async entry => {
+    const { uploader, index, storage } = makeUploader();
+    const deps = (uploader as any).deps;
+    const effects = ['stat', 'readBinary', 'writeBinary', 'trashIfPresent', 'removeFile',
+      'hydratePending', 'sweepObsidian', 'hydrateActiveFile', 'blobsEnabled'];
+    for (const key of effects) deps[key] = vi.fn();
+    storage.files.set('blob-index.json', { v: 0 });
+    await index.load();
+    const update = vi.spyOn(index, 'update');
+    const note = vi.spyOn(index, 'noteMaxSeq');
+    if (entry === 'catch-up') await uploader.catchUp();
+    else if (entry === 'queue') {
+      uploader.onFileChanged('image.svg');
+      expect((uploader as any).queue).toEqual([]);
+    } else {
+      (uploader as any).queue.push('image.svg');
+      (uploader as any).queued.add('image.svg');
+      // Simulate poison discovered between pump start and its first dequeue.
+      if (entry === 'dequeue') vi.spyOn(index, 'poisoned').mockReturnValueOnce(false);
+      (uploader as any).pump();
+      await uploader.flush();
+      expect((uploader as any).queue).toEqual(['image.svg']);
+      (uploader as any).pump();
+    }
+    for (const key of effects) expect(deps[key]).not.toHaveBeenCalled();
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled(); expect(note).not.toHaveBeenCalled();
+    index.dispose();
+  });
+
+  it('restored valid main clears poison and catch-up effects resume', async () => {
+    const hydratePending = vi.fn();
+    const { uploader, index, storage } = makeUploader({ hydratePending });
+    storage.files.set('blob-index.json', { v: 0 });
+    await index.load();
+    await uploader.catchUp();
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+    storage.files.set('blob-index.json', { v: 1, paths: {}, maxSeq: 3 });
+    await index.load();
+    expect(index.poisoned()).toBe(false);
+    mockRequestUrl.mockResolvedValue(resp(200, { states: [], max_seq: 4 }));
+    await uploader.catchUp();
+    expect(mockRequestUrl).toHaveBeenCalledTimes(1);
+    expect(hydratePending).toHaveBeenCalledTimes(1);
+    expect(index.maxSeq()).toBe(4);
+    index.dispose();
+  });
+
+  it('gates hydrate/sweep when a reload poisons the index during catch-up flush', async () => {
+    const { uploader, index, storage } = makeUploader();
+    const deps = (uploader as any).deps;
+    deps.hydratePending = vi.fn(); deps.sweepObsidian = vi.fn();
+    mockRequestUrl.mockResolvedValue(resp(200, { states: [] }));
+    vi.spyOn(index, 'flush').mockImplementation(async () => {
+      storage.files.set('blob-index.json', { v: 0 });
+      await index.load();
+    });
+    await uploader.catchUp();
+    expect(index.poisoned()).toBe(true);
+    expect(deps.hydratePending).not.toHaveBeenCalled();
+    expect(deps.sweepObsidian).not.toHaveBeenCalled();
+    index.dispose();
+  });
   it('uploads before it references, and never references a failed transfer', async () => {
     const { uploader, index } = makeUploader();
     mockRequestUrl

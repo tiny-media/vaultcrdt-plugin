@@ -232,6 +232,7 @@ export class ObsidianSync {
 
   /** Toggle-ON: hydrate skipped/unhydrated category entries FIRST, then sweep. */
   async onCategoryEnabled(category: ObsidianSyncCategory): Promise<void> {
+    if (this.deps.index.poisoned()) { warn('obsidian.enable paused: index recovery required'); return; }
     const toHydrate: string[] = [];
     for (const [path, entry] of this.deps.index.entries()) {
       if (obsidianSyncCategoryOf(path) !== category) continue;

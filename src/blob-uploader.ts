@@ -126,6 +126,7 @@ export class BlobUploader {
 
   /** Vault create/modify for an attachment path. */
   onFileChanged(path: string): void {
+    if (this.deps.index.poisoned()) { warn('blob.queue paused: index recovery required'); return; }
     const cat = obsidianSyncCategoryOf(path);
     if (cat && !this.enabled()[cat]) return;
     if (this.queued.has(path)) return;
@@ -256,7 +257,9 @@ export class BlobUploader {
   }
 
   private pump(): void {
+    if (this.deps.index.poisoned()) { warn('blob.pump paused: index recovery required'); return; }
     while (this.active < this.maxParallel && this.queue.length > 0) {
+      if (this.deps.index.poisoned()) { warn('blob.dequeue paused: index recovery required'); return; }
       const path = this.queue.shift() as string;
       this.active += 1;
       const run: Promise<void> = this.upload(path)
@@ -567,6 +570,7 @@ export class BlobUploader {
   }
 
   private async runCatchUp(): Promise<void> {
+    if (this.deps.index.poisoned()) { warn('blob.catch-up paused: index recovery required'); return; }
     if (!(await this.deps.blobsEnabled())) return;
     const since = this.deps.index.maxSeq();
     const resp = await this.http('GET', `/vault/blob-paths?since_seq=${since}&limit=1000`);
@@ -589,6 +593,8 @@ export class BlobUploader {
       maxSeq = resp.json.max_seq;
     }
     this.deps.index.noteMaxSeq(maxSeq);
+    await this.deps.index.flush();
+    if (this.deps.index.poisoned()) { warn('blob.catch-up tail paused: index recovery required'); return; }
     // Category files hydrate eagerly on every device class; downloader filters
     // mobile to .obsidian paths. Sweep is the required backstop (raw is undocumented).
     await this.deps.hydratePending?.();

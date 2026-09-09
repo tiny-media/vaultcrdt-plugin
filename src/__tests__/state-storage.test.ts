@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { StateStorage } from '../state-storage';
+import { BlobIndex } from '../blob-index';
 
 // ── Mock Obsidian adapter ─────────────────────────────────────────────────────
 
@@ -58,6 +59,38 @@ describe('StateStorage', () => {
   beforeEach(() => {
     adapter = makeAdapter();
     storage = new StateStorage(makeApp(adapter));
+  });
+
+  it('raw methods preserve bytes, create the directory, and distinguish absence from read errors', async () => {
+    expect(await storage.existsRaw('blob-index.json')).toBe(false);
+    expect(await storage.readRaw('blob-index.json')).toBeNull();
+    await storage.writeRaw('blob-index.json', '{ broken bytes');
+    expect(adapter.mkdir).toHaveBeenCalledWith('.obsidian/plugins/vaultcrdt/state');
+    expect(await storage.existsRaw('blob-index.json')).toBe(true);
+    expect(await storage.readRaw('blob-index.json')).toBe('{ broken bytes');
+    adapter.read.mockRejectedValueOnce(new Error('read denied'));
+    await expect(storage.readRaw('blob-index.json')).rejects.toThrow('read denied');
+    adapter.exists.mockRejectedValueOnce(new Error('exists denied'));
+    await expect(storage.readRaw('blob-index.json')).rejects.toThrow('exists denied');
+    adapter.write.mockRejectedValueOnce(new Error('write denied'));
+    await expect(storage.writeRaw('blob-index.json', '{}')).rejects.toThrow('write denied');
+  });
+
+  it.each([false, true])('cleanup preserves all three index files across startup/restart (poisoned=%s)', async poisoned => {
+    const names = ['blob-index.json', 'blob-index.bak', 'blob-index.corrupt.json'];
+    for (const name of names) await storage.writeRaw(name, poisoned ? '{' : '{"v":1,"maxSeq":7,"paths":{}}');
+    await storage.save('orphan.md', new Uint8Array([1]));
+    await storage.save('kept.md', new Uint8Array([2]));
+    const first = new BlobIndex(storage);
+    const restarted = new BlobIndex(storage);
+    try {
+      expect((await first.load(async () => {})).outcome).toBe(poisoned ? 'poisoned' : 'ok');
+      expect(await storage.cleanOrphans(new Set(['kept.md']))).toBe(1);
+      for (const name of names) expect(await storage.existsRaw(name)).toBe(true);
+      expect((await restarted.load(async () => {})).outcome).toBe(poisoned ? 'poisoned' : 'ok');
+      expect(restarted.poisoned()).toBe(poisoned);
+      expect(restarted.maxSeq()).toBe(poisoned ? 0 : 7);
+    } finally { first.dispose(); restarted.dispose(); }
   });
 
   it('save and load roundtrip', async () => {

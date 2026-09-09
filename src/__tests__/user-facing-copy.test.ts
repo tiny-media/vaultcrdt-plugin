@@ -95,6 +95,15 @@ function exportedStrings(value: unknown, depth = 0): string[] {
   return [];
 }
 
+describe('blob index recovery copy', () => {
+  it.each([
+    [null, 'Attachment sync paused: index recovery required — see console log for details'],
+    ['blob-index.corrupt.json', 'Attachment sync paused: index recovery required — saved diagnostic: blob-index.corrupt.json'],
+  ])('conditionally names the diagnostic (%s)', (name, message) => {
+    expect(copy.blobIndexRecoveryPausedMessage(name)).toBe(message);
+  });
+});
+
 describe('terminology smoke', () => {
   it('exports Vault ID / Vault secret and drops Vault Name', () => {
     const strings = exportedStrings(copy);

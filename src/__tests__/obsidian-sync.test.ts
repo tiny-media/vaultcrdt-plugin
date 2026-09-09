@@ -17,6 +17,9 @@ const MANIFEST = '.obsidian/themes/Nord/manifest.json';
 function memStorage() {
   const files = new Map<string, unknown>();
   return {
+    existsRaw: async (name: string) => files.has(name),
+    readRaw: async (name: string) => files.has(name) ? JSON.stringify(files.get(name)) : null,
+    writeRaw: async (name: string, text: string) => { files.set(name, JSON.parse(text)); },
     loadJson: async <T,>(name: string) => (files.get(name) ?? null) as T | null,
     saveJson: async (name: string, value: unknown) => { files.set(name, value); },
   };
@@ -68,6 +71,21 @@ describe('joinListed', () => {
 });
 
 describe('ObsidianSync raw debounce', () => {
+  it('poison gates category enable before mutations, downloader or sweep', async () => {
+    const index = new BlobIndex(memStorage());
+    vi.spyOn(index, 'poisoned').mockReturnValue(true);
+    const update = vi.spyOn(index, 'update');
+    const downloader = idleDownloader();
+    const stat = vi.fn(); const list = vi.fn(); const readBinary = vi.fn();
+    const onFileChanged = vi.fn(); const onFileDeleted = vi.fn(); const enabled = vi.fn(() => ON);
+    const sync = new ObsidianSync({ index, downloader, enabled, vaultBasePath: () => '',
+      stat, list, readBinary, onFileChanged, onFileDeleted });
+    const sweep = vi.spyOn(sync, 'sweep');
+    await sync.onCategoryEnabled('settings');
+    for (const spy of [update, downloader.hydrateOne, stat, list, readBinary, onFileChanged, onFileDeleted, enabled, sweep]) {
+      expect(spy).not.toHaveBeenCalled();
+    }
+  });
   it('coalesces raw events after debounce and ignores plugins paths', async () => {
     let release!: () => void;
     const sleep = () => new Promise<void>((r) => { release = r; });

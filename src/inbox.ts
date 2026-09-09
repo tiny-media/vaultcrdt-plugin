@@ -11,7 +11,8 @@ export type InboxKind =
   | 'tombstone-edit'
   | 'tombstone-rename'
   | 'disjoint-conflict'
-  | 'failed-docs';
+  | 'failed-docs'
+  | 'blob-index-recovery';
 
 /** Kinds whose entry is tied to a vault file: gone file → entry auto-clears. */
 const FILE_KINDS: ReadonlySet<InboxKind> = new Set<InboxKind>([

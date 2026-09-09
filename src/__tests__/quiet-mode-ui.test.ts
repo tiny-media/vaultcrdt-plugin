@@ -54,7 +54,8 @@ function makeStatusBarEl() {
 
 function makePlugin(showSyncStatus: boolean) {
   const statusBarEl = makeStatusBarEl();
-  const app = { vault: { getAbstractFileByPath: () => null }, workspace: {} } as unknown as App;
+  const app = { vault: { adapter: { exists: vi.fn(async () => false) },
+    getAbstractFileByPath: () => null }, workspace: {} } as unknown as App;
   const plugin = new VaultCRDTPlugin(app, {} as never);
   Object.assign(plugin, {
     app,

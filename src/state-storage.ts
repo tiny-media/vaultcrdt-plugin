@@ -146,6 +146,7 @@ export class StateStorage {
       if (key === 'vv-cache.json') continue;
       if (key === 'delete-journal.json') continue;
       if (key === 'inbox.json') continue;
+      if (key === 'blob-index.json' || key === 'blob-index.bak' || key === 'blob-index.corrupt.json') continue;
       if (validKeys.has(key)) continue;
       try {
         await adapter.remove(`${STATE_DIR}/${key}`);
@@ -155,6 +156,25 @@ export class StateStorage {
       }
     }
     return removed;
+  }
+
+  /** Raw index reads distinguish absence from adapter failures. */
+  existsRaw(name: string): Promise<boolean> {
+    return this.app.vault.adapter.exists(`${STATE_DIR}/${name}`);
+  }
+
+  async readRaw(name: string): Promise<string | null> {
+    if (!await this.existsRaw(name)) return null;
+    return this.app.vault.adapter.read(`${STATE_DIR}/${name}`);
+  }
+
+  async writeRaw(name: string, text: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    if (!this.dirEnsured) {
+      if (!await adapter.exists(STATE_DIR)) await adapter.mkdir(STATE_DIR);
+      this.dirEnsured = true;
+    }
+    await adapter.write(`${STATE_DIR}/${name}`, text);
   }
 
   // ── Generic JSON state ────────────────────────────────────────────────────

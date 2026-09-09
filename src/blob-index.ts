@@ -35,6 +35,9 @@ interface BlobIndexFile {
 }
 
 export interface BlobIndexStorage {
+  existsRaw(name: string): Promise<boolean>;
+  readRaw(name: string): Promise<string | null>;
+  writeRaw(name: string, text: string): Promise<void>;
   loadJson<T>(name: string): Promise<T | null>;
   saveJson(name: string, value: unknown): Promise<void>;
 }
@@ -49,34 +52,55 @@ function isCandidate(value: unknown): value is Record<string, unknown> & { key: 
   return isRecord(value) && typeof value.key === 'string' && typeof value.hash === 'string';
 }
 
-async function parse(raw: unknown, ready: () => Promise<void>): Promise<BlobIndexFile> {
-  const empty: BlobIndexFile = { v: 1, maxSeq: 0, paths: Object.create(null) as Record<string, BlobIndexEntry> };
-  if (!isRecord(raw) || raw.v !== 1 || !isRecord(raw.paths)) return empty;
-  const candidates = Object.entries(raw.paths).filter(
-    (entry): entry is [string, Record<string, unknown> & { key: string; hash: string }] => isCandidate(entry[1]),
-  );
-  // Readiness errors must abort the load, not masquerade as rejected paths.
-  // Candidate-free startup retains lazy WASM initialization.
-  if (candidates.length) await ready();
-  for (const [path, e] of candidates) {
+const BACKUP = 'blob-index.bak';
+const QUARANTINE = 'blob-index.corrupt.json';
+const emptyFile = (): BlobIndexFile => ({ v: 1, maxSeq: 0, paths: Object.create(null) });
+type Validation = { ok: true; file: BlobIndexFile } | { ok: false; reason: string };
+export interface BlobIndexLoadOutcome {
+  outcome: 'ok' | 'fresh' | 'recovered' | 'poisoned';
+  reason?: string;
+  quarantine?: string;
+}
+
+/** The same strict validator is used for admission and every write readback. */
+export async function validateIndexFile(text: string, ready: () => Promise<void> = async () => {}): Promise<Validation> {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { return { ok: false, reason: 'invalid JSON' }; }
+  if (!isRecord(raw) || raw.v !== 1 || !isRecord(raw.paths) || typeof raw.maxSeq !== 'number') {
+    return { ok: false, reason: 'invalid index envelope' };
+  }
+  const entries = Object.entries(raw.paths);
+  for (const [path, e] of entries) {
+    if (!isCandidate(e)) return { ok: false, reason: `invalid entry: ${path}` };
+    for (const field of ['size', 'generation', 'seq', 'mtime']) {
+      if (field in e && typeof e[field] !== 'number') return { ok: false, reason: `invalid ${field}: ${path}` };
+    }
+    for (const field of ['hydrated', 'skipped']) {
+      if (field in e && typeof e[field] !== 'boolean') return { ok: false, reason: `invalid ${field}: ${path}` };
+    }
+    if ('lastRemoteHash' in e && e.lastRemoteHash !== null && typeof e.lastRemoteHash !== 'string') {
+      return { ok: false, reason: `invalid lastRemoteHash: ${path}` };
+    }
+  }
+  // Readiness failure propagates; empty/malformed startup stays lazy.
+  if (entries.length) await ready();
+  const file = emptyFile();
+  file.maxSeq = raw.maxSeq;
+  for (const [path, value] of entries) {
+    const e = value as Record<string, unknown> & { key: string; hash: string };
     const key = blob_path_key(path);
-    if (!key || key !== e.key) continue;
-    empty.paths[path] = {
-      key: e.key,
-      hash: e.hash,
-      size: typeof e.size === 'number' ? e.size : 0,
-      generation: typeof e.generation === 'number' ? e.generation : 0,
-      seq: typeof e.seq === 'number' ? e.seq : 0,
-      hydrated: e.hydrated !== false,
-      lastRemoteHash: typeof e.lastRemoteHash === 'string'
-        ? e.lastRemoteHash
-        : e.lastRemoteHash === null ? null : '',
-      ...(e.skipped ? { skipped: true } : {}),
-      ...(typeof e.mtime === 'number' ? { mtime: e.mtime } : {}),
+    if (!key || key !== e.key) return { ok: false, reason: `invalid path key: ${path}` };
+    file.paths[path] = {
+      key, hash: e.hash, size: (e.size as number | undefined) ?? 0,
+      generation: (e.generation as number | undefined) ?? 0,
+      seq: (e.seq as number | undefined) ?? 0,
+      hydrated: (e.hydrated as boolean | undefined) ?? true,
+      lastRemoteHash: 'lastRemoteHash' in e ? e.lastRemoteHash as string | null : '',
+      ...('skipped' in e ? { skipped: e.skipped as boolean } : {}),
+      ...('mtime' in e ? { mtime: e.mtime as number } : {}),
     };
   }
-  empty.maxSeq = typeof raw.maxSeq === 'number' ? raw.maxSeq : 0;
-  return empty;
+  return { ok: true, file };
 }
 
 export class BlobIndex {
@@ -85,10 +109,78 @@ export class BlobIndex {
 
   constructor(private storage: BlobIndexStorage) {}
 
-  /** Read once; publish only after canonical validation. Never persists on read. */
-  async load(ready: () => Promise<void>): Promise<void> {
-    const raw = await this.storage.loadJson<unknown>(BLOB_INDEX_FILE);
-    this.file = await parse(raw, ready);
+  private mutations = 0;
+  // Only a validated restored snapshot clears poison; dismissing a Notice never does.
+  private poison = false;
+  lastPersistError: string | null = null;
+  private retryTimer: number | undefined;
+  private disposed = false;
+
+  poisoned(): boolean { return this.poison; }
+
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.writes.then(task);
+    this.writes = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  /** Reload is itself exclusive, not merely awaiting a tail. A restarted plugin
+   * has a new FIFO: its old instance/writer must already have stopped. */
+  load(ready: () => Promise<void> = async () => {}): Promise<BlobIndexLoadOutcome> {
+    const mutations = this.mutations;
+    return this.enqueue(async () => {
+      const raw = await this.storage.readRaw(BLOB_INDEX_FILE);
+      const main = raw === null ? null : await validateIndexFile(raw, ready);
+      let file = emptyFile();
+      let result: BlobIndexLoadOutcome;
+      let restoreFrom: string | null = null;
+      if (main?.ok) {
+        file = main.file;
+        result = { outcome: 'ok' };
+      } else {
+        let quarantine: string | undefined;
+        if (main && !main.ok) {
+          console.error('[BlobIndex] corrupt main:', main.reason);
+          try {
+            await this.storage.writeRaw(QUARANTINE, raw!);
+            quarantine = QUARANTINE;
+          } catch (error) { console.warn('[BlobIndex] quarantine failed', error); }
+        }
+        const backupRaw = await this.storage.readRaw(BACKUP);
+        const backup = backupRaw === null ? null : await validateIndexFile(backupRaw, ready);
+        if (backup?.ok) {
+          file = backup.file;
+          result = { outcome: 'recovered', quarantine };
+          restoreFrom = backupRaw!;
+        } else if (!main && !backup && !this.poison) {
+          result = { outcome: 'fresh' };
+        } else {
+          result = { outcome: 'poisoned', reason: main && !main.ok ? main.reason : 'no valid snapshot', quarantine };
+        }
+      }
+      // PUBLISH FIRST (contract): recovery visibility is immediate, and a
+      // mutation arriving during the repair I/O below composes onto the
+      // recovered state instead of being lost together with it.
+      if (result.outcome === 'poisoned') {
+        // Poison overrides the discard guard, including all paths AND cursor.
+        this.poison = true;
+        this.file = emptyFile();
+      } else if (this.mutations === mutations) {
+        this.file = file;
+        this.poison = false;
+      }
+      if (result.outcome === 'recovered') {
+        // Inline repair AFTER publication, never append/await a descendant
+        // FIFO task. Even a poisoned instance may repair from this
+        // independently validated bak. A failed repair leaves the published
+        // recovered memory standing and surfaces via lastPersistError.
+        try {
+          await this.writeVerified(BLOB_INDEX_FILE, restoreFrom!, 'main-restore', ready);
+          this.succeeded();
+        } catch (error) { this.failed(error); }
+      }
+      return result;
+    });
   }
 
   /** Canonical key, or null when the path is not a syncable attachment. */
@@ -113,6 +205,7 @@ export class BlobIndex {
 
   /** Move an entry to a new raw path (including case-only renames). */
   move(oldPath: string, newPath: string): BlobIndexEntry | null {
+    if (this.refusePoison()) return null;
     if (oldPath === newPath) return this.file.paths[oldPath] ?? null;
     const entry = this.file.paths[oldPath];
     if (!entry) return null;
@@ -126,6 +219,7 @@ export class BlobIndex {
   }
 
   remove(path: string): void {
+    if (this.refusePoison()) return;
     if (!(path in this.file.paths)) return;
     delete this.file.paths[path];
     this.persist();
@@ -136,6 +230,7 @@ export class BlobIndex {
    * when the path has no blob path key.
    */
   update(path: string, patch: Partial<BlobIndexEntry>): BlobIndexEntry | null {
+    if (this.refusePoison()) return null;
     const key = this.keyFor(path);
     if (!key) return null;
     const prev: BlobIndexEntry = this.file.paths[path]
@@ -153,24 +248,91 @@ export class BlobIndex {
   }
 
   noteMaxSeq(seq: number): void {
+    if (this.refusePoison()) return;
     if (seq <= this.file.maxSeq) return;
     this.file.maxSeq = seq;
     this.persist();
   }
 
-  private persist(): void {
-    const snapshot: BlobIndexFile = {
-      v: 1,
-      maxSeq: this.file.maxSeq,
-      paths: Object.fromEntries(Object.entries(this.file.paths).map(([p, e]) => [p, { ...e }])),
-    };
-    this.writes = this.writes
-      .then(() => this.storage.saveJson(BLOB_INDEX_FILE, snapshot))
-      .catch(() => undefined);
+  private refusePoison(): boolean {
+    if (this.poison) console.warn('[BlobIndex] mutation/persist refused: poisoned');
+    return this.poison;
   }
 
-  /** Await pending writes (tests / shutdown). */
+  private persist(): void {
+    if (this.refusePoison()) return;
+    this.mutations++;
+    const snapshot = JSON.stringify(this.file); // Capture synchronously, preserving FIFO newest state.
+    void this.enqueue(() => this.step(snapshot));
+  }
+
+  private async writeVerified(name: string, text: string, stage: string, ready?: () => Promise<void>): Promise<void> {
+    try {
+      await this.storage.writeRaw(name, text);
+      const actual = await this.storage.readRaw(name);
+      if (actual === null || !(await validateIndexFile(actual, ready)).ok || actual !== text) {
+        throw new Error('readback invalid or unequal');
+      }
+    } catch (error) { throw new Error(`${stage}: ${String(error)}`); }
+  }
+
+  private async step(snapshot: string): Promise<void> {
+    if (this.refusePoison()) return;
+    try {
+      const raw = await this.storage.readRaw(BLOB_INDEX_FILE);
+      const main = raw === null ? null : await validateIndexFile(raw);
+      if (main?.ok) {
+        // Torn bak leaves intact main; torn main leaves verified bak. Bak
+        // receives only bytes read back as valid main (also after restore).
+        await this.writeVerified(BACKUP, raw!, 'bak');
+      } else if (raw === null && !await this.storage.existsRaw(BACKUP)) {
+        // A torn FIRST write has no backup yet: restart must poison, not reset.
+      } else {
+        const backupRaw = await this.storage.readRaw(BACKUP);
+        if (backupRaw === null || !(await validateIndexFile(backupRaw)).ok) throw new Error('no-valid-snapshot');
+        await this.writeVerified(BLOB_INDEX_FILE, backupRaw, 'main-restore');
+        await this.writeVerified(BACKUP, backupRaw, 'bak');
+      }
+      await this.writeVerified(BLOB_INDEX_FILE, snapshot, 'main');
+      this.succeeded();
+    } catch (error) { this.failed(error); }
+  }
+
+  private succeeded(): void {
+    this.lastPersistError = null;
+    if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+  }
+
+  private failed(error: unknown): void {
+    this.lastPersistError = String(error);
+    console.warn('[BlobIndex] persist failed', this.lastPersistError);
+    if (this.disposed) return;
+    if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
+    this.retryTimer = window.setTimeout(() => {
+      this.retryTimer = undefined;
+      void this.retry().catch(error => console.warn('[BlobIndex] retry failed', error));
+    }, 30_000);
+  }
+
+  private retry(): Promise<void> {
+    // Capture when enqueued, not when executed: a later persist must win.
+    const snapshot = JSON.stringify(this.file);
+    return this.enqueue(async () => {
+      if (this.lastPersistError) await this.step(snapshot);
+      if (this.lastPersistError) throw new Error(this.lastPersistError);
+    });
+  }
+
   async flush(): Promise<void> {
-    await this.writes;
+    const tail = this.writes;
+    await tail;
+    if (this.lastPersistError) await this.retry();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
   }
 }
