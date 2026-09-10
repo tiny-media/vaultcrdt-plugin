@@ -1,6 +1,6 @@
 import { requestUrl } from 'obsidian';
 import { blake3_hex, sanitize_svg } from '../wasm/vaultcrdt_wasm';
-import { attachmentCap, isCategoryWriteAllowed, isSvgPath, obsidianSyncCategoryOf, pathCaseKey, type ObsidianSyncEnabled } from './path-policy';
+import { attachmentCap, isAttachmentPath, isCategoryWriteAllowed, isSvgPath, obsidianSyncCategoryOf, pathCaseKey, type ObsidianSyncEnabled } from './path-policy';
 import { toHttpBase } from './url-policy';
 import { log, error, warn } from './logger';
 import { attachmentTooLargeMessage, quotaExceededMessage, remoteDeleteKeptNoticeMessage, remoteDeleteRemovedNoticeMessage, remoteDeleteTrashedNoticeMessage, svgRejectedMessage } from './user-facing-copy';
@@ -30,6 +30,7 @@ export interface BlobUploaderDeps {
   /** True when the cached /health features advertise FEATURE_BLOBS. */
   blobsEnabled(): Promise<boolean>;
   stat(path: string): Promise<{ size: number; mtime?: number } | null>;
+  listFiles(): Promise<string[]>;
   readBinary(path: string): Promise<ArrayBuffer>;
   writeBinary(path: string, data: ArrayBuffer): Promise<void>;
   notify(text: string): void;
@@ -178,6 +179,61 @@ export class BlobUploader {
     this.queued.add(path);
     this.queue.push(path);
     this.pump();
+  }
+
+  private sweepRun: Promise<void> | null = null;
+
+  /** Best-effort recovery of missed attachment watcher events; no polling. */
+  sweepAttachments(): Promise<void> {
+    if (this.sweepRun) return this.sweepRun;
+    const run = this.runAttachmentSweep().finally(() => {
+      if (this.sweepRun === run) this.sweepRun = null;
+    });
+    this.sweepRun = run;
+    return run;
+  }
+
+  private async runAttachmentSweep(): Promise<void> {
+    const { index } = this.deps;
+    if (index.poisoned()) return;
+    const eligible = (path: string) => isAttachmentPath(path, this.enabled()) &&
+      !pathCaseKey(path).startsWith('.obsidian/');
+    const present = await this.deps.listFiles();
+    for (const path of present) {
+      if (index.poisoned()) return;
+      if (!eligible(path)) continue;
+      const entry = index.get(path);
+      if (entry?.pendingDecision || entry?.skipped) continue;
+      if (!entry) { this.onFileChanged(path); continue; }
+      const valid = () => !index.poisoned() && index.get(path) === entry &&
+        !index.get(path)?.pendingDecision;
+      const st = await this.deps.stat(path);
+      if (!valid() || !st) continue;
+      let changed = entry.size !== st.size;
+      if (!changed) {
+        if (entry.mtime != null && st.mtime != null) {
+          changed = entry.mtime !== st.mtime;
+        } else if (st.size <= 2 * 1024 * 1024) {
+          try {
+            changed = blake3_hex(new Uint8Array(await this.deps.readBinary(path))) !== entry.hash;
+          } catch {
+            changed = true;
+          }
+        }
+        // Accepted blind spot: same-size >2 MiB with missing mtime cannot
+        // be detected within this bounded read budget. Mtime is only a heuristic.
+      }
+      if (valid() && changed) this.onFileChanged(path);
+    }
+    for (const [path, entry] of index.entries()) {
+      if (index.poisoned()) return;
+      if (!eligible(path) || !entry.hydrated || entry.skipped || entry.pendingDecision) continue;
+      const st = await this.deps.stat(path);
+      const current = index.get(path);
+      // Decision admission or any entry replacement during stat owns the path.
+      if (index.poisoned() || current !== entry || current?.pendingDecision) continue;
+      if (!st) await this.onFileDeleted(path);
+    }
   }
 
   /** Re-queue every upload that was skipped by a closed blobs gate. */
@@ -748,6 +804,7 @@ export class BlobUploader {
     // mobile to .obsidian paths. Sweep is the required backstop (raw is undocumented).
     await this.deps.hydratePending?.();
     await this.deps.sweepObsidian?.();
+    await this.sweepAttachments();
     if (applied > 0 && this.deps.isMobile) this.deps.hydrateActiveFile?.();
   }
 

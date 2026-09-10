@@ -140,7 +140,7 @@ function makePair(opts: {
     isMobile: opts.isMobile ?? false,
     getFileCache: (file) => (opts.cacheFor ? opts.cacheFor(file) : opts.cache ?? null),
   });
-  const uploader = new BlobUploader({
+  const uploader = new BlobUploader({ listFiles: async () => [],
     index,
     serverUrl: () => 'https://s.example.com',
     peerId: () => 'peer-1',

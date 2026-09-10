@@ -220,7 +220,7 @@ describe('sweep fail-closed / reentrancy / skipped / mtime',
         index.update('.obsidian/appearance.json', {
           hash: 'h', size: 1, hydrated: true, skipped: false,
         });
-        const uploader = new BlobUploader({
+        const uploader = new BlobUploader({ listFiles: async () => [],
           index,
           serverUrl: () => 'https://s.example.com',
           peerId: () => 'peer-1',

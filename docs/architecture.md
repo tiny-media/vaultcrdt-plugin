@@ -36,6 +36,8 @@ uploads before publishing a path reference. Upload concurrency is one on
 mobile and two on desktop. Handles renames, tombstones, quota pauses and
 registry catch-up; `lastRemoteHash` suppresses upload echoes.
 
+Attachment backstop `sweepAttachments()` runs single-flight on desktop focus and after catch-up's category sweep, never on a timer. Injected `listFiles` uses `vault.getFiles()` to discover missed creates and modifications; `.obsidian/**` stays with the category sweep. Size differences or differing available mtimes queue a change without reading; equal available mtimes skip, otherwise files ≤2 MiB are compared with BLAKE3. Mtime is only a best-effort skip heuristic (including on Android): same-size files >2 MiB with missing mtime are an accepted blind spot. Missing hydrated, non-skipped index paths route through `onFileDeleted`; pending decisions belong exclusively to reconciliation. Poison blocks the sweep, and entry identity, decisions and poison are revalidated after asynchronous comparisons/stat before routing.
+
 **BlobDownloader — `src/blob-downloader.ts:BlobDownloader`.** Fetches range segments, assembles bytes in memory, verifies BLAKE3 and writes
 through the adapter. Desktop hydration is eager, smallest first, with two
 workers; mobile attachments are selected from open-note links with one worker.

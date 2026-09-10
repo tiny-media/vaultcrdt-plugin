@@ -19,7 +19,7 @@ function setup() {
   index.update(path, { hash, size: 3, lastRemoteHash: hash, seq: 10, generation: 2 });
   const stat = vi.fn(async (): Promise<{ size: number } | null> => ({ size: 3 }));
   const trash = vi.fn();
-  const uploader = new BlobUploader({ index, stat, readBinary: async () => bytes.buffer,
+  const uploader = new BlobUploader({ listFiles: async () => [], index, stat, readBinary: async () => bytes.buffer,
     writeBinary: vi.fn(), notify: vi.fn(), serverUrl: () => '', peerId: () => '',
     getJwt: async () => '', blobsEnabled: async () => true, isMobile: false, now: () => 123,
     trashIfPresent: trash, removeFile: trash });
@@ -354,7 +354,7 @@ it('modified tombstone admission is durable before any network', async () => {
   await index.load();
   index.update('a.png', { hash: 'server-hash', size: 3, lastRemoteHash: 'server-hash', seq: 4, generation: 1 });
   const net: string[] = [];
-  const uploader = new BlobUploader({ index,
+  const uploader = new BlobUploader({ listFiles: async () => [], index,
     stat: async () => ({ size: 3 }), readBinary: async () => new Uint8Array([9, 9, 9]).buffer,
     writeBinary: vi.fn(), notify: vi.fn(), serverUrl: () => '', peerId: () => '',
     getJwt: async () => '', blobsEnabled: async () => true, isMobile: false, now: () => 1 });

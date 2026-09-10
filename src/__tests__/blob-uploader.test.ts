@@ -91,6 +91,8 @@ function memStorage() {
 }
 
 function makeUploader(opts: {
+  listFiles?: () => Promise<string[]>;
+  stat?: (path: string) => Promise<{ size: number; mtime?: number } | null>;
   blobs?: boolean;
   size?: number;
   files?: Record<string, Uint8Array>;
@@ -113,19 +115,19 @@ function makeUploader(opts: {
       return BYTES.slice().buffer;
     });
   const writeBinary = opts.writeBinary ?? vi.fn(async () => undefined);
-  const uploader = new BlobUploader({
+  const uploader = new BlobUploader({ listFiles: opts.listFiles ?? (async () => []),
     index,
     serverUrl: () => 'https://s.example.com',
     peerId: () => 'peer-1',
     getJwt: async () => 'jwt-1',
     blobsEnabled: async () => opts.blobs !== false,
-    stat: async (path: string) => {
+    stat: opts.stat ?? (async (path: string) => {
       if (opts.files) {
         const f = opts.files[path];
         return f ? { size: f.byteLength } : null;
       }
       return { size: opts.size ?? BYTES.length };
-    },
+    }),
     readBinary,
     writeBinary,
     notify,
@@ -139,6 +141,130 @@ function makeUploader(opts: {
   });
   return { uploader, index, storage, notify, readBinary, writeBinary };
 }
+
+describe('attachment backstop sweep', () => {
+  function setup(paths: string[] = [PATH], stat = vi.fn<NonNullable<NonNullable<Parameters<typeof makeUploader>[0]>['stat']>>().mockResolvedValue({ size: BYTES.length, mtime: 10 })) {
+    const listFiles = vi.fn(async () => paths);
+    const readBinary = vi.fn(async () => BYTES.slice().buffer);
+    const h = makeUploader({ listFiles, stat, readBinary,
+      obsidianSyncEnabled: () => ({ settings: true, styles: true }) });
+    const changed = vi.spyOn(h.uploader, 'onFileChanged').mockImplementation(() => {});
+    const deleted = vi.spyOn(h.uploader, 'onFileDeleted').mockResolvedValue();
+    return { ...h, listFiles, stat, changed, deleted };
+  }
+  it('discovers a missed create through listFiles and queues the upload', async () => {
+    const listFiles = vi.fn(async () => [PATH]);
+    const h = makeUploader({ listFiles, blobs: false });
+    const changed = vi.spyOn(h.uploader, 'onFileChanged');
+    await h.uploader.sweepAttachments();
+    await vi.waitFor(() => expect(h.uploader.gateBlockedPaths()).toContain(PATH));
+    expect(listFiles).toHaveBeenCalledOnce();
+    expect(changed).toHaveBeenCalledWith(PATH);
+    expect(h.uploader.gateBlockedPaths()).toContain(PATH);
+  });
+  it.each([
+    ['unchanged mtime', 10, 10, BYTES.length, false, false],
+    ['different mtime', 10, 11, BYTES.length, true, false],
+    ['different size', 10, 10, BYTES.length + 1, true, false],
+    ['missing stored mtime', undefined, 10, BYTES.length, true, true],
+    ['missing disk mtime', 10, undefined, BYTES.length, true, true],
+    ['accepted >2MiB blind spot', undefined, undefined, 2 * MIB + 1, false, false],
+  ] as const)('%s comparison', async (_name, mtime, diskMtime, size, changed, read) => {
+    const h = setup([PATH], vi.fn().mockResolvedValue({ size, mtime: diskMtime }));
+    h.index.update(PATH, { size: _name === 'different size' ? BYTES.length : size, mtime, hash: 'old' });
+    await h.uploader.sweepAttachments();
+    expect(h.readBinary).toHaveBeenCalledTimes(read ? 1 : 0);
+    expect(h.changed).toHaveBeenCalledTimes(changed ? 1 : 0);
+  });
+  it('hash-equal missing-mtime file is unchanged', async () => {
+    const h = setup();
+    h.index.update(PATH, { size: BYTES.length, hash: blake3_hex(BYTES) });
+    await h.uploader.sweepAttachments();
+    expect(h.readBinary).toHaveBeenCalledOnce();
+    expect(h.changed).not.toHaveBeenCalled();
+  });
+  it('routes a missed delete only for eligible hydrated rows', async () => {
+    const h = setup([], vi.fn().mockResolvedValue(null));
+    h.index.update(PATH, { hydrated: true });
+    h.index.update(PATH_B, { skipped: true });
+    h.index.update(PATH_NEW, { hydrated: false });
+    await h.uploader.sweepAttachments();
+    expect(h.deleted).toHaveBeenCalledExactlyOnceWith(PATH);
+  });
+  it.each(['delete', 'republish'] as const)('excludes existing %s decisions in both directions', async kind => {
+    const h = setup([PATH], vi.fn().mockResolvedValue(null));
+    h.index.update(PATH, { pendingDecision: { kind, seq: 1, generation: 1, expectedHash: 'old', expectedSize: 10 } });
+    const before = h.index.get(PATH);
+    await h.uploader.sweepAttachments();
+    expect(h.deleted).not.toHaveBeenCalled();
+    expect(h.changed).not.toHaveBeenCalled();
+    expect(h.stat).not.toHaveBeenCalled();
+    expect(h.index.get(PATH)).toBe(before);
+    expect(calls()).toEqual([]);
+  });
+  it.each(['delete', 'republish', 'replacement', 'poison'] as const)('revalidates gone stat after %s admission', async kind => {
+    let release!: (value: null) => void;
+    const stat = vi.fn(() => new Promise<null>(resolve => { release = resolve; }));
+    const h = setup([], stat);
+    h.index.update(PATH, { hydrated: true });
+    const run = h.uploader.sweepAttachments();
+    await vi.waitFor(() => expect(stat).toHaveBeenCalledOnce());
+    if (kind === 'poison') vi.spyOn(h.index, 'poisoned').mockReturnValue(true);
+    else if (kind === 'replacement') h.index.update(PATH, { seq: 2 });
+    else h.index.update(PATH, { pendingDecision: { kind, seq: 2, generation: 1, expectedHash: 'old', expectedSize: 10 } });
+    const before = h.index.get(PATH);
+    release(null);
+    await run;
+    expect(h.deleted).not.toHaveBeenCalled();
+    expect(h.changed).not.toHaveBeenCalled();
+    expect(h.index.get(PATH)).toBe(before);
+    expect(calls()).toEqual([]);
+  });
+  it('skips categories and cap-parked uploads', async () => {
+    const h = setup(['.obsidian/app.json', '.obsidian/snippets/a.css', PATH]);
+    h.index.update('.obsidian/app.json', { hydrated: true });
+    h.index.update(PATH, { skipped: true });
+    await h.uploader.sweepAttachments();
+    expect(h.stat).not.toHaveBeenCalled();
+    expect(h.changed).not.toHaveBeenCalled();
+    expect(h.deleted).not.toHaveBeenCalled();
+  });
+  it('poison blocks discovery and both directions', async () => {
+    const h = setup();
+    h.index.update(PATH, { hydrated: true });
+    vi.spyOn(h.index, 'poisoned').mockReturnValue(true);
+    await h.uploader.sweepAttachments();
+    expect(h.listFiles).not.toHaveBeenCalled();
+    expect(h.stat).not.toHaveBeenCalled();
+    expect(h.changed).not.toHaveBeenCalled();
+    expect(h.deleted).not.toHaveBeenCalled();
+  });
+  it('catch-up runs the attachment sweep after the category sweep', async () => {
+    const { uploader } = makeUploader();
+    const order: string[] = [];
+    const deps = (uploader as unknown as { deps: import('../blob-uploader').BlobUploaderDeps }).deps;
+    deps.sweepObsidian = async () => { order.push('category'); };
+    vi.spyOn(uploader, 'sweepAttachments').mockImplementation(async () => { order.push('attachment'); });
+    mockRequestUrl.mockResolvedValue({ status: 200, json: { states: [], max_seq: 0 } });
+    await uploader.catchUp();
+    expect(order).toEqual(['category', 'attachment']);
+  });
+  it('single-flight joins concurrent calls and permits a later run', async () => {
+    let release!: (paths: string[]) => void;
+    const listFiles = vi.fn(() => new Promise<string[]>(resolve => { release = resolve; }));
+    const { uploader } = makeUploader({ listFiles });
+    const a = uploader.sweepAttachments();
+    const b = uploader.sweepAttachments();
+    expect(a).toBe(b);
+    expect(listFiles).toHaveBeenCalledOnce();
+    release([]);
+    await Promise.all([a, b]);
+    const c = uploader.sweepAttachments();
+    expect(listFiles).toHaveBeenCalledTimes(2);
+    release([]);
+    await c;
+  });
+});
 
 const resp = (status: number, json: Record<string, unknown> = {}) => ({ status, json });
 

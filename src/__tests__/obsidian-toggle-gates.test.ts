@@ -103,7 +103,7 @@ function makeRig(opts: {
   });
   const trashIfPresent = opts.trashIfPresent ?? vi.fn(async () => undefined);
   const removeFile = opts.removeFile ?? vi.fn(async () => undefined);
-  const uploader = new BlobUploader({
+  const uploader = new BlobUploader({ listFiles: async () => [],
     index,
     serverUrl: () => 'https://s.example.com',
     peerId: () => 'peer-1',

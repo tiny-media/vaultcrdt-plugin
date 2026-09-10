@@ -34,7 +34,7 @@ function rig() {
     disk.delete(p);
     await uploader.onFileDeleted(p); // real synchronous vault echo admission
   });
-  const deps: BlobUploaderDeps = { index, stat: async p => disk.has(p) ? { size: disk.get(p)!.length } : null,
+  const deps: BlobUploaderDeps = { listFiles: async () => [], index, stat: async p => disk.has(p) ? { size: disk.get(p)!.length } : null,
     readBinary: async p => disk.get(p)!.slice().buffer, writeBinary: writes,
     trashIfPresent: trash, notify: vi.fn(), serverUrl: () => '', peerId: () => '',
     getJwt: async () => '', blobsEnabled: async () => true, isMobile: false, sleep: async () => {} };

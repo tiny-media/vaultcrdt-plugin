@@ -97,6 +97,7 @@ export default class VaultCRDTPlugin extends Plugin {
       peerId: () => this.settings.peerId,
       getJwt: () => this.syncEngine.getJwt(),
       blobsEnabled: () => this.blobsEnabled(),
+      listFiles: async () => this.app.vault.getFiles().map(f => f.path),
       stat: (path) => this.app.vault.adapter.stat(path),
       readBinary: (path) => this.app.vault.adapter.readBinary(path),
       writeBinary: (path, data) => this.app.vault.adapter.writeBinary(path, data),
@@ -193,6 +194,7 @@ export default class VaultCRDTPlugin extends Plugin {
       this.registerDomEvent(window, 'focus', () => {
         if (this.syncEngineInitialized) {
           void this.fileWatcher.scanForExternalChanges();
+          void this.blobUploader.sweepAttachments().catch(err => error('blob.sweep failed:', err));
         }
       });
     }

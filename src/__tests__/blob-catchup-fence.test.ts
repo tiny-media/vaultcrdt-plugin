@@ -10,7 +10,7 @@ function setup(pages: Record<string, unknown>[]) {
   const storage = { existsRaw: async (name: string) => files.has(name), readRaw: async (name: string) => files.get(name) ?? null,
     writeRaw: vi.fn(async (name: string, text: string) => { files.set(name, text); }), loadJson: async () => null, saveJson: async () => {} };
   const index = new BlobIndex(storage);
-  const uploader = new BlobUploader({ index, serverUrl: () => '', peerId: () => '', getJwt: async () => '',
+  const uploader = new BlobUploader({ listFiles: async () => [], index, serverUrl: () => '', peerId: () => '', getJwt: async () => '',
     blobsEnabled: async () => true, stat: async () => null, readBinary: async () => new ArrayBuffer(0),
     writeBinary: async () => {}, notify: () => {}, isMobile: false });
   const http = vi.spyOn(uploader as any, 'http').mockImplementation(async () => ({ json: pages.shift() }));
@@ -20,6 +20,8 @@ const row = (seq: number) => ({ seq, state: 'live', path_key: 'ignored' });
 describe('fixed fence', () => {
   it.each([false, true])('settlement alone rearms once, including teardown=%s', async teardown => {
     const { index, uploader, http } = setup([]);
+    // Isolate settlement rearming from the independent missed-delete backstop.
+    vi.spyOn(uploader, 'sweepAttachments').mockResolvedValue();
     index.update('a.png', { seq: 0, hash: 'x' });
     const state = { seq: 2, state: 'deleted', path_key: index.get('a.png')!.key };
     http.mockImplementation(async () => ({ json: { max_seq: 2, states: [row(1), state] } }));

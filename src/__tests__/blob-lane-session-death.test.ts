@@ -33,7 +33,7 @@ function memStorage() {
 
 function makeUploader(gate: { open: boolean }) {
   const index = new BlobIndex(memStorage());
-  const uploader = new BlobUploader({
+  const uploader = new BlobUploader({ listFiles: async () => [],
     index,
     serverUrl: () => 'https://s.example.com',
     peerId: () => 'peer-1',
