@@ -8,11 +8,13 @@ maintainer's global setup live in the untracked `AGENTS.override.md`.
 ## Session entry and exit
 
 - Enter locally through `dev/next.md` (goal, open work, last
-  verification; untracked, ≤60 lines, rewritten not appended). Without
-  local files, the public docs are the entry: `docs/architecture.md`,
+  verification; untracked, rewritten not appended, as long as it needs
+  to be — no line limit). When it outgrows one screen, move closed items
+  to the archive with a pointer; never squeeze at session end to hit a
+  number. Without local files, the public docs are the entry: `docs/architecture.md`,
   `docs/development.md`, `docs/decisions/`.
 - Only `dev/next.md` carries current priorities and releases. One log
-  entry per session, ≤15 lines, changes + evidence links instead of
+  entry per session, short — changes + evidence links instead of
   repeated state. Log, archive and working files are not required
   reading for continuation.
 - History is append-only in `dev/log.md`; frozen history in
