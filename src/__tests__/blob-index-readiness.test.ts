@@ -36,7 +36,7 @@ describe('BlobIndex cold readiness boundary (export spy, not path-policy oracle)
     await vi.waitFor(() => expect(ready).toHaveBeenCalledTimes(1));
     expect(canonical).not.toHaveBeenCalled();
     expect(index.entries()).toEqual([]);
-    expect(index.maxSeq()).toBe(0);
+    expect(index.cursor()).toBe(0);
     gate.resolve();
     await loading;
     expect(canonical).toHaveBeenCalledExactlyOnceWith(path);
@@ -70,7 +70,7 @@ describe('BlobIndex cold readiness boundary (export spy, not path-policy oracle)
     expect(ready).toHaveBeenCalledTimes(1);
     expect(canonical).toHaveBeenCalledExactlyOnceWith(path);
     expect(index.entries()).toEqual([]);
-    expect(index.maxSeq()).toBe(0);
+    expect(index.cursor()).toBe(0);
     expect(index.poisoned()).toBe(true);
   });
 
@@ -111,14 +111,14 @@ describe('BlobIndex cold readiness boundary (export spy, not path-policy oracle)
     expect(await result).toBe(failure);
     expect(index.entries()).toEqual(previous);
     expect(index.get(path)).toBe(oldEntry);
-    expect(index.maxSeq()).toBe(9);
+    expect(index.cursor()).toBe(0);
     expect(fixture.bytes()).toBe(stored);
     expect(canonical).not.toHaveBeenCalled();
     expect(store.saveJson).not.toHaveBeenCalled();
     fixture.replace({ ...candidate, maxSeq: 30 });
     await index.load(async () => undefined);
     expect(index.get(nextPath)).toBeUndefined();
-    expect(index.maxSeq()).toBe(30);
+    expect(index.cursor()).toBe(0);
     expect(store.read).toHaveBeenCalledTimes(3);
     expect(store.saveJson).not.toHaveBeenCalled();
   });

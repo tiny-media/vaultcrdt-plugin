@@ -108,13 +108,17 @@ export default class VaultCRDTPlugin extends Plugin {
         if (f instanceof TFile) await this.app.fileManager.trashFile(f);
       },
       removeFile: (path) => this.app.vault.adapter.remove(path),
+      mkdir: (dir) => this.app.vault.adapter.mkdir(dir),
+      rename: (a, b) => this.app.vault.adapter.rename(a, b),
       obsidianSyncEnabled: () => this.settings?.obsidianSync ?? { settings: false, styles: false },
       sweepObsidian: () => this.obsidianSync.sweep(),
       // Index is fresh right after catch-up: no 2 s guard needed here.
       hydrateActiveFile: () => this.scheduleActiveFileHydration(0),
     });
+    this.blobUploader.reconcilePendingDeletes(false).catch(err => error('blob reconcile failed:', err));
     this.blobDownloader = new BlobDownloader({
       index: this.blobIndex,
+      pathEffects: this.blobUploader.pathEffects,
       onActiveCountChange: (count) => {
         if (this.hydrationDestroyed) return;
         this.activeDownloads = count;

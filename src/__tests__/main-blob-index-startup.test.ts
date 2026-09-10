@@ -37,6 +37,7 @@ vi.mock('../state-storage', () => ({ StateStorage: class {
 } }));
 vi.mock('../blob-uploader', () => ({ BlobUploader: class {
   constructor() { spies.order.push('uploader'); }
+  async reconcilePendingDeletes(_networkReady: boolean) {}
 } }));
 vi.mock('../blob-downloader', () => ({ BlobDownloader: class {
   constructor() { spies.order.push('downloader'); }

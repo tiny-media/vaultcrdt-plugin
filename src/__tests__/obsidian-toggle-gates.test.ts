@@ -87,6 +87,7 @@ function makeRig(opts: {
   };
   const downloader = new BlobDownloader({
     index,
+    get pathEffects() { return uploader.pathEffects; },
     serverUrl: () => 'https://s.example.com',
     getJwt: async () => 'jwt-1',
     blobsEnabled: async () => true,

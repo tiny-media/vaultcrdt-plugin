@@ -63,16 +63,21 @@ while the error stands; `dispose()` stops the timer on unload.
 `load(ready)` is an exclusive FIFO task (not a tail await): it reads main
 and backup through one strict validator (`validateIndexFile`) that admits
 WHOLE snapshots only — any invalid entry (wrong field types, key/hash
-mismatch, WASM key rejection) or envelope corruption (bad JSON, `v !== 1`,
-non-record paths, non-number maxSeq) rejects the entire snapshot; missing
-optional fields keep their defaults. A nonempty valid entry set awaits
+mismatch, WASM key rejection, malformed `pendingDecision`) or envelope
+corruption (bad JSON, `v` ∉ {1, 2}, non-record paths, non-number
+`maxSeq` on v1, non-nonnegative-integer `c` on v2) rejects the entire
+snapshot; missing optional fields keep their defaults. v1 files migrate
+in-memory to v2 with `c := 0` (the old `maxSeq` is deliberately not
+trusted — one full fixed-fence re-enumeration rebuilds provenance);
+persist always writes v2. A nonempty valid entry set awaits
 readiness before canonical admission; candidate-free data needs neither
 readiness nor exports. Publication happens BEFORE the inline repair
 (recovery visibility is immediate); a mutation counter keeps newer
 in-memory mutations through reload. Outcomes: `ok`, `fresh` (both files
 absent, not already poisoned), `recovered` (backup wins, main self-heals
 from it), `poisoned` (no valid snapshot: empty in-memory state including
-`maxSeq = 0`, sticky across restarts until a valid snapshot file reappears,
+cursor 0 and no decisions, sticky across restarts until a valid snapshot
+file reappears,
 corrupt main quarantined best-effort and named in the recovery notice only
 when actually written — `blobIndexRecoveryPausedMessage`). Poisoned state
 gates every blob effect path (catch-up incl. hydrate/sweep tail, watcher
@@ -206,11 +211,54 @@ its known generation and consumes acceptance/sequence responses
 Server generation/tiebreak ordering is not implemented or verifiable here;
 HTTP 409 is treated as an LWW loss without an immediate upload-side copy.
 
-Catch-up fetches one `since_seq` page with `limit=1000`, records returned
-states and advances to the reported `max_seq`; it does not loop over pages
-(`src/blob-uploader.ts:runCatchUp`). WS `blob_path_changed` schedules this
+Catch-up is a fixed-fence pagination walk (`src/blob-uploader.ts:runCatchUp`):
+the first page's `max_seq` freezes a fence `F` (fallback to the page's
+highest row seq only when `max_seq` is absent; a present-but-invalid
+`max_seq` aborts the pass uncertified), pages continue `since_seq=p`
+ascending while rows return and `p < F`, the first row above `F` ends
+the pass unapplied, and short/empty pages or `p === F` end it. Each
+fully-handled row advances the in-pass position `p := row.seq`; a row
+whose decision is not durably complete yet (upload or hydration effect
+in flight) defers: the pass stops at `p` and the cursor certifies `p`,
+not `F`, with exactly one follow-up pass scheduled on that effect's
+settlement — never a polling loop. The durable completeness cursor `C`
+(`index.cursor()`) advances only after `index.flush()` succeeds; local
+acknowledgements never move it (A[k] per-path bookkeeping lives in
+`entry.seq`, re-checked at mutation time after every await). The server
+premise — seq allocation/upsert atomicity plus a snapshot-consistent
+listing response — is pinned by `test_blob_listing_fence_premise_p1`
+in the server repo. WS `blob_path_changed` schedules this
 HTTP catch-up rather than carrying attachment bytes
 (`src/sync-engine.ts:scheduleBlobCatchUp`).
+
+Remote tombstones do not delete inline. The applier records a durable
+decision on the entry — `pendingDecision: {kind: 'delete', expectedHash,
+expectedSize, seq, generation}` for unmodified files, `{kind:
+'republish', seq, generation}` for locally-modified ones — flushes it
+BEFORE any effect, and leaves execution to the reconciler
+(`reconcilePendingDeletes`), which runs inside one serialized decision
+lane with the catch-up pass (pass tail, and once at startup with
+network-gating off). The reconciler re-verifies file identity (hash,
+size, size stability) at delete time; a mismatch transitions durably
+to `republish` (never a blind delete), whose POST uses
+`max(local.generation, decision.generation)+1` so it either wins the
+server's LWW or provably loses (409 keeps the local file, server truth
+stands). Deletion itself: attachments are trashed (recoverable);
+category files are moved via adapter rename to a collision-safe
+`.trash/vaultcrdt/<epoch>-seq<n>-<path>` recovery path (any failure
+keeps the decision and deletes nothing), followed by post-delete
+verification. All file effects — destructive or write — serialize
+through a per-path effect lock (`src/path-effects.ts`); in-flight
+writes register token-bound authorities (decision-owned, upload-owned,
+hydration), and every deletion admission cancels its path's captured
+in-flight effects by token (never path-wide, so a newer authority never
+inherits an old cancellation), with compensation trashes marked as
+self-deletes so their vault events no-op in `onFileDeleted`. The
+post-write classifier (cancellation → upload-owned → entry-absent →
+supersession → normal) decides each write's outcome; supersession keeps
+the bytes and marks `hydrated: false` for re-download. The remaining
+asynchronous check→delete gap is irreducible without FS locking and is
+documented as such (reduction, not impossibility).
 
 Receive-side registry admission requires a valid key for a new display path;
 a known canonical key resolves to the existing local spelling. The code does

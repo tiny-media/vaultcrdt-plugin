@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import type { App } from 'obsidian';
+import { PathEffects } from '../path-effects';
 
 const { request } = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock('obsidian', async () => ({
@@ -77,6 +78,7 @@ describe('persisted BlobIndex admission with real WASM and downloader', () => {
     const writeBinary = vi.fn<(path: string, data: ArrayBuffer) => Promise<void>>(async () => undefined);
     const readBinary = vi.fn(async () => new ArrayBuffer(0));
     const downloader = new BlobDownloader({
+      pathEffects: new PathEffects(index, async () => { throw new Error('Unexpected compensation'); }),
       index, serverUrl: () => 'https://vcrdt-t.example', getJwt: async () => 'vcrdt-t-jwt',
       blobsEnabled: async () => true, exists, mkdir, writeBinary, readBinary,
       enqueueUpload: vi.fn(), categoryEnabled: () => ({ settings: true, styles: true }),
@@ -93,7 +95,7 @@ describe('persisted BlobIndex admission with real WASM and downloader', () => {
     expect(readBinary).not.toHaveBeenCalled();
     expect(first.map(([p]) => p)).toEqual(mixed ? [] : valid);
     expect(index.poisoned()).toBe(mixed);
-    expect(index.maxSeq()).toBe(mixed ? 0 : 5); // Paths and cursor travel together.
+    expect(index.cursor()).toBe(0); // v1 maxSeq is never a certified cursor.
     expect(store.saveJson).not.toHaveBeenCalled();
     expect(store.read).toHaveBeenCalledTimes(2);
     await downloader.hydratePending();
@@ -113,7 +115,7 @@ describe('persisted BlobIndex admission with real WASM and downloader', () => {
     expect(index.get(p)).toEqual(entry);
     expect(index.get('vcrdt-t-default.png')).toEqual({ key: 'vcrdt-t-default.png', hash: '',
       size: 0, generation: 0, seq: 0, hydrated: true, lastRemoteHash: '' });
-    expect(index.maxSeq()).toBe(-7);
+    expect(index.cursor()).toBe(0);
     expect(store.saveJson).not.toHaveBeenCalled();
   });
 

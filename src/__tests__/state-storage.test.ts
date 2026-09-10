@@ -89,7 +89,7 @@ describe('StateStorage', () => {
       for (const name of names) expect(await storage.existsRaw(name)).toBe(true);
       expect((await restarted.load(async () => {})).outcome).toBe(poisoned ? 'poisoned' : 'ok');
       expect(restarted.poisoned()).toBe(poisoned);
-      expect(restarted.maxSeq()).toBe(poisoned ? 0 : 7);
+      expect(restarted.cursor()).toBe(0);
     } finally { first.dispose(); restarted.dispose(); }
   });
 

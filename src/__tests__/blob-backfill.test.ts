@@ -87,6 +87,18 @@ async function setup() {
 }
 
 describe('backfillAttachments', () => {
+  it('routes skipped decision entries through the real uploader admission gate', async () => {
+    const { plugin, app } = await setup();
+    const path = 'Bilder/pending.png';
+    setIndexEntry(plugin, path, { skipped: true, seq: 12,
+      pendingDecision: { kind: 'republish', seq: 12, generation: 3 } });
+    app.vault.getFiles.mockReturnValue([{ path }]);
+    vi.spyOn(plugin.serverFeatures, 'get').mockResolvedValue([FEATURE_BLOBS]);
+    const changed = vi.spyOn(plugin.blobUploader, 'onFileChanged');
+    await plugin.backfillAttachments();
+    expect(changed).toHaveBeenCalledExactlyOnceWith(path);
+    expect(plugin.blobUploader.isPending(path)).toBe(false);
+  });
   it('checks poison before listing or enqueueing attachments', async () => {
     const { plugin, app } = await setup();
     vi.spyOn(plugin.blobIndex, 'poisoned').mockReturnValue(true);

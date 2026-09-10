@@ -1,5 +1,9 @@
 import { blob_path_key } from '../wasm/vaultcrdt_wasm';
 
+export type PendingDecision =
+  | { kind: 'delete'; expectedHash: string; expectedSize: number; seq: number; generation: number }
+  | { kind: 'republish'; seq: number; generation: number };
+
 /**
  * Persistent attachment blob index (design §3). One entry per attachment path,
  * keyed by the vault-relative path; `key` is the canonical blob path key from
@@ -26,11 +30,12 @@ export interface BlobIndexEntry {
   skipped?: boolean;
   /** Adapter mtime from the last successful upload/stat — sweep diff. */
   mtime?: number;
+  pendingDecision?: PendingDecision;
 }
 
 interface BlobIndexFile {
-  v: 1;
-  maxSeq: number;
+  v: 2;
+  c: number;
   paths: Record<string, BlobIndexEntry>;
 }
 
@@ -54,7 +59,14 @@ function isCandidate(value: unknown): value is Record<string, unknown> & { key: 
 
 const BACKUP = 'blob-index.bak';
 const QUARANTINE = 'blob-index.corrupt.json';
-const emptyFile = (): BlobIndexFile => ({ v: 1, maxSeq: 0, paths: Object.create(null) });
+const emptyFile = (): BlobIndexFile => ({ v: 2, c: 0, paths: Object.create(null) });
+const nonNegativeInteger = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && Number.isInteger(n) && n >= 0;
+function validDecision(d: unknown): d is PendingDecision {
+  if (!isRecord(d) || !nonNegativeInteger(d.seq) || !nonNegativeInteger(d.generation)) return false;
+  if (d.kind === 'republish') return true;
+  return d.kind === 'delete' && typeof d.expectedHash === 'string' && d.expectedHash.length > 0
+    && nonNegativeInteger(d.expectedSize);
+}
 type Validation = { ok: true; file: BlobIndexFile } | { ok: false; reason: string };
 export interface BlobIndexLoadOutcome {
   outcome: 'ok' | 'fresh' | 'recovered' | 'poisoned';
@@ -66,12 +78,16 @@ export interface BlobIndexLoadOutcome {
 export async function validateIndexFile(text: string, ready: () => Promise<void> = async () => {}): Promise<Validation> {
   let raw: unknown;
   try { raw = JSON.parse(text); } catch { return { ok: false, reason: 'invalid JSON' }; }
-  if (!isRecord(raw) || raw.v !== 1 || !isRecord(raw.paths) || typeof raw.maxSeq !== 'number') {
+  if (!isRecord(raw) || (raw.v !== 1 && raw.v !== 2) || !isRecord(raw.paths)
+    || (raw.v === 1 ? typeof raw.maxSeq !== 'number' : !nonNegativeInteger(raw.c))) {
     return { ok: false, reason: 'invalid index envelope' };
   }
   const entries = Object.entries(raw.paths);
   for (const [path, e] of entries) {
     if (!isCandidate(e)) return { ok: false, reason: `invalid entry: ${path}` };
+    if ('pendingDecision' in e && !validDecision(e.pendingDecision)) {
+      return { ok: false, reason: `invalid pendingDecision: ${path}` };
+    }
     for (const field of ['size', 'generation', 'seq', 'mtime']) {
       if (field in e && typeof e[field] !== 'number') return { ok: false, reason: `invalid ${field}: ${path}` };
     }
@@ -85,7 +101,7 @@ export async function validateIndexFile(text: string, ready: () => Promise<void>
   // Readiness failure propagates; empty/malformed startup stays lazy.
   if (entries.length) await ready();
   const file = emptyFile();
-  file.maxSeq = raw.maxSeq;
+  file.c = raw.v === 2 ? raw.c as number : 0;
   for (const [path, value] of entries) {
     const e = value as Record<string, unknown> & { key: string; hash: string };
     const key = blob_path_key(path);
@@ -98,13 +114,14 @@ export async function validateIndexFile(text: string, ready: () => Promise<void>
       lastRemoteHash: 'lastRemoteHash' in e ? e.lastRemoteHash as string | null : '',
       ...('skipped' in e ? { skipped: e.skipped as boolean } : {}),
       ...('mtime' in e ? { mtime: e.mtime as number } : {}),
+      ...('pendingDecision' in e ? { pendingDecision: e.pendingDecision as PendingDecision } : {}),
     };
   }
   return { ok: true, file };
 }
 
 export class BlobIndex {
-  private file: BlobIndexFile = { v: 1, maxSeq: 0, paths: Object.create(null) as Record<string, BlobIndexEntry> };
+  private file: BlobIndexFile = emptyFile();
   private writes: Promise<void> = Promise.resolve();
 
   constructor(private storage: BlobIndexStorage) {}
@@ -237,20 +254,19 @@ export class BlobIndex {
       ?? { key, hash: '', size: 0, generation: 0, seq: 0, hydrated: true, lastRemoteHash: '' };
     const next: BlobIndexEntry = { ...prev, ...patch, key };
     this.file.paths[path] = next;
-    if (next.seq > this.file.maxSeq) this.file.maxSeq = next.seq;
     this.persist();
     return next;
   }
 
-  /** Highest server seq observed (per-path acks and catch-up pages). */
-  maxSeq(): number {
-    return this.file.maxSeq;
+  /** Last certified catch-up position, independent of per-path acknowledgements. */
+  cursor(): number {
+    return this.file.c;
   }
 
-  noteMaxSeq(seq: number): void {
+  advanceCursor(f: number): void {
     if (this.refusePoison()) return;
-    if (seq <= this.file.maxSeq) return;
-    this.file.maxSeq = seq;
+    if (f <= this.file.c) return;
+    this.file.c = f;
     this.persist();
   }
 

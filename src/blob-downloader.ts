@@ -12,12 +12,14 @@ import {
 } from './path-policy';
 import { blobRequest, headerValue } from './blob-uploader';
 import type { BlobIndex, BlobIndexEntry } from './blob-index';
+import type { PathEffects } from './path-effects';
 
 /** Download segments match the upload default (server Accept-Ranges: bytes). */
 const SEGMENT_BYTES = 4 * 1024 * 1024;
 
 export interface BlobDownloaderDeps {
   index: BlobIndex;
+  pathEffects: PathEffects;
   /** Admitted hydrateOne operations, through local processing/write completion. */
   onActiveCountChange?(count: number): void;
   serverUrl(): string;
@@ -45,9 +47,9 @@ export interface BlobDownloaderDeps {
  * The 25 MiB audio cap is the accepted worst case (requestUrl also buffers
  * each response wholly).
  *
- * Echo suppression relies on updating the index (hash, size, generation,
- * seq, lastRemoteHash) BEFORE writeBinary. `hydrated` flips only AFTER
- * writeBinary resolves — a failed write leaves hydrated:false (retryable)
+ * Echo suppression sets lastRemoteHash BEFORE writeBinary. Authority hash
+ * and seq stay intact for post-write classification; local hash/size and
+ * `hydrated` commit only after a normal result. A failed write leaves hydrated:false (retryable)
  * so a concurrent sweep cannot tombstone a file that is not on disk yet.
  * The vault 'create' from that write routes to onFileChanged → upload() →
  * hash → `entry.lastRemoteHash === hash` returns early.
@@ -189,12 +191,19 @@ export class BlobDownloader {
   async hydrateOne(path: string): Promise<void> {
     if (this.inflight.has(path)) return;
     const entry = this.deps.index.get(path);
-    if (!entry || entry.hydrated || entry.skipped || !entry.hash) return;
+    if (!entry || entry.pendingDecision || entry.hydrated || entry.skipped || !entry.hash) return;
+    const effects = this.deps.pathEffects;
+    const token = effects.register(path, { kind: 'hydration', seq: entry.seq, hash: entry.hash });
+    const valid = () => {
+      const current = this.deps.index.get(path);
+      return !effects.isCancelled(token) && !this.deps.index.poisoned() && !!current &&
+        current.seq === entry.seq && current.hash === entry.hash && !current.pendingDecision;
+    };
     this.inflight.add(path);
     try {
       this.publishActiveCount();
       const bytes = await this.download(entry.hash, path, entry.size);
-      if (!bytes) return;
+      if (!bytes || !valid()) return;
       const remoteHash = blake3_hex(bytes);
       if (remoteHash !== entry.hash) {
         // Mismatch: nothing was written (in-memory assembly only). Leave
@@ -220,50 +229,54 @@ export class BlobDownloader {
         return;
       }
 
-      await this.maybeConflictCopy(path, entry, hash);
-      await this.mkdirParents(path);
-      const prevLastRemoteHash = entry.lastRemoteHash;
-      // lastRemoteHash must be set BEFORE writeBinary (echo suppression).
-      // hydrated stays false until the write resolves — a failed write
-      // leaves hydrated:false so the next pass retries.
-      this.deps.index.update(path, {
-        hash,
-        size: local.byteLength,
-        generation: entry.generation,
-        seq: entry.seq,
-        lastRemoteHash: hash,
+      await this.maybeConflictCopy(path, entry, hash, valid);
+      if (!valid()) return;
+      await this.mkdirParents(path, valid);
+      if (!valid()) return;
+      await effects.withPathLock(path, async () => {
+        if (!valid()) return;
+        const prevLastRemoteHash = entry.lastRemoteHash;
+        // Keep authority hash/seq intact until classification. Only the echo
+        // baseline changes before the write; hydrated remains false on failure.
+        this.deps.index.update(path, { lastRemoteHash: hash });
+        try {
+          await this.deps.writeBinary(path, bufferOf(local));
+        } catch (e) {
+          if (valid()) this.deps.index.update(path, { lastRemoteHash: prevLastRemoteHash });
+          throw e;
+        }
+        const outcome = effects.classify(token);
+        if (typeof outcome !== 'string') { await outcome; return; }
+        if (outcome !== 'normal') return;
+        // No await between normal classification and committing hydration.
+        this.deps.index.update(path, { hash, size: local.byteLength, hydrated: true });
       });
-      try {
-        await this.deps.writeBinary(path, bufferOf(local));
-      } catch (e) {
-        this.deps.index.update(path, {
-          lastRemoteHash: prevLastRemoteHash,
-        });
-        throw e;
-      }
-      this.deps.index.update(path, { hydrated: true });
     } catch (e) {
       error('blob.hydrate failed:', path, e);
     } finally {
+      effects.settle(token);
       this.inflight.delete(path);
       this.publishActiveCount();
     }
   }
 
   private async maybeConflictCopy(
-    path: string, entry: BlobIndexEntry, remoteHash: string,
+    path: string, entry: BlobIndexEntry, remoteHash: string, valid: () => boolean,
   ): Promise<void> {
     // Category files overwrite locally (whole-file LWW, no JSON-key merge).
     // A `.obsidian/app (conflict …).json` could never produce a valid key.
     if (obsidianSyncCategoryOf(path)) return;
-    if (!(await this.deps.exists(path))) return;
+    if (!(await this.deps.exists(path)) || !valid()) return;
     const localBytes = new Uint8Array(await this.deps.readBinary(path));
+    if (!valid()) return;
     const localHash = blake3_hex(localBytes);
     if (localHash === remoteHash) return;
     if (localHash === entry.lastRemoteHash) return;
     const dest = conflictPath(this.deps.app, path);
-    await this.mkdirParents(dest);
+    await this.mkdirParents(dest, valid);
+    if (!valid()) return;
     await this.deps.writeBinary(dest, bufferOf(localBytes));
+    if (!valid()) return;
     this.deps.enqueueUpload(dest);
   }
 
@@ -335,14 +348,19 @@ export class BlobDownloader {
     });
   }
 
-  private async mkdirParents(path: string): Promise<void> {
+  private async mkdirParents(path: string, valid = () => true): Promise<void> {
     const slash = path.lastIndexOf('/');
     if (slash < 0) return;
     const parts = path.slice(0, slash).split('/');
     let acc = '';
     for (const part of parts) {
       acc = acc ? `${acc}/${part}` : part;
-      if (!(await this.deps.exists(acc))) await this.deps.mkdir(acc);
+      const exists = await this.deps.exists(acc);
+      if (!valid()) return;
+      if (!exists) {
+        await this.deps.mkdir(acc);
+        if (!valid()) return;
+      }
     }
   }
 }

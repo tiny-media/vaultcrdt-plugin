@@ -123,8 +123,9 @@ function makePair(opts: {
   const vault = makeVault();
   const index = new BlobIndex(memStorage());
   const enqueue = vi.fn();
-  const downloader = new BlobDownloader({
+  const downloader: BlobDownloader = new BlobDownloader({
     index,
+    get pathEffects() { return uploader.pathEffects; },
     serverUrl: () => 'https://s.example.com',
     getJwt: async () => 'jwt-1',
     blobsEnabled: opts.blobsEnabled ?? (async () => true),
@@ -152,6 +153,7 @@ function makePair(opts: {
     isMobile: opts.isMobile ?? false,
     sleep: async () => undefined,
     now: () => 0,
+    trashIfPresent: async (path) => { vault.files.delete(path); },
     hydratePending: () => downloader.hydratePending(),
     obsidianSyncEnabled: enabledNow,
     hydrateActiveFile: opts.hydrateActiveFile,
@@ -168,6 +170,28 @@ beforeEach(() => {
 });
 
 describe('BlobDownloader (hydration S3)', () => {
+  it('does not admit decision entries', async () => {
+    const { index, downloader } = makePair();
+    index.update('pending.png', { hash: blake3_hex(new Uint8Array([1])), hydrated: false, seq: 12,
+      pendingDecision: { kind: 'republish', seq: 12, generation: 3 } });
+    const download = vi.spyOn(downloader as unknown as { download(): Promise<Uint8Array> }, 'download');
+    await downloader.hydrateOne('pending.png'); expect(download).not.toHaveBeenCalled();
+  });
+  it.each(['removed', 'changed', 'decision'])('discards a download after entry %s', async change => {
+    const { index, downloader, vault } = makePair();
+    const bytes = new Uint8Array([1, 2, 3]); const path = 'pending.png';
+    index.update(path, { hash: blake3_hex(bytes), hydrated: false, size: 3, seq: 10 });
+    let release!: (b: Uint8Array) => void;
+    vi.spyOn(downloader as unknown as { download(): Promise<Uint8Array> }, 'download')
+      .mockImplementation(() => new Promise(r => { release = r; }));
+    const work = downloader.hydrateOne(path);
+    if (change === 'removed') index.remove(path);
+    else if (change === 'changed') index.update(path, { seq: 14 });
+    else index.update(path, { pendingDecision: { kind: 'republish', seq: 12, generation: 3 } });
+    release(bytes); await work;
+    expect(vault.files.has(path)).toBe(false);
+    if (change === 'removed') expect(index.get(path)).toBeUndefined();
+  });
   it('1. happy path: 206 segments assemble, index gets hash+seq+generation, create is echo, second catchUp does not loop', async () => {
     const { vault, index, uploader } = makePair();
     mockRequestUrl.mockImplementation(async (opts: Call) => {

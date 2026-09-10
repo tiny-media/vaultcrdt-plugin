@@ -4331,6 +4331,120 @@ describe('SyncEngine', () => {
   });
 
   describe('doc_tombstoned', () => {
+    it.each(['size', 'mtime'] as const)('dedups same stats and re-probes a changed %s', async field => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      const probe = vi.spyOn(internal, 'probeServerDoc').mockResolvedValue(null);
+      ctx.renameFile.mockResolvedValue(undefined); // Keep lookup stable for repeated refusals.
+      await internal.handleDocTombstoned('doomed.md');
+      await internal.handleDocTombstoned('doomed.md');
+      expect(probe).toHaveBeenCalledTimes(1);
+      expect(ctx.renameFile).toHaveBeenCalledTimes(1);
+      ctx.stat[field]++;
+      await internal.handleDocTombstoned('doomed.md');
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(ctx.renameFile).toHaveBeenCalledTimes(2);
+      expect(internal.notifiedTombstones.get('doomed.md')).toEqual(ctx.stat);
+    });
+
+    it('discards a negative probe answer for a recreated incarnation', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      let release!: (value: null) => void;
+      const probe = vi.spyOn(internal, 'probeServerDoc')
+        .mockImplementation(() => new Promise(resolve => { release = resolve; }));
+      const task = internal.handleDocTombstoned('doomed.md');
+      ctx.stat.mtime++;
+      release(null);
+      await flush();
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(ctx.renameFile).not.toHaveBeenCalled();
+      expect(internal.tombstoneLivenessChecked.size).toBe(0);
+      release(null);
+      await task;
+      expect(ctx.renameFile).toHaveBeenCalledTimes(1);
+      expect(internal.tombstoneLivenessChecked.get('doomed.md')).toEqual(ctx.stat);
+    });
+
+    it('revalidates recreation during the recovery document load', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      const probe = vi.spyOn(internal, 'probeServerDoc')
+        .mockResolvedValueOnce({ delta: new Uint8Array([1]), serverVV: '{}' })
+        .mockResolvedValue(null);
+      let release!: (doc: any) => void;
+      ctx.getOrLoad.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+      const push = vi.spyOn(internal.push, 'pushDocCreate');
+      const task = internal.handleDocTombstoned('doomed.md');
+      await flush();
+      ctx.stat.size++;
+      const doc = { text_matches: vi.fn(), sync_from_disk: vi.fn() };
+      release(doc);
+      await task;
+      expect(push).not.toHaveBeenCalled();
+      expect(doc.text_matches).not.toHaveBeenCalled();
+      expect(probe).toHaveBeenCalledTimes(2);
+      expect(ctx.renameFile).toHaveBeenCalledTimes(1);
+    });
+
+    it('revalidates immediately before rename after destination lookup', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      const probe = vi.spyOn(internal, 'probeServerDoc').mockResolvedValue(null);
+      const lookup = mockVault.getAbstractFileByPath.getMockImplementation()!;
+      let recreated = false;
+      mockVault.getAbstractFileByPath.mockImplementation((path: string) => {
+        if (path === 'doomed (deleted-remote).md' && !recreated) {
+          recreated = true;
+          ctx.stat.mtime++;
+        }
+        return lookup(path);
+      });
+      ctx.renameFile.mockImplementation(async file => {
+        expect(file.stat).toEqual({ size: 1, mtime: 2 });
+        expect(probe).toHaveBeenCalledTimes(2);
+      });
+      await internal.handleDocTombstoned('doomed.md');
+      expect(recreated).toBe(true);
+      expect(ctx.renameFile).toHaveBeenCalledTimes(1);
+    });
+
+    it('an old failed rename cannot release a newer admitted slot', async () => {
+      const ctx = await startContainmentEngine(['doomed.md']);
+      const internal = engine as any;
+      const probe = vi.spyOn(internal, 'probeServerDoc').mockResolvedValue(null);
+      let reject!: (error: Error) => void;
+      ctx.renameFile.mockImplementationOnce(() => new Promise<void>((_resolve, no) => { reject = no; }))
+        .mockResolvedValue(undefined);
+      const oldTask = internal.handleDocTombstoned('doomed.md');
+      await flush();
+      expect(internal.notifiedTombstones.get('doomed.md')).toEqual({ size: 1, mtime: 1 });
+      ctx.stat.mtime++;
+      await internal.handleDocTombstoned('doomed.md');
+      reject(new Error('old rename failed'));
+      await oldTask;
+      expect(internal.notifiedTombstones.get('doomed.md')).toEqual({ size: 1, mtime: 2 });
+      await internal.handleDocTombstoned('doomed.md');
+      expect(ctx.renameFile).toHaveBeenCalledTimes(2);
+      expect(probe).toHaveBeenCalledTimes(2);
+    });
+
+    it('dedups no-file sentinel but admits a real file afterwards', async () => {
+      const paths: string[] = [];
+      const ctx = await startContainmentEngine(paths);
+      const internal = engine as any;
+      const probe = vi.spyOn(internal, 'probeServerDoc').mockResolvedValue(null);
+      await internal.handleDocTombstoned('doomed.md');
+      await internal.handleDocTombstoned('doomed.md');
+      expect(ctx.add).toHaveBeenCalledTimes(1);
+      expect(internal.notifiedTombstones.get('doomed.md')).toEqual({ size: -1, mtime: -1 });
+      expect(probe).not.toHaveBeenCalled();
+      paths.push('doomed.md');
+      await internal.handleDocTombstoned('doomed.md');
+      expect(probe).toHaveBeenCalledTimes(1);
+      expect(ctx.renameFile).toHaveBeenCalledTimes(1);
+    });
+
     it.each([null, { delta: new Uint8Array([1]), serverVV: '{}' }])('fences controlled probe survivors (%j)', async live => {
       const ctx = await startContainmentEngine(['doomed.md']);
       const internal = engine as any;
@@ -4406,7 +4520,7 @@ describe('SyncEngine', () => {
       expect(probe).toHaveBeenCalledTimes(2);
     });
 
-    it('keeps completed path dedup across restart and recreation (N7 ④/R2 residual)', async () => {
+    it('keeps same-stat dedup across restart (session-local heuristic)' , async () => {
       const paths = ['doomed.md'];
       const ctx = await startContainmentEngine(paths);
       const internal = engine as any;
@@ -4414,7 +4528,7 @@ describe('SyncEngine', () => {
       await internal.handleDocTombstoned('doomed.md');
       expect(paths).not.toContain('doomed.md');
       await engine.restart();
-      paths.push('doomed.md'); // Actual new incarnation; N7 ④/R2 supplies identity later.
+      paths.push('doomed.md'); // Same stats deliberately cannot distinguish this recreation.
       ctx.add.mockClear();
       await internal.handleDocTombstoned('doomed.md');
       expect(ctx.renameFile).toHaveBeenCalledTimes(1);
@@ -4444,7 +4558,7 @@ describe('SyncEngine', () => {
       await internal.handleDocTombstoned('doomed.md');
       expect(ctx.renameFile).toHaveBeenCalledTimes(failure ? 2 : 1);
       if (failure) expect(probe).toHaveBeenCalledTimes(2);
-      else expect(ctx.add).not.toHaveBeenCalled();
+      else expect(ctx.add).toHaveBeenCalledWith(expect.objectContaining({ kind: 'tombstone-edit' }));
     });
 
     it('fences a definitive refusal answered immediately before stop', async () => {
@@ -4484,7 +4598,7 @@ describe('SyncEngine', () => {
       expect(trace).toHaveBeenCalledWith('tombstoned.fence-stopped', 'doomed.md');
     });
     it('renames the local file to " (deleted-remote)" instead of leaving it editable, and adds a tombstone-rename inbox entry', async () => {
-      const tfile = Object.create(TFile.prototype);
+      const tfile = Object.assign(Object.create(TFile.prototype), { stat: { size: 1, mtime: 1 } });
       mockVault.getAbstractFileByPath.mockImplementation((p: string) => (p === 'doomed.md' ? tfile : null));
       const renameFile = vi.fn().mockResolvedValue(undefined);
       const app = makeApp();
@@ -4509,7 +4623,7 @@ describe('SyncEngine', () => {
     });
 
     it('defers the rename when the liveness probe fails, and re-probes on the next refusal', async () => {
-      const tfile = Object.create(TFile.prototype);
+      const tfile = Object.assign(Object.create(TFile.prototype), { stat: { size: 1, mtime: 1 } });
       mockVault.getAbstractFileByPath.mockImplementation((p: string) => (p === 'doomed.md' ? tfile : null));
       const renameFile = vi.fn().mockResolvedValue(undefined);
       const app = makeApp();
@@ -4538,7 +4652,7 @@ describe('SyncEngine', () => {
     });
 
     it('re-probes after a stale answer instead of renaming on the next refusal', async () => {
-      const tfile = Object.create(TFile.prototype);
+      const tfile = Object.assign(Object.create(TFile.prototype), { stat: { size: 1, mtime: 1 } });
       mockVault.getAbstractFileByPath.mockImplementation((p: string) => (p === 'doomed.md' ? tfile : null));
       const renameFile = vi.fn().mockResolvedValue(undefined);
       const app = makeApp();
@@ -4602,9 +4716,10 @@ describe('SyncEngine', () => {
 
     /** Start an engine whose vault holds TFiles for exactly the given paths. */
     const startContainmentEngine = async (paths: string[]) => {
+      const stat = { size: 1, mtime: 1 };
       mockVault.getAbstractFileByPath.mockImplementation((p: string) =>
         paths.includes(p)
-          ? Object.assign(Object.create(TFile.prototype), { path: p })
+          ? Object.assign(Object.create(TFile.prototype), { path: p, stat })
           : null);
       const renameFile = vi.fn().mockImplementation(async (file, destination) => {
         const index = paths.indexOf(file.path);
@@ -4624,7 +4739,7 @@ describe('SyncEngine', () => {
       renameFile.mockClear();
       notices.length = 0;
       const getOrLoad = vi.spyOn((engine as any).docs, 'getOrLoad');
-      return { renameFile, add, getOrLoad };
+      return { renameFile, add, getOrLoad, stat };
     };
 
     const expectNoRefusalEffects = (

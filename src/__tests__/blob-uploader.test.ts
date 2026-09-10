@@ -64,7 +64,7 @@ import { BlobUploader } from '../blob-uploader';
 import { isAttachmentPath } from '../path-policy';
 import { SyncEngine } from '../sync-engine';
 import { FEATURE_BLOBS } from '../server-features';
-import { remoteDeleteKeptNoticeMessage, remoteDeleteTrashedNoticeMessage } from '../user-facing-copy';
+import { remoteDeleteKeptNoticeMessage } from '../user-facing-copy';
 
 const PATH = 'Bilder/photo.png';
 const PATH_B = 'Bilder/other.png';
@@ -206,6 +206,72 @@ beforeEach(() => {
 });
 
 describe('BlobUploader (attachment lane S2)', () => {
+  it('never admits decision-bearing paths', async () => {
+    const { uploader, index } = makeUploader();
+    index.update(PATH, { seq: 12, pendingDecision: { kind: 'republish', seq: 12, generation: 3 } });
+    uploader.onFileChanged(PATH);
+    expect(uploader.isPending(PATH)).toBe(false);
+    await uploader.flush(); expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+  it('discards an upload when a decision arrives during readBinary', async () => {
+    let release!: (bytes: ArrayBuffer) => void;
+    let entered!: () => void;
+    const started = new Promise<void>(r => { entered = r; });
+    const read = new Promise<ArrayBuffer>(r => { release = r; });
+    const { uploader, index } = makeUploader({ readBinary: async () => { entered(); return read; } });
+    uploader.onFileChanged(PATH); await started;
+    index.update(PATH, { seq: 12, pendingDecision: { kind: 'republish', seq: 12, generation: 3 } });
+    release(BYTES.slice().buffer); await uploader.flush();
+    expect(mockRequestUrl).not.toHaveBeenCalled();
+  });
+  it('same-hash live advances authority, stale live and tombstone do not', async () => {
+    const { uploader, index } = makeUploader();
+    index.update(PATH, { hash: 'hash', seq: 10, generation: 1 });
+    const state = { path_key: index.get(PATH)!.key, content_hash: 'hash', seq: 12, generation: 3 };
+    await (uploader as any).applyRemoteLive(state);
+    expect(index.get(PATH)).toMatchObject({ seq: 12, generation: 3 });
+    await (uploader as any).applyRemoteLive({ ...state, seq: 11, content_hash: 'old' });
+    await (uploader as any).applyRemoteTombstone({ ...state, seq: 11 });
+    expect(index.get(PATH)).toMatchObject({ hash: 'hash', seq: 12, generation: 3 });
+  });
+
+  it('does not replace an ack arriving during unindexed live matching', async () => {
+    let release!: (bytes: ArrayBuffer) => void;
+    const readBinary = vi.fn(() => new Promise<ArrayBuffer>(resolve => { release = resolve; }));
+    const { uploader, index } = makeUploader({ readBinary });
+    const work = (uploader as any).applyRemoteLive({ path_key: index.keyFor(PATH), display_path: PATH,
+      content_hash: blake3_hex(BYTES), size: BYTES.length, seq: 11 });
+    await flush();
+    index.update(PATH, { hash: 'ack', seq: 12 });
+    release(BYTES.slice().buffer);
+    await work;
+    expect(index.get(PATH)).toMatchObject({ hash: 'ack', seq: 12 });
+  });
+
+  it('rechecks authority after tombstone stat', async () => {
+    const { uploader, index } = makeUploader();
+    index.update(PATH, { hash: 'old', seq: 10 });
+    let release!: (value: null) => void;
+    (uploader as any).deps.stat = () => new Promise(resolve => { release = resolve; });
+    const work = (uploader as any).applyRemoteTombstone({ path_key: index.get(PATH)!.key, seq: 11 });
+    index.update(PATH, { hash: 'ack', seq: 12 });
+    release(null);
+    await work;
+    expect(index.get(PATH)).toMatchObject({ hash: 'ack', seq: 12 });
+  });
+
+  it('rechecks authority after tombstone read', async () => {
+    let release!: (bytes: ArrayBuffer) => void;
+    const readBinary = vi.fn(() => new Promise<ArrayBuffer>(resolve => { release = resolve; }));
+    const { uploader, index } = makeUploader({ readBinary });
+    index.update(PATH, { hash: 'old', seq: 10 });
+    const work = (uploader as any).applyRemoteTombstone({ path_key: index.get(PATH)!.key, seq: 11 });
+    await flush();
+    index.update(PATH, { hash: 'ack', seq: 12 });
+    release(BYTES.slice().buffer);
+    await work;
+    expect(index.get(PATH)).toMatchObject({ hash: 'ack', seq: 12 });
+  });
   it.each(['pending', 'failed', 'recovered'])('catch-up awaits real persistence retry: %s', async mode => {
     const hydratePending = vi.fn();
     const { uploader, index, storage } = makeUploader({ hydratePending });
@@ -220,6 +286,8 @@ describe('BlobUploader (attachment lane S2)', () => {
       if (mode === 'pending') await gate;
       await original(name, text);
     });
+    // The entry checkpoint, not the later cursor write, gates hydration.
+    index.update(PATH, { seq: 99 });
     let settled = false;
     const work = uploader.catchUp().then(() => { settled = true; return null; }, e => { settled = true; return e; });
     try {
@@ -237,7 +305,8 @@ describe('BlobUploader (attachment lane S2)', () => {
       } else {
         expect(result).toBeNull();
         expect(index.lastPersistError).toBeNull();
-        expect(storage.files.get('blob-index.json')).toMatchObject({ maxSeq: 12 });
+        await index.flush();
+        expect(storage.files.get('blob-index.json')).toMatchObject({ v: 2, c: 12 });
         expect(hydratePending).toHaveBeenCalledTimes(1);
       }
     } finally { release(); index.dispose(); }
@@ -252,7 +321,7 @@ describe('BlobUploader (attachment lane S2)', () => {
     storage.files.set('blob-index.json', { v: 0 });
     await index.load();
     const update = vi.spyOn(index, 'update');
-    const note = vi.spyOn(index, 'noteMaxSeq');
+    const note = vi.spyOn(index, 'advanceCursor');
     if (entry === 'catch-up') await uploader.catchUp();
     else if (entry === 'queue') {
       uploader.onFileChanged('image.svg');
@@ -287,7 +356,7 @@ describe('BlobUploader (attachment lane S2)', () => {
     await uploader.catchUp();
     expect(mockRequestUrl).toHaveBeenCalledTimes(1);
     expect(hydratePending).toHaveBeenCalledTimes(1);
-    expect(index.maxSeq()).toBe(4);
+    expect(index.cursor()).toBe(4);
     index.dispose();
   });
 
@@ -330,7 +399,7 @@ describe('BlobUploader (attachment lane S2)', () => {
     expect(entry.lastRemoteHash).toBe(blake3_hex(BYTES));
     expect(entry.seq).toBe(7);
     expect(entry.generation).toBe(1);
-    expect(index.maxSeq()).toBe(7);
+    expect(index.cursor()).toBe(0);
   });
 
   it('never calls blob-paths when a segment keeps failing', async () => {
@@ -438,9 +507,9 @@ describe('BlobUploader (attachment lane S2)', () => {
 
     await uploader.catchUp();
 
-    expect(urls()).toEqual(['GET /vault/blob-paths?since_seq=4&limit=1000']);
+    expect(urls()).toEqual(['GET /vault/blob-paths?since_seq=0&limit=1000']);
     expect(index.get(PATH)!.hydrated).toBe(false);
-    expect(index.maxSeq()).toBe(11);
+    expect(index.cursor()).toBe(11);
   });
 
   it('is fully dormant without the blobs feature', async () => {
@@ -741,7 +810,7 @@ describe('BlobUploader (attachment lane S2)', () => {
     expect(index.pathForKey(key)).toBe(PATH_CASE);
   });
 
-  it('7. remote tombstone: unmodified trashes; locally modified is kept and republished', async () => {
+  it('7. remote tombstone: unmodified admits delete; locally modified admits republish', async () => {
     const hash = blake3_hex(BYTES);
     const key = blob_path_key(PATH)!;
     const tomb = {
@@ -760,10 +829,12 @@ describe('BlobUploader (attachment lane S2)', () => {
     });
     mockRequestUrl.mockResolvedValueOnce(resp(200, { states: [tomb], max_seq: 20 }));
     await unmodified.uploader.catchUp();
-    expect(trash).toHaveBeenCalledExactlyOnceWith(PATH);
-    expect(unmodified.index.get(PATH)).toBeUndefined();
-    expect(unmodified.notify).toHaveBeenCalledWith(remoteDeleteTrashedNoticeMessage(PATH));
-    expect(urls()).toEqual(['GET /vault/blob-paths?since_seq=5&limit=1000']);
+    expect(trash).toHaveBeenCalledOnce(); // no-op trash must retain the obligation
+    expect(unmodified.index.get(PATH)).toMatchObject({ seq: 20, pendingDecision: {
+      kind: 'delete', expectedHash: hash, expectedSize: BYTES.length, seq: 20, generation: 3,
+    } });
+    expect(unmodified.notify).not.toHaveBeenCalled();
+    expect(urls()).toEqual(['GET /vault/blob-paths?since_seq=0&limit=1000']);
 
     mockRequestUrl.mockReset();
     const trash2 = vi.fn(async () => undefined);
@@ -778,17 +849,11 @@ describe('BlobUploader (attachment lane S2)', () => {
     await modified.uploader.catchUp();
     expect(trash2).not.toHaveBeenCalled();
     expect(modified.index.get(PATH)).toMatchObject({
-      hash, hydrated: true, lastRemoteHash: hash, generation: 4,
+      hash, hydrated: true, seq: 21, generation: 4,
     });
+    expect(modified.index.get(PATH)?.pendingDecision).toBeUndefined();
     expect(modified.notify).toHaveBeenCalledWith(remoteDeleteKeptNoticeMessage(PATH));
-    expect(urls()).toEqual([
-      'GET /vault/blob-paths?since_seq=5&limit=1000',
-      'POST /vault/blobs/uploads',
-      'POST /vault/blob-paths',
-    ]);
-    expect(JSON.parse(calls()[2].body as string)).toMatchObject({
-      path_key: key, state: 'live', content_hash: hash, generation: 4,
-    });
+    expect(urls()).toEqual(['GET /vault/blob-paths?since_seq=0&limit=1000', 'POST /vault/blobs/uploads', 'POST /vault/blob-paths']);
   });
 
   const SVG_PATH = 'Bilder/icon.svg';
@@ -984,7 +1049,7 @@ describe('.obsidian blob-path catch-up', () => {
     expect(index.pathForKey(PLUGINS)).toBeUndefined();
   });
 
-  it('remote tombstone of a category file uses adapter.remove, not trash',
+  it('remote tombstone of a category file admits deletion without file effects',
     async () => {
       const hash = blake3_hex(BYTES);
       const key = blob_path_key(CFG)!;
@@ -1008,9 +1073,9 @@ describe('.obsidian blob-path catch-up', () => {
         max_seq: 20,
       }));
       await uploader.catchUp();
-      expect(removeFile).toHaveBeenCalledExactlyOnceWith(CFG);
+      expect(removeFile).not.toHaveBeenCalled();
       expect(trash).not.toHaveBeenCalled();
-      expect(index.get(CFG)).toBeUndefined();
+      expect(index.get(CFG)?.pendingDecision?.kind).toBe('delete');
     });
 
   it('toggle-off skipped category + remote tombstone: index.remove only',

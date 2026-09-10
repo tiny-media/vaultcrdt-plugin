@@ -152,10 +152,11 @@ export class SyncEngine {
   private stopped = false;
   /** Engine lifecycle generation; bumped on each start(). Tasks capture it at admission so restart survivors are fenced. */
   private generation = 0;
-  /** Pending or completed tombstone actions; survives restart, failures release. */
-  private notifiedTombstones = new Set<string>();
-  /** Docs whose tombstone refusal we already probed for liveness (once per session, per doc; cleared on start() — evidence never crosses a session boundary). */
-  private tombstoneLivenessChecked = new Set<string>();
+  /** Pending/completed actions keyed by (docUuid, size, mtime), a SESSION-LOCAL admission heuristic.
+   * “mtime never identity” applies to BLOB deletion identity, not this flow. Failures release only their own incarnation. */
+  private notifiedTombstones = new Map<string, { size: number; mtime: number }>();
+  /** Definitive liveness evidence for the captured incarnation; cleared on start(). */
+  private tombstoneLivenessChecked = new Map<string, { size: number; mtime: number }>();
   private trace = new SyncTrace();
   private advertisedFeatures: string[] = [];
   private blobCatchUpTimer: number | null = null;
@@ -1043,11 +1044,25 @@ export class SyncEngine {
     return this.stopped || gen !== this.generation;
   }
 
+  private tombstoneIdentity(docUuid: string): { size: number; mtime: number } {
+    const file = this.app.vault.getAbstractFileByPath(docUuid);
+    return file instanceof TFile
+      ? { size: file.stat.size, mtime: file.stat.mtime }
+      : { size: -1, mtime: -1 };
+  }
+
+  private sameTombstoneIdentity(
+    a: { size: number; mtime: number } | undefined,
+    b: { size: number; mtime: number },
+  ): boolean {
+    return a?.size === b.size && a?.mtime === b.mtime;
+  }
+
   /**
    * Server refused a push because the document is tombstoned (deleted on
    * another device). The previous behaviour was a silent warn-log, which
    * meant the user could keep typing into a doomed file with no feedback.
-   * Show a clear Notice (deduped by pending/completed path action) so the user
+   * Show a clear Notice (deduped by pending/completed incarnation action) so the user
    * notices the situation and can recover the content manually.
    * If the file still exists locally it is renamed to `(deleted-remote)` so the content lives on as a new synced note.
    */
@@ -1062,7 +1077,9 @@ export class SyncEngine {
       return;
     }
     warn(`${this.tag} doc is tombstoned on server — push refused`, { doc: docUuid });
-    if (await this.tombstoneRefusalIsStale(docUuid, gen)) return;
+    const identity = this.tombstoneIdentity(docUuid);
+    if (this.sameTombstoneIdentity(this.notifiedTombstones.get(docUuid), identity)) return;
+    const stale = await this.tombstoneRefusalIsStale(docUuid, gen, identity);
     // Socket retirement preserves the decision; engine restart fences survivors.
     // Liveness evidence belongs only to the current session.
     if (this.fenced(gen)) {
@@ -1070,11 +1087,14 @@ export class SyncEngine {
       this.trace.markPath('tombstoned.fence-stopped', docUuid);
       return;
     }
-    // Admission lock and completed-action dedup survive restart. Path-only keys
-    // also suppress recreated incarnations after success: accepted until N7 ④/R2
-    // adds file-identity markers.
-    if (this.notifiedTombstones.has(docUuid)) return;
-    this.notifiedTombstones.add(docUuid);
+    if (!this.sameTombstoneIdentity(this.tombstoneIdentity(docUuid), identity)) {
+      return this.handleDocTombstoned(docUuid);
+    }
+    if (stale) return;
+    // (docUuid, size, mtime) is a SESSION-LOCAL admission heuristic, not BLOB
+    // deletion identity: that separate flow retains the “mtime never identity” invariant.
+    if (this.sameTombstoneIdentity(this.notifiedTombstones.get(docUuid), identity)) return;
+    this.notifiedTombstones.set(docUuid, identity);
     const f = this.app.vault.getAbstractFileByPath(docUuid);
     if (!(f instanceof TFile)) {
       this.noteTombstoneEditLost(docUuid);
@@ -1096,9 +1116,15 @@ export class SyncEngine {
         this.trace.markPath('tombstoned.fence-stopped', docUuid);
         return;
       }
-      await this.app.fileManager.renameFile(f, keptPath);
+      const current = this.app.vault.getAbstractFileByPath(docUuid);
+      if (!(current instanceof TFile) || !this.sameTombstoneIdentity(current.stat, identity)) {
+        return this.handleDocTombstoned(docUuid);
+      }
+      await this.app.fileManager.renameFile(current, keptPath);
     } catch (err) {
-      this.notifiedTombstones.delete(docUuid);
+      if (this.sameTombstoneIdentity(this.notifiedTombstones.get(docUuid), identity)) {
+        this.notifiedTombstones.delete(docUuid);
+      }
       warn(`${this.tag} rename of tombstoned file failed`, { doc: docUuid, keptPath, err });
       if (this.fenced(gen)) {
         this.trace.markPath('tombstoned.fence-stopped', docUuid);
@@ -1131,10 +1157,12 @@ export class SyncEngine {
    * for the doc's current state over the existing sync_start request before
    * destroying the local file's identity. A live snapshot ⇒ keep the file and
    * re-send the change as doc_create with replace semantics.
-   * The probe runs at most once per doc_uuid per session.
+   * Definitive negative evidence is reused only for the same incarnation this session.
    */
-  private async tombstoneRefusalIsStale(docUuid: string, gen: number): Promise<boolean> {
-    if (this.tombstoneLivenessChecked.has(docUuid)) return false;
+  private async tombstoneRefusalIsStale(
+    docUuid: string, gen: number, identity: { size: number; mtime: number },
+  ): Promise<boolean> {
+    if (this.sameTombstoneIdentity(this.tombstoneLivenessChecked.get(docUuid), identity)) return false;
     const f = this.app.vault.getAbstractFileByPath(docUuid);
     if (!(f instanceof TFile)) return false;
     let live: { delta: Uint8Array; serverVV: string } | null;
@@ -1142,7 +1170,7 @@ export class SyncEngine {
       live = await this.probeServerDoc(docUuid);
     } catch (err) {
       // A failed or timed-out probe is NOT a delete confirmation: defer the
-      // rename and leave the file as-is. The liveness set is only marked on
+      // rename and leave the file as-is. The liveness map is only marked on
       // definitive answers, so the next refusal may probe again.
       warn(`${this.tag} tombstone liveness probe failed — deferring rename`, { doc: docUuid, err });
       this.trace.markPath('tombstoned.liveness-unknown', docUuid);
@@ -1152,10 +1180,11 @@ export class SyncEngine {
       this.trace.markPath('tombstoned.fence-stopped', docUuid);
       return true;
     }
+    if (!this.sameTombstoneIdentity(this.tombstoneIdentity(docUuid), identity)) return true;
     if (live === null || live.delta.length === 0) {
       // Definitive no-live-row answer: this (and only this) consumes the
       // once-per-session slot — after the rename, notifiedTombstones dedups.
-      this.tombstoneLivenessChecked.add(docUuid);
+      this.tombstoneLivenessChecked.set(docUuid, identity);
       this.trace.markPath('tombstoned.liveness-confirmed', docUuid);
       return false;
     }
@@ -1178,6 +1207,7 @@ export class SyncEngine {
         this.trace.markPath('tombstoned.fence-stopped', docUuid);
         return true;
       }
+      if (!this.sameTombstoneIdentity(this.tombstoneIdentity(docUuid), identity)) return true;
       const current = this.editor.readCurrentContent(docUuid);
       if (current !== null && !doc.text_matches(current)) doc.sync_from_disk(current);
       // No await between check and push; restart survivors are generation-fenced.
