@@ -1,8 +1,9 @@
 # 0006 — Incarnation-guarded document deletes
 
-Status: accepted, not yet implemented. Design counter-read through five
-rounds (2026-09-11; v1–v4 BLOCK, v5 GO-WITH-EDITS with the final
-recreation-invalidation edit folded). Full design:
+Status: implemented (server b63efc4, plugin 4892bb4, 2026-09-11; full
+test matrices green, every regression red-falsified). Design counter-read
+through five rounds (2026-09-11; v1–v4 BLOCK, v5 GO-WITH-EDITS with the
+final recreation-invalidation edit folded). Full design:
 [dev/work/delete-incarnation-brief-2026-09-11.md](../../dev/work/delete-incarnation-brief-2026-09-11.md)
 (untracked working file; this ADR carries the durable summary).
 
