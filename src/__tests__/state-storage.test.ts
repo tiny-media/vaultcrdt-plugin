@@ -210,15 +210,15 @@ describe('StateStorage', () => {
 
   it('saveDeleteJournal writes v2 entries with acked flags', async () => {
     await storage.saveDeleteJournal([
-      { path: 'a.md', acked: false },
-      { path: 'b.md', acked: true },
+      { path: 'a.md', acked: false, intent_id: 'a', token: { kind: 'unresolved' } },
+      { path: 'b.md', acked: true, intent_id: 'b', token: { kind: 'pinned', value: null }, attempted: true },
     ]);
     const raw = await adapter.read('.obsidian/plugins/vaultcrdt/state/delete-journal.json');
     expect(JSON.parse(raw)).toEqual({
       _version: 2,
       entries: [
-        { path: 'a.md', acked: false },
-        { path: 'b.md', acked: true },
+        { path: 'a.md', acked: false, intent_id: 'a', token: { kind: 'unresolved' } },
+        { path: 'b.md', acked: true, intent_id: 'b', token: { kind: 'pinned', value: null }, attempted: true },
       ],
     });
   });
@@ -233,7 +233,8 @@ describe('StateStorage', () => {
         entries: [{ path: 'kept.md', acked: true }],
       }),
     );
-    expect(await storage.loadDeleteJournal()).toEqual([{ path: 'kept.md', acked: true }]);
+    expect(await storage.loadDeleteJournal()).toEqual([{ path: 'kept.md', acked: true,
+      intent_id: expect.stringMatching(/^[0-9a-f-]{36}$/), token: { kind: 'unresolved' }, attempted: false, skip_cleanup: false }]);
   });
 
   it('loadDeleteJournal treats v1 paths as unacked', async () => {
@@ -242,6 +243,7 @@ describe('StateStorage', () => {
       '.obsidian/plugins/vaultcrdt/state/delete-journal.json',
       JSON.stringify({ _version: 1, paths: ['old.md'] }),
     );
-    expect(await storage.loadDeleteJournal()).toEqual([{ path: 'old.md', acked: false }]);
+    expect(await storage.loadDeleteJournal()).toEqual([{ path: 'old.md', acked: false,
+      intent_id: expect.stringMatching(/^[0-9a-f-]{36}$/), token: { kind: 'unresolved' }, attempted: false, skip_cleanup: false }]);
   });
 });

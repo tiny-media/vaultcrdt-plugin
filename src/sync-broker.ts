@@ -1,6 +1,6 @@
 import { warn } from './logger';
 
-export type SyncDeltaResponse = { delta: Uint8Array; serverVV: string } | null;
+export type SyncDeltaResponse = { delta: Uint8Array; serverVV: string; incarnation?: number } | null;
 type ResponseKind = 'sync_delta' | 'doc_unknown';
 // Matches WS_REQUEST_TIMEOUT_MS in promise-manager.ts; bounds caller wait, not drain.
 const REQUEST_TIMEOUT_MS = 60_000;

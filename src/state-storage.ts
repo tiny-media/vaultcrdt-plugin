@@ -1,4 +1,5 @@
 import type { App } from 'obsidian';
+import { nextRequestId, OWNERSHIP_CACHE_FILE } from './ownership-cache';
 
 const STATE_DIR = '.obsidian/plugins/vaultcrdt/state';
 
@@ -12,6 +13,11 @@ export interface VVCacheEntry {
 export interface DeleteJournalEntry {
   path: string;
   acked: boolean;
+  intent_id: string;
+  token: { kind: 'owned'; value: number } | { kind: 'unresolved' } | { kind: 'pinned'; value: number | null };
+  attempted?: boolean;
+  /** Case-only rename intents MUST preserve the local doc during crash replay. Missing means false. */
+  skip_cleanup?: boolean;
 }
 
 /**
@@ -144,7 +150,7 @@ export class StateStorage {
 
     for (const key of allKeys) {
       if (key === 'vv-cache.json') continue;
-      if (key === 'delete-journal.json') continue;
+      if (key === 'delete-journal.json' || key === OWNERSHIP_CACHE_FILE) continue;
       if (key === 'inbox.json') continue;
       if (key === 'blob-index.json' || key === 'blob-index.bak' || key === 'blob-index.corrupt.json') continue;
       if (validKeys.has(key)) continue;
@@ -294,16 +300,22 @@ export class StateStorage {
         const loaded: DeleteJournalEntry[] = [];
         for (const item of obj.entries) {
           if (item === null || typeof item !== 'object') continue;
-          const rec = item as { path?: unknown; acked?: unknown };
+          const rec = item as Partial<DeleteJournalEntry>;
           if (typeof rec.path !== 'string') continue;
-          loaded.push({ path: rec.path, acked: rec.acked === true });
+          loaded.push({
+            path: rec.path, acked: rec.acked === true,
+            intent_id: typeof rec.intent_id === 'string' ? rec.intent_id : nextRequestId(),
+            token: rec.token ?? { kind: 'unresolved' },
+            attempted: rec.attempted === true,
+            skip_cleanup: rec.skip_cleanup === true,
+          });
         }
         return loaded;
       }
       if (Array.isArray(obj.paths)) {
         return obj.paths
           .filter((p): p is string => typeof p === 'string')
-          .map((path) => ({ path, acked: false }));
+          .map((path) => ({ path, acked: false, intent_id: nextRequestId(), token: { kind: 'unresolved' }, attempted: false, skip_cleanup: false }));
       }
       return [];
     } catch {

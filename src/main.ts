@@ -328,6 +328,7 @@ export default class VaultCRDTPlugin extends Plugin {
         if (isAttachmentPath(abstractFile.path, this.settings?.obsidianSync)) { this.blobUploader.onFileChanged(abstractFile.path); return; }
         if (!isSyncablePath(abstractFile.path)) return;
         if (!this.syncEngineInitialized) return; // Ignore changes before sync engine is ready
+        if (this.syncEngine.shouldAcceptVaultChangeEvents()) this.syncEngine.admitRecreation(abstractFile.path);
         let content: string | undefined;
         if (this.syncEngine.isWritingFromRemote(abstractFile.path)) {
           content = await this.app.vault.read(abstractFile);
@@ -350,6 +351,7 @@ export default class VaultCRDTPlugin extends Plugin {
         if (isAttachmentPath(file.path, this.settings?.obsidianSync)) { this.blobUploader.onFileChanged(file.path); return; }
         if (!isSyncablePath(file.path)) return;
         if (!this.syncEngineInitialized) return; // Ignore creates before sync engine is ready
+        if (this.syncEngine.shouldAcceptVaultChangeEvents()) this.syncEngine.admitRecreation(file.path);
         let content: string | undefined;
         if (this.syncEngine.isWritingFromRemote(file.path)) {
           content = await this.app.vault.read(file);
@@ -435,6 +437,10 @@ export default class VaultCRDTPlugin extends Plugin {
         if (!this.syncEngine.shouldAcceptVaultChangeEvents()) {
           this.syncEngine.noteSuppressedColdStartVaultEvent('rename');
           return;
+        }
+        // A syncable target is a recreation; invalidate D1 before the file read.
+        if (newSync && (oldSync || !this.syncEngine.isWritingFromRemote(file.path))) {
+          this.syncEngine.admitRecreation(file.path);
         }
         if (oldSync && newSync) {
           const content = await this.app.vault.read(file);

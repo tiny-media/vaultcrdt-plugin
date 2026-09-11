@@ -6,7 +6,18 @@ vi.mock('../logger', () => ({
   error: vi.fn(),
 }));
 
-import { PushHandler } from '../push-handler';
+import { PushHandler as ProductionPushHandler } from '../push-handler';
+import { OwnershipCache, nextRequestId } from '../ownership-cache';
+
+// Existing debounce fixtures exercise the legacy-capability connection.
+class PushHandler extends ProductionPushHandler {
+  constructor(...args: ConstructorParameters<typeof ProductionPushHandler> extends [...infer A, OwnershipCache, unknown, unknown] ? A : never) {
+    super(...args, new OwnershipCache({ readRaw: async () => null, saveJson: async () => {} }), () => false, async () => null);
+  }
+}
+const intent = (path: string, acked = false) => ({
+  path, acked, intent_id: nextRequestId(), token: { kind: 'unresolved' as const }, attempted: false,
+});
 
 describe('PushHandler push debounce maxWait', () => {
   beforeEach(() => {
@@ -268,7 +279,7 @@ describe('PushHandler persistJournal serialization', () => {
     // First write still blocked; second is queued behind it.
     expect(writes).toEqual([]);
     releaseFirst();
-    await vi.waitFor(() => expect(writes.length).toBe(2));
+    await vi.waitFor(() => expect(writes.length).toBeGreaterThanOrEqual(2));
     // Last completed write must include both deletes (latest pendingDeletes snapshot).
     expect(writes[1]).toEqual(expect.arrayContaining(['a.md', 'b.md']));
   });
@@ -382,11 +393,12 @@ describe('PushHandler delete journal ack and resend', () => {
     return { push, sendMock, docs };
   }
 
-  it('resendPendingDeletes sends only unacked entries', () => {
+  it('resendPendingDeletes sends only unacked entries', async () => {
     const { push, sendMock } = makePush();
-    (push as any).pendingDeletes.set('acked.md', { acked: true });
-    (push as any).pendingDeletes.set('unacked.md', { acked: false });
+    (push as any).pendingDeletes.set('acked.md', intent('acked.md', true));
+    (push as any).pendingDeletes.set('unacked.md', intent('unacked.md'));
     push.resendPendingDeletes();
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalled());
     const deletes = sendMock.mock.calls.filter((c) => c[0]?.type === 'doc_delete');
     expect(deletes.map((c) => c[0].doc_uuid)).toEqual(['unacked.md']);
   });
@@ -394,8 +406,8 @@ describe('PushHandler delete journal ack and resend', () => {
   it('ackPendingDelete marks the journal entry acked', async () => {
     const { push, docs } = makePush();
     push.onFileDeleted('gone.md');
-    expect((push as any).pendingDeletes.get('gone.md')?.acked).toBe(true);
-    (push as any).pendingDeletes.set('gone.md', { acked: false });
+    await vi.waitFor(() => expect((push as any).pendingDeletes.get('gone.md')?.acked).toBe(true));
+    (push as any).pendingDeletes.set('gone.md', intent('gone.md'));
     push.ackPendingDelete('gone.md');
     expect((push as any).pendingDeletes.get('gone.md')?.acked).toBe(true);
     await vi.waitFor(() => expect(docs.saveDeleteJournal).toHaveBeenCalled());

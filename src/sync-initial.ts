@@ -134,6 +134,7 @@ export async function runInitialSync(
   const recreatePathSet = new Set(
     push.pendingDeletePaths().filter((path) => localFileMap.has(path)),
   );
+  for (const path of recreatePathSet) push.admitRecreation(path);
 
   let tPhase = performance.now();
   const { docs: serverDocs, tombstones, tombstone_hashes } = await deps.requestDocList();
@@ -967,6 +968,7 @@ async function syncOverlappingDoc(
           // EXEMPT from sentUnacked tracking by design: this initial-sync push is reconciled by this same initial-sync run, which also clears the set.
           deps.send({
             type: 'sync_push',
+            request_id: push.writeRequestId(path),
             doc_uuid: path,
             delta,
             peer_id: deps.peerId,

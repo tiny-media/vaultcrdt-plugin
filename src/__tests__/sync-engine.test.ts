@@ -165,7 +165,7 @@ const makeApp = (leaves: any[] = []) =>
   }) as any;
 
 /** Drain the microtask queue N levels deep. */
-const flush = async (n = 20) => {
+const flush = async (n = 100) => {
   for (let i = 0; i < n; i++) await Promise.resolve();
 };
 
@@ -471,6 +471,27 @@ describe('SyncEngine', () => {
       expect(MockWebSocket).toHaveBeenCalledWith(expect.not.stringContaining('token='));
       expect(MockWebSocket).toHaveBeenCalledWith(expect.stringContaining('/ws?'));
       expect(MockWebSocket).toHaveBeenCalledWith(expect.stringContaining('vault_id=vault-abc'));
+    });
+
+    it.each([true, false])('§6.15 every connection resets negotiated capability=%s to unknown', async capable => {
+      vi.useFakeTimers();
+      try {
+        engine.onInitialSync = vi.fn();
+        expect(engine.deleteIncarnationCapable).toBe('unknown');
+        await engine.start();
+        mockWsInstance.onopen!({} as Event);
+        expect(engine.deleteIncarnationCapable).toBe('unknown');
+        fireMessage(capable ? { type: 'auth_ok', capabilities: ['delete_incarnation'] } : { type: 'auth_ok' });
+        expect(engine.deleteIncarnationCapable).toBe(capable);
+        // Replace a negotiated connection: the new socket MUST NOT inherit its capability.
+        await (engine as any).connect();
+        mockWsInstance.onopen!({} as Event);
+        expect(engine.deleteIncarnationCapable).toBe('unknown');
+        fireMessage(capable ? { type: 'auth_ok', capabilities: ['delete_incarnation'] } : { type: 'auth_ok' });
+        expect(engine.deleteIncarnationCapable).toBe(capable);
+        mockWsInstance.onclose!({ code: 1000, reason: '' } as CloseEvent);
+        expect(engine.deleteIncarnationCapable).toBe('unknown');
+      } finally { await engine.stop(); vi.useRealTimers(); }
     });
 
     it('auth_ok gates heartbeat and onInitialSync', async () => {
@@ -2459,8 +2480,10 @@ describe('SyncEngine', () => {
   describe('onFileDeleted', () => {
     it('sends doc_delete message', async () => {
       await engine.start();
+      openAndAuth();
 
       engine.onFileDeleted('del.md');
+      await flush();
 
       const deleteCalls = mockEncode.mock.calls.filter(
         (c: any[]) => c[0]?.type === 'doc_delete'
@@ -2512,6 +2535,7 @@ describe('SyncEngine', () => {
   describe('onFileRenamed', () => {
     it('sends doc_delete for old path and sync_push for new path', async () => {
       await engine.start();
+      openAndAuth();
 
       engine.onFileRenamed('old.md', 'new.md', 'content');
       await flush();
@@ -2529,6 +2553,7 @@ describe('SyncEngine', () => {
 
     it('case-only rename sends doc_delete for old path and push for new path', async () => {
       await engine.start();
+      openAndAuth();
 
       const docs = (engine as any).docs;
       const doc = await docs.getOrLoad('foo.md');

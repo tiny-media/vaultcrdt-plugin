@@ -31,7 +31,7 @@ import { fnv1aHash64 } from '../conflict-utils';
 import { PANEL_COPY, remoteDeleteTrashedNoticeMessage } from '../user-facing-copy';
 
 async function setup(content: string) {
-  const handlers = new Map<string, (file: TFile) => Promise<void>>();
+  const handlers = new Map<string, (file: TFile, oldPath?: string) => Promise<void>>();
   const app = {
     vault: {
       adapter: { exists: vi.fn(async () => false) }, // Raw index storage: fresh install.
@@ -200,6 +200,101 @@ describe('vault delete remote-write window', () => {
     vi.advanceTimersByTime(600);
     expect(app.vault.getAbstractFileByPath).toHaveBeenCalledOnce();
     expect(deleted).toHaveBeenCalledExactlyOnceWith('window.md');
+  });
+});
+
+describe.each(['modify', 'create'])('ADR-0006 §6.10 real %s admission before vault.read', (event) => {
+  it.each(['same', 'different'])('fences D1 while read is deferred (%s text) and preserves replace routing', async text => {
+    const { engine, push: immediateSpy, handlers, editor, app } = await setup('same');
+    immediateSpy.mockRestore();
+    editor.writingFromRemote.clear();
+    editor.lastRemoteWrite.clear();
+    let releaseJournal!: () => void;
+    const journalGate = new Promise<void>(r => { releaseJournal = r; });
+    let releaseRead!: (s: string) => void;
+    app.vault.read.mockImplementation(() => new Promise<string>(r => { releaseRead = r; }));
+    const clean = vi.fn(async () => {});
+    const doc = {
+      text_matches: (s: string) => s === 'same', sync_from_disk: vi.fn(),
+      export_vv_json: () => '{}', export_snapshot: () => new Uint8Array([1]),
+      export_delta_since_vv_json: () => new Uint8Array([2]), version: () => 1,
+    };
+    Object.assign((engine as any).docs, {
+      saveDeleteJournal: vi.fn().mockImplementationOnce(() => journalGate).mockResolvedValue(undefined),
+      getOrLoad: vi.fn(async () => doc), persist: vi.fn(async () => {}), removeAndClean: clean,
+    });
+    const send = vi.spyOn(engine as any, 'send').mockImplementation(() => {});
+    (engine as any).ws = { readyState: 1 };
+    engine.deleteIncarnationCapable = false;
+    engine.onFileDeleted('window.md');
+    await Promise.resolve();
+    const handler = handlers.get(event)!(new TFile());
+    expect(app.vault.read).toHaveBeenCalledOnce();
+    expect((engine as any).push.hasPendingDelete('window.md')).toBe(false);
+    releaseJournal();
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    expect(clean).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    releaseRead(text);
+    await handler;
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    if (text === 'same') {
+      expect(send).not.toHaveBeenCalled();
+      expect((engine as any).push.serverTombstones.has('window.md')).toBe(true);
+      engine.onFileChangedImmediate('window.md', 'next edit');
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+    }
+    expect(send.mock.calls.map(c => c[0])).toEqual([
+      expect.objectContaining({ type: 'doc_create', doc_uuid: 'window.md', replace_tombstone: true }),
+    ]);
+    expect(clean).not.toHaveBeenCalled();
+  });
+});
+
+describe('ADR-0006 §6.16 real rename admission before vault.read', () => {
+  it.each(['source.md', 'source.txt'])('fences target D1 at admission from %s and seeds replace routing', async oldPath => {
+    const { engine, push: immediateSpy, handlers, app } = await setup('renamed content');
+    // The real handler and real target delete run; only post-read dispatch is stubbed.
+    const renamed = vi.spyOn(engine, 'onFileRenamed').mockImplementation(() => {});
+    let releaseJournal!: () => void;
+    const journalGate = new Promise<void>(r => { releaseJournal = r; });
+    let releaseRead!: (s: string) => void;
+    app.vault.read.mockImplementation(() => new Promise<string>(r => { releaseRead = r; }));
+    const clean = vi.fn(async () => {});
+    Object.assign((engine as any).docs, {
+      saveDeleteJournal: vi.fn().mockImplementationOnce(() => journalGate).mockResolvedValue(undefined),
+      removeAndClean: clean,
+    });
+    const send = vi.spyOn(engine as any, 'send').mockImplementation(() => {});
+    (engine as any).ws = { readyState: 1 };
+    engine.deleteIncarnationCapable = true;
+    engine.ownership.ownedTokens.set('target.md', 17);
+    const push = (engine as any).push;
+    engine.onFileDeleted('target.md');
+    await Promise.resolve();
+    expect(push.hasPendingDelete('target.md')).toBe(true);
+    const file = new TFile();
+    file.path = 'target.md';
+    const handler = handlers.get('rename')!(file, oldPath);
+    expect(app.vault.read).toHaveBeenCalledExactlyOnceWith(file);
+    expect(push.hasPendingDelete('target.md')).toBe(false);
+    expect(push.serverTombstones.has('target.md')).toBe(true);
+    releaseJournal();
+    for (let i = 0; i < 150; i++) await Promise.resolve();
+    expect(clean).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(renamed).not.toHaveBeenCalled();
+    expect(immediateSpy).not.toHaveBeenCalled();
+    releaseRead('renamed content');
+    await handler;
+    if (oldPath.endsWith('.md')) {
+      expect(renamed).toHaveBeenCalledExactlyOnceWith(oldPath, 'target.md', 'renamed content');
+    } else {
+      expect(immediateSpy).toHaveBeenCalledExactlyOnceWith('target.md', 'renamed content');
+    }
+    expect(push.serverTombstones.has('target.md')).toBe(true);
+    expect(clean).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 });
 

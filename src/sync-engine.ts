@@ -14,7 +14,8 @@ import { isSyncablePath, isExcalidrawPath } from './path-policy';
 import { validateServerUrl, toHttpBase, toWsBase } from './url-policy';
 import { runInitialSync, type SyncMode } from './sync-initial';
 import { SyncTrace } from './sync-trace';
-import type { VVCacheEntry } from './state-storage';
+import { StateStorage, type VVCacheEntry } from './state-storage';
+import { OwnershipCache } from './ownership-cache';
 import { StartupDirtyTracker } from './startup-dirty-tracker';
 import type { InboxSink } from './inbox';
 import { FEATURE_BLOBS } from './server-features';
@@ -79,6 +80,9 @@ export class SyncEngine {
   private docs: DocumentManager;
   private editor: EditorIntegration;
   private push: PushHandler;
+  readonly ownership: OwnershipCache;
+  deleteIncarnationCapable: 'unknown' | boolean = 'unknown';
+  private warnedLegacyDelete = false;
   private promises = new PromiseManager();
   private broker = new SyncRequestBroker((docUuid, clientVV) => {
     this.trace.markPath('ws.sync-start', docUuid, {
@@ -189,6 +193,7 @@ export class SyncEngine {
     // (loadSettings() generates one before constructing SyncEngine). We pass
     // it through so every CRDT doc commits ops on a stable per-device VV line.
     this.docs = new DocumentManager(app, settings.peerId);
+    this.ownership = new OwnershipCache(new StateStorage(app));
     this.startupDirty = new StartupDirtyTracker(settings.vaultId, settings.peerId);
     this.editor = new EditorIntegration(app, this.writingFromRemote, this.lastRemoteWrite, this.tag);
     this.push = new PushHandler(
@@ -202,6 +207,9 @@ export class SyncEngine {
       () => this.ws?.readyState === WebSocket.OPEN,
       this.tag,
       (event, path, data) => this.trace.markPath(event, path, data),
+      this.ownership,
+      () => this.deleteIncarnationCapable,
+      (path, vv) => this.requestSyncStart(path, vv),
     );
     this.push.onExcalidrawConcurrent = (path, content) => this.resolveExcalidrawConcurrent(path, content);
   }
@@ -235,6 +243,7 @@ export class SyncEngine {
     // Restore offline delete intents from the persistent journal before we
     // reconnect, so initialSync can skip redownloading paths that were
     // deleted while offline.
+    await this.ownership.load();
     await this.push.loadPendingDeletesFromJournal();
     this.trace.mark('start.pending-deletes-loaded');
 
@@ -283,6 +292,7 @@ export class SyncEngine {
     this.ws = null;
     this.promises.rejectAll('Sync engine stopped', this.tag);
     this.broker.rejectAll('Sync engine stopped', this.tag);
+    this.ownership.pendingGrants.clear();
     await this.docs.persistAll();
     await this.flushVVCache();
   }
@@ -400,6 +410,8 @@ export class SyncEngine {
     const url = `${this.wsUrl()}?vault_id=${encodeURIComponent(this.settings.vaultId)}&device=${device}&peer_id=${peerId}`;
     const ws = new WebSocket(url);
     this.socketEpoch++;
+    this.deleteIncarnationCapable = 'unknown';
+    this.warnedLegacyDelete = false;
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
 
@@ -437,6 +449,8 @@ export class SyncEngine {
       this.stopHeartbeat();
       this.promises.rejectAll('WebSocket closed', this.tag);
       this.broker.rejectAll('WebSocket closed', this.tag);
+      this.ownership.pendingGrants.clear();
+      this.deleteIncarnationCapable = 'unknown';
       if (!this.stopped) this.scheduleReconnect();
     };
 
@@ -639,6 +653,11 @@ export class SyncEngine {
 
     switch (type) {
       case 'auth_ok':
+        this.deleteIncarnationCapable = Array.isArray(msg.capabilities) && msg.capabilities.includes('delete_incarnation');
+        if (!this.deleteIncarnationCapable && !this.warnedLegacyDelete) {
+          this.warnedLegacyDelete = true;
+          warn(`${this.tag} server lacks delete_incarnation; deletes use legacy unconditional semantics`);
+        }
         this.authedThisSocket = true;
         this.trace.mark('ws.auth-ok', { protocolVersion: msg.protocol_version });
         this.backoffMs = 1_000;
@@ -692,6 +711,7 @@ export class SyncEngine {
           if (!this.broker.deliver(docUuid, 'sync_delta', {
             delta,
             serverVV: new TextDecoder().decode(serverVv),
+            incarnation: typeof msg.incarnation === 'number' ? msg.incarnation : undefined,
           })) {
             log(`${this.tag} unsolicited sync_delta (no waiter): ${docUuid}`);
           }
@@ -730,6 +750,9 @@ export class SyncEngine {
         break;
 
       case 'doc_deleted':
+        if (typeof msg.doc_uuid === 'string') {
+          void this.ownership.remove(msg.doc_uuid).catch(err => warn(`${this.tag} ownership persist failed`, { err }));
+        }
         if (this.initialSyncRunning) {
           log(`${this.tag} delete queued (initialSync running)`, { doc: msg.doc_uuid });
           this.queueBroadcast(msg);
@@ -754,7 +777,16 @@ export class SyncEngine {
         else void this.resolveDisjointHistory(msg.doc_uuid, 'create_conflict');
         break;
 
+      case 'delete_rejected':
+        this.ownership.forgetRequest(msg.request_id);
+        if (typeof msg.doc_uuid === 'string') {
+          void this.ownership.remove(msg.doc_uuid).catch(err => warn(`${this.tag} ownership persist failed`, { err }));
+          void this.push.retireRejectedDelete(msg.doc_uuid, msg.intent_id).catch(err => warn(`${this.tag} delete retirement persist failed`, { err }));
+        }
+        break;
+
       case 'ack':
+        void this.ownership.grant(msg.request_id, msg.incarnation).catch(err => warn(`${this.tag} ownership grant persist failed`, { err }));
         this.setStatus('connected');
         break;
 
@@ -766,6 +798,7 @@ export class SyncEngine {
         break;
 
       case 'error':
+        this.ownership.forgetRequest(msg.request_id);
         warn(`${this.tag} Server error:`, redact(fieldText(msg.code), this.token ?? ''), redact(fieldText(msg.message), this.token ?? ''));
         if (msg.code === 'protocol_version_mismatch') {
           const m = /server=(\d+)/.exec(fieldText(msg.message));
@@ -1432,7 +1465,12 @@ export class SyncEngine {
     this.trace.markPath('ui.editor-change', path, data);
   }
 
+  admitRecreation(path: string): void {
+    this.push.admitRecreation(path);
+  }
+
   onFileChanged(path: string): void {
+    this.admitRecreation(path);
     this.startupEditedPaths.add(path);
     this.markStartupPathDirty(path);
     this.trace.observePath(path);

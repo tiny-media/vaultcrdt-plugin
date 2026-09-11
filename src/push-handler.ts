@@ -5,6 +5,9 @@ import type { WasmSyncDocument } from './wasm-bridge';
 import { log, warn, error } from './logger';
 import { isCaseOnlyPathRename, isExcalidrawPath } from './path-policy';
 import { fnv1aHash64, vvCovers } from './conflict-utils';
+import type { DeleteJournalEntry } from './state-storage';
+import { nextRequestId, type OwnershipCache } from './ownership-cache';
+import type { SyncDeltaResponse } from './sync-broker';
 
 /**
  * Delete-Journal invariant:
@@ -41,7 +44,8 @@ export class PushHandler {
   private pushDebounceTimers = new Map<string, number>();
   /** First unsynced edit per path; bounds how long a burst may stay unsynced. */
   private pushFirstChangeAt = new Map<string, number>();
-  private pendingDeletes = new Map<string, { acked: boolean }>();
+  private pendingDeletes = new Map<string, DeleteJournalEntry>();
+  private runningDeletes = new Set<string>();
   /**
    * Paths the server reported as tombstoned in the last doc_list. The delete
    * journal entry is dropped on reconcile once the tombstone is confirmed, so
@@ -77,6 +81,9 @@ export class PushHandler {
     private isWsOpen: () => boolean,
     private tag: string,
     private tracePath: (event: string, path: string, data?: Record<string, unknown>) => void,
+    readonly ownership: OwnershipCache,
+    private deleteIncarnationCapable: () => 'unknown' | boolean,
+    private resolveDelete: (path: string, vv: null) => Promise<SyncDeltaResponse>,
   ) {}
 
   onFileChanged(path: string): void {
@@ -116,16 +123,9 @@ export class PushHandler {
   }
 
   onFileDeleted(path: string): void {
-    void this.docs.removeAndClean(path);
-    this.lastServerVV.delete(path);
-    // Journal = intent list. Unacked until we emit doc_delete on an open socket
-    // (or see a confirmation). Reconnects resend only unacked entries, and only
-    // after request_doc_list / reconcilePendingDeletes().
-    this.pendingDeletes.set(path, { acked: false });
-    if (this.isWsOpen()) {
-      this.sendDocDelete(path);
-    }
-    void this.persistJournal();
+    const entry = this.newIntent(path);
+    this.pendingDeletes.set(path, entry);
+    void this.sendDocDelete(entry);
   }
 
   onFileRenamed(oldPath: string, newPath: string, content: string): void {
@@ -139,11 +139,10 @@ export class PushHandler {
       // Server still has the old-case path as a separate identity — send
       // doc_delete intent only. Do NOT call onFileDeleted: removeAndClean
       // would drop the in-memory doc before movePath can relocate it.
-      this.pendingDeletes.set(oldPath, { acked: false });
-      if (this.isWsOpen()) {
-        this.sendDocDelete(oldPath);
-      }
-      void this.persistJournal();
+      const entry = this.newIntent(oldPath);
+      entry.skip_cleanup = true;
+      this.pendingDeletes.set(oldPath, entry);
+      void this.sendDocDelete(entry);
       void this.docs.movePath(oldPath, newPath);
       this.pushFileDelta(newPath, content);
       return;
@@ -162,9 +161,14 @@ export class PushHandler {
   consumePendingDeleteForRecreate(path: string): boolean {
     if (!this.pendingDeletes.delete(path)) return false;
     this.lastServerVV.delete(path);
-    void this.persistJournal();
+    this.persistJournalInBackground();
     this.tracePath('push.delete.recreate-consume', path);
     return true;
+  }
+
+  /** Admission MUST invalidate before file reads and content-equality shortcuts. */
+  admitRecreation(path: string): void {
+    if (this.consumePendingDeleteForRecreate(path)) this.serverTombstones.add(path);
   }
 
   /** True if `path` has an outstanding offline/unacknowledged delete. */
@@ -177,7 +181,7 @@ export class PushHandler {
     const entry = this.pendingDeletes.get(path);
     if (!entry || entry.acked) return;
     entry.acked = true;
-    void this.persistJournal();
+    this.persistJournalInBackground();
     this.tracePath('push.delete.acked', path);
   }
 
@@ -209,9 +213,9 @@ export class PushHandler {
    * sync (recreateFiles).
    */
   markRecreateIntent(path: string): void {
-    this.pendingDeletes.set(path, { acked: false });
+    this.pendingDeletes.set(path, this.newIntent(path));
     this.tracePath('push.delete.recreate-intent', path);
-    void this.persistJournal();
+    this.persistJournalInBackground();
   }
 
   /** Snapshot of the pending delete set. */
@@ -227,20 +231,23 @@ export class PushHandler {
   /** Load the persistent delete journal into memory. Call during plugin start. */
   async loadPendingDeletesFromJournal(): Promise<void> {
     const entries = await this.docs.loadDeleteJournal();
-    for (const e of entries) this.pendingDeletes.set(e.path, { acked: e.acked });
+    for (const e of entries) this.pendingDeletes.set(e.path, e);
   }
 
-  private persistJournal(): Promise<void> {
-    this.journalPersistChain = this.journalPersistChain.then(async () => {
-      try {
-        await this.docs.saveDeleteJournal(
-          [...this.pendingDeletes.entries()].map(([path, state]) => ({ path, acked: state.acked })),
-        );
-      } catch (err) {
-        warn(`${this.tag} delete journal persist failed`, { err });
-      }
+  private persistJournal(attempt?: DeleteJournalEntry): Promise<void> {
+    const write = this.journalPersistChain.then(async () => {
+      await this.docs.saveDeleteJournal([...this.pendingDeletes.values()].map(entry => ({
+        ...entry, token: { ...entry.token },
+        attempted: entry === attempt ? true : entry.attempted,
+      })));
+      if (attempt && this.ownsIntent(attempt)) attempt.attempted = true;
     });
-    return this.journalPersistChain;
+    this.journalPersistChain = write.catch(() => {});
+    return write;
+  }
+
+  private persistJournalInBackground(): void {
+    void this.persistJournal().catch(err => warn(`${this.tag} delete journal persist failed`, { err }));
   }
 
   /** Cancel disjoint local edits without sending them to the server. */
@@ -283,7 +290,7 @@ export class PushHandler {
       if (delta.length > 0) {
         const wsOpen = this.isWsOpen();
         if (wsOpen) {
-          this.send({ type: 'sync_push', doc_uuid: path, delta, peer_id: this.settings.peerId });
+          this.send({ type: 'sync_push', request_id: this.writeRequestId(path), doc_uuid: path, delta, peer_id: this.settings.peerId });
           this.sentUnacked.add(path);
           this.tracePath('push.flush.sent', path, { deltaLen: delta.length });
           log(`${this.tag} flushed + pushed pending edits`, { path, deltaLen: delta.length });
@@ -310,6 +317,7 @@ export class PushHandler {
       });
       this.send({
         type: 'doc_create',
+        request_id: this.writeRequestId(filePath),
         doc_uuid: filePath,
         snapshot,
         peer_id: this.settings.peerId,
@@ -330,18 +338,15 @@ export class PushHandler {
    */
   resendPendingDeletes(skipPaths: ReadonlySet<string> = new Set()): void {
     if (this.pendingDeletes.size === 0) return;
-    let sent = false;
     for (const [path, state] of this.pendingDeletes) {
-      if (state.acked) continue;
+      if (state.acked || state.attempted) continue;
       if (skipPaths.has(path)) {
         log(`${this.tag} skip pending delete resend for local recreate`, { path });
         continue;
       }
       log(`${this.tag} resending pending delete`, { path });
-      this.sendDocDelete(path);
-      sent = true;
+      void this.sendDocDelete(state);
     }
-    if (sent) void this.persistJournal();
   }
 
   /**
@@ -361,8 +366,9 @@ export class PushHandler {
     tombstoneSet: ReadonlySet<string>,
     activeSet: ReadonlySet<string>,
   ): void {
+    void this.ownership.reconcile(activeSet).catch(err => warn(`${this.tag} ownership persist failed`, { err }));
     if (this.pendingDeletes.size === 0) return;
-    const nextPending = new Map<string, { acked: boolean }>();
+    const nextPending = new Map<string, DeleteJournalEntry>();
     const confirmed: string[] = [];
     const stillPending: string[] = [];
     const resurrected: string[] = [];
@@ -393,7 +399,7 @@ export class PushHandler {
         paths: stillPending,
       });
     }
-    void this.persistJournal();
+    this.persistJournalInBackground();
   }
 
   stopAllTimers(): void {
@@ -409,11 +415,78 @@ export class PushHandler {
    * Intentional trade: a lost in-flight delete reappears as a restored file
    * (the user deletes again); replaying it would kill a resurrection (data loss).
    */
-  private sendDocDelete(path: string): void {
-    this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId });
+  writeRequestId(path: string): string {
+    const id = nextRequestId();
+    this.ownership.track(id, path);
+    return id;
+  }
+
+  private newIntent(path: string): DeleteJournalEntry {
+    const owned = this.ownership.ownedTokens.get(path);
+    return { path, acked: false, intent_id: nextRequestId(), attempted: false,
+      token: owned === undefined ? { kind: 'unresolved' } : { kind: 'owned', value: owned } };
+  }
+
+  private ownsIntent(entry: DeleteJournalEntry): boolean {
+    return this.pendingDeletes.get(entry.path)?.intent_id === entry.intent_id;
+  }
+
+  async retireRejectedDelete(path: string, intentId: unknown): Promise<void> {
     const entry = this.pendingDeletes.get(path);
-    if (entry) entry.acked = true;
-    else this.pendingDeletes.set(path, { acked: true });
+    if (typeof intentId !== 'string' || entry?.intent_id !== intentId) {
+      warn(`${this.tag} ignoring unmatched delete_rejected`, { path });
+      return;
+    }
+    this.pendingDeletes.delete(path);
+    warn(`${this.tag} delete_rejected; retired exact intent`, { path, intentId });
+    await this.persistJournal();
+  }
+
+  private async sendDocDelete(entry: DeleteJournalEntry, sendAllowed = this.isWsOpen()): Promise<void> {
+    if (entry.acked || entry.attempted || this.runningDeletes.has(entry.intent_id)) return;
+    this.runningDeletes.add(entry.intent_id);
+    const path = entry.path;
+    try {
+      await this.persistJournal();
+      if (!this.ownsIntent(entry)) return;
+      if (!sendAllowed || !this.isWsOpen()) return;
+      const capability = this.deleteIncarnationCapable();
+      // Socket OPEN does not authorize legacy deletes. AuthOk MUST negotiate first.
+      if (capability === 'unknown') return;
+      if (entry.token.kind !== 'pinned') {
+        let expected: number | null;
+        if (capability === false) expected = null;
+        else if (entry.token.kind === 'owned') expected = entry.token.value;
+        else {
+          const resolved = await this.resolveDelete(path, null);
+          if (!this.ownsIntent(entry)) return;
+          if (resolved !== null && typeof resolved.incarnation !== 'number') {
+            throw new Error('capable server omitted delete incarnation');
+          }
+          expected = resolved === null ? 0 : resolved.incarnation!;
+        }
+        entry.token = { kind: 'pinned', value: expected };
+      }
+      await this.persistJournal(entry);
+      if (!this.ownsIntent(entry)) return;
+      if (entry.skip_cleanup !== true) {
+        await this.docs.removeAndClean(path);
+        if (!this.ownsIntent(entry)) return;
+        this.lastServerVV.delete(path);
+      }
+      await this.ownership.remove(path);
+      if (!this.ownsIntent(entry)) return;
+      this.send({ type: 'doc_delete', doc_uuid: path, peer_id: this.settings.peerId,
+        expected_incarnation: entry.token.value, intent_id: entry.intent_id,
+        request_id: this.writeRequestId(path) });
+      entry.acked = true;
+      await this.persistJournal();
+      if (!this.ownsIntent(entry)) return;
+    } catch (err) {
+      if (this.ownsIntent(entry)) warn(`${this.tag} delete deferred after failure`, { path, err });
+    } finally {
+      this.runningDeletes.delete(entry.intent_id);
+    }
   }
 
   /**
@@ -444,6 +517,7 @@ export class PushHandler {
   }
 
   private async pushFileDeltaAsync(path: string, content: string): Promise<void> {
+    this.admitRecreation(path);
     // Prefer fresh editor content over potentially stale disk content.
     const freshEditorContent = this.editor.readCurrentContent(path);
     if (freshEditorContent !== null) content = freshEditorContent;
@@ -495,6 +569,7 @@ export class PushHandler {
         log(`${this.tag} sync_push`, { path, version: doc.version(), deltaLen: delta.length });
         this.send({
           type: 'sync_push',
+          request_id: this.writeRequestId(path),
           doc_uuid: path,
           delta,
           peer_id: this.settings.peerId,

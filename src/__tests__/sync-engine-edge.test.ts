@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // vi.hoisted() runs before imports and vi.mock factories — no TDZ errors.
 const {
@@ -146,7 +146,7 @@ const makeApp = () =>
     },
   }) as any;
 
-const flush = async (n = 20) => {
+const flush = async (n = 100) => {
   for (let i = 0; i < n; i++) await Promise.resolve();
 };
 
@@ -179,10 +179,20 @@ describe('SyncEngine — edge cases (S34)', () => {
     engine = new SyncEngine(makeApp(), makeSettings());
   });
 
+  afterEach(() => { (engine as any).stopHeartbeat(); });
+
+  // Delete tests MUST negotiate legacy capability explicitly before expecting sends.
+  const openAndAuth = () => {
+    engine.onInitialSync = vi.fn();
+    mockWsInstance.onopen!({} as Event);
+    fireMessage({ type: 'auth_ok', protocol_version: 1 });
+  };
+
   // ── offline delete queued and sent on reconnect ────────────────────────────
 
   it('offline delete queued and sent on reconnect', async () => {
     await engine.start();
+    openAndAuth();
 
     // Go offline
     mockWsInstance.readyState = 3; // CLOSED
@@ -208,6 +218,7 @@ describe('SyncEngine — edge cases (S34)', () => {
       tombstones: [],
     });
     await syncPromise;
+    await flush();
 
     const deleteCallsAfter = mockEncode.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'offline-del.md'
@@ -219,6 +230,7 @@ describe('SyncEngine — edge cases (S34)', () => {
 
   it('online delete then same-path edit sends replace doc_create and clears journal', async () => {
     await engine.start();
+    openAndAuth();
     mockWsInstance.readyState = 1;
 
     engine.onFileDeleted('Untitled.md');
@@ -302,6 +314,7 @@ describe('SyncEngine — edge cases (S34)', () => {
 
   it('offline rename = delete + push on reconnect', async () => {
     await engine.start();
+    openAndAuth();
 
     // Go offline
     mockWsInstance.readyState = 3;
@@ -327,6 +340,7 @@ describe('SyncEngine — edge cases (S34)', () => {
       tombstones: [],
     });
     await syncPromise;
+    await flush(); // Delete pin and ownership removal are durable before send.
 
     const deleteCalls = mockEncode.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'doc_delete' && c[0]?.doc_uuid === 'old.md'
@@ -409,6 +423,7 @@ describe('SyncEngine — edge cases (S34)', () => {
 
     await engine.start();
 
+    warnSpy.mockClear(); // Ownership-cache load warning is independent of this broadcast.
     // Simulate a broadcast where text grows significantly
     mockDocInstance.get_text
       .mockReturnValueOnce('short')           // textBefore
@@ -439,6 +454,7 @@ describe('SyncEngine — edge cases (S34)', () => {
 
   it('pending deletes cleared after initial sync', async () => {
     await engine.start();
+    openAndAuth();
 
     // Queue deletes while offline
     mockWsInstance.readyState = 3;
@@ -460,6 +476,7 @@ describe('SyncEngine — edge cases (S34)', () => {
       tombstones: [],
     });
     await syncPromise;
+    await flush();
 
     const deleteCalls = mockEncode.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'doc_delete'
@@ -515,6 +532,7 @@ describe('SyncEngine — edge cases (S34)', () => {
     // Rebuild engine so start() picks up the preloaded journal.
     engine = new SyncEngine(makeApp(), makeSettings());
     await engine.start();
+    openAndAuth();
 
     mockVault.getMarkdownFiles.mockReturnValue([]);
     const syncPromise = engine.initialSync();
@@ -526,6 +544,7 @@ describe('SyncEngine — edge cases (S34)', () => {
       tombstones: [],
     });
     await syncPromise;
+    await flush();
 
     // Unacked ghost path is still live → resend after request_doc_list, not before.
     const deleteCalls = mockEncode.mock.calls.filter(
@@ -545,6 +564,7 @@ describe('SyncEngine — edge cases (S34)', () => {
 
   it('online delete keeps journal entry until reconcile (WS open)', async () => {
     await engine.start();
+    openAndAuth();
     mockWsInstance.readyState = 1; // OPEN
 
     engine.onFileDeleted('online-del.md');
@@ -584,12 +604,14 @@ describe('SyncEngine — edge cases (S34)', () => {
     mockVault.getMarkdownFiles.mockReturnValue([]);
     const syncPromise = engine.initialSync();
     await flush();
+    openAndAuth();
     fireMessage({
       type: 'doc_list',
       docs: [{ doc_uuid: 'resent.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' }],
       tombstones: [],
     });
     await syncPromise;
+    await flush();
 
     const sentTypes = mockEncode.mock.calls.map((c: any[]) => c[0]?.type);
     const deleteIdx = sentTypes.indexOf('doc_delete');
@@ -655,12 +677,14 @@ describe('SyncEngine — edge cases (S34)', () => {
     mockVault.getMarkdownFiles.mockReturnValue([]);
     const syncPromise = engine.initialSync();
     await flush();
+    openAndAuth();
     fireMessage({
       type: 'doc_list',
       docs: [{ doc_uuid: 'active.md', updated_at: '2026-04-07T00:00:00Z', vv_json: '{}' }],
       tombstones: [],
     });
     await syncPromise;
+    await flush();
 
     // Resend happened
     const deleteCalls = mockEncode.mock.calls.filter(
@@ -739,6 +763,7 @@ describe('SyncEngine — edge cases (S34)', () => {
     mockVault.getMarkdownFiles.mockReturnValue([]);
     const syncPromise = engine.initialSync();
     await flush();
+    openAndAuth();
     fireMessage({
       type: 'doc_list',
       docs: [
