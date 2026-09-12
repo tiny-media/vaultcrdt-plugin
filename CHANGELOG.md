@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-11
+
+### Added
+- **Incarnation-guarded deletes (ADR 0006)**, client side against server
+  v0.5.0+: deletes carry `expected_incarnation`/`intent_id`/`request_id`.
+  Ownership tokens come only from echoed ack grants (persisted ownership
+  cache; doc lists, sync answers and broadcasts never authorize). Unresolved
+  intents resolve fresh via SyncStart (absence = 0); legacy unconditional
+  deletes happen only after a connection negotiated incapability (three
+  capability states — unknown defers, never pins). The delete journal gains
+  intent fencing with a durable pin-and-attempt mark BEFORE the first send;
+  every await is fenced against the exact intent. Accepted local recreations
+  invalidate a pending delete at admission (create/change before the file
+  read, rename targets likewise, initial sync at the recreate snapshot,
+  push entry before the echo/text-match shortcuts) and preserve the
+  replace-tombstone routing; case-only rename intents persist a skip-cleanup
+  flag so crash replay cannot destroy the not-yet-moved document.
+  `delete_rejected` retires the exact intent only.
+
+### Fixed
+- **Single-flight document loading** in DocumentManager: concurrent loads
+  of the same path share one promise instead of racing duplicated
+  WASM/IO work (fix queue S1-F2).
+
 ## [0.5.13] - 2026-09-08
 
 ### Security
