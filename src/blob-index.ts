@@ -59,7 +59,7 @@ function isCandidate(value: unknown): value is Record<string, unknown> & { key: 
 
 const BACKUP = 'blob-index.bak';
 const QUARANTINE = 'blob-index.corrupt.json';
-const emptyFile = (): BlobIndexFile => ({ v: 2, c: 0, paths: Object.create(null) });
+const emptyFile = (): BlobIndexFile => ({ v: 2, c: 0, paths: Object.create(null) as Record<string, BlobIndexEntry> });
 const nonNegativeInteger = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && Number.isInteger(n) && n >= 0;
 function validDecision(d: unknown): d is PendingDecision {
   if (!isRecord(d) || !nonNegativeInteger(d.seq) || !nonNegativeInteger(d.generation)) return false;
@@ -289,7 +289,7 @@ export class BlobIndex {
       if (actual === null || !(await validateIndexFile(actual, ready)).ok || actual !== text) {
         throw new Error('readback invalid or unequal');
       }
-    } catch (error) { throw new Error(`${stage}: ${String(error)}`); }
+    } catch (error) { throw new Error(`${stage}: ${String(error)}`, { cause: error }); }
   }
 
   private async step(snapshot: string): Promise<void> {

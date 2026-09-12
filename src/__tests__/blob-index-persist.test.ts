@@ -74,7 +74,7 @@ describe('v2 cursor and decisions', () => {
       if (!validated.ok) throw Error(validated.reason);
       expect(validated.file.paths['a.png'].pendingDecision).toEqual(del);
       expect(validated.file.paths['b.png'].pendingDecision).toEqual(rep);
-      const restart = rig(r.files.get(name)!);
+      const restart = rig(r.files.get(name));
       await restart.index.load();
       expect(restart.index.get('a.png')?.pendingDecision).toEqual(del);
       expect(restart.index.get('b.png')?.pendingDecision).toEqual(rep);

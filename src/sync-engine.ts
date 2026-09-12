@@ -751,7 +751,7 @@ export class SyncEngine {
 
       case 'doc_deleted':
         if (typeof msg.doc_uuid === 'string') {
-          void this.ownership.remove(msg.doc_uuid).catch(err => warn(`${this.tag} ownership persist failed`, { err }));
+          void this.ownership.remove(msg.doc_uuid).catch((err: unknown) => warn(`${this.tag} ownership persist failed`, { err }));
         }
         if (this.initialSyncRunning) {
           log(`${this.tag} delete queued (initialSync running)`, { doc: msg.doc_uuid });
@@ -780,13 +780,13 @@ export class SyncEngine {
       case 'delete_rejected':
         this.ownership.forgetRequest(msg.request_id);
         if (typeof msg.doc_uuid === 'string') {
-          void this.ownership.remove(msg.doc_uuid).catch(err => warn(`${this.tag} ownership persist failed`, { err }));
-          void this.push.retireRejectedDelete(msg.doc_uuid, msg.intent_id).catch(err => warn(`${this.tag} delete retirement persist failed`, { err }));
+          void this.ownership.remove(msg.doc_uuid).catch((err: unknown) => warn(`${this.tag} ownership persist failed`, { err }));
+          void this.push.retireRejectedDelete(msg.doc_uuid, msg.intent_id).catch((err: unknown) => warn(`${this.tag} delete retirement persist failed`, { err }));
         }
         break;
 
       case 'ack':
-        void this.ownership.grant(msg.request_id, msg.incarnation).catch(err => warn(`${this.tag} ownership grant persist failed`, { err }));
+        void this.ownership.grant(msg.request_id, msg.incarnation).catch((err: unknown) => warn(`${this.tag} ownership grant persist failed`, { err }));
         this.setStatus('connected');
         break;
 

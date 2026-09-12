@@ -767,7 +767,7 @@ export class BlobUploader {
         }
         if (p === fence) break;
         for (const s of states) {
-          if (s.seq > fence!) break walk;
+          if (s.seq > fence) break walk;
           if (s.state === 'deleted') {
             const path = (typeof s.path_key === 'string' ? this.deps.index.pathForKey(s.path_key) : undefined)
               ?? s.display_path;

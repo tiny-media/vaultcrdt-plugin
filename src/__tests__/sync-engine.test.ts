@@ -244,7 +244,7 @@ describe('SyncEngine', () => {
       engine.onInitialSync = vi.fn();
       await engine.start();
       openAndAuth();
-      const persist = vi.spyOn(internal.docs, 'persistAll').mockImplementation(() => new Promise(() => {}));
+      const persist = vi.spyOn(internal.docs as { persistAll: () => Promise<void> }, 'persistAll').mockImplementation(() => new Promise(() => {}));
       const rejected = vi.fn();
       const pending = internal.requestSyncStart('x.md', null).catch(rejected);
       let stopped = false;
@@ -4376,8 +4376,8 @@ describe('SyncEngine', () => {
       const ctx = await startContainmentEngine(['doomed.md']);
       const internal = engine as any;
       let release!: (value: null) => void;
-      const probe = vi.spyOn(internal, 'probeServerDoc')
-        .mockImplementation(() => new Promise(resolve => { release = resolve; }));
+      const probe = vi.spyOn(internal as { probeServerDoc: (p: string) => Promise<unknown> }, 'probeServerDoc')
+        .mockImplementation(() => new Promise<unknown>(resolve => { release = resolve; }));
       const task = internal.handleDocTombstoned('doomed.md');
       ctx.stat.mtime++;
       release(null);
@@ -4475,7 +4475,7 @@ describe('SyncEngine', () => {
       const internal = engine as any;
       let release!: (value: any) => void;
       let resumed = false;
-      vi.spyOn(internal, 'probeServerDoc').mockImplementation(async () => {
+      vi.spyOn(internal as { probeServerDoc: (p: string) => Promise<unknown> }, 'probeServerDoc').mockImplementation(async (): Promise<unknown> => {
         const value = await new Promise(resolve => { release = resolve; });
         resumed = true;
         return value;
@@ -4518,7 +4518,7 @@ describe('SyncEngine', () => {
       const ctx = await startContainmentEngine(['doomed.md']);
       const internal = engine as any;
       let release!: (value: boolean) => void;
-      vi.spyOn(internal, 'tombstoneRefusalIsStale').mockImplementation(() => new Promise(resolve => { release = resolve; }));
+      vi.spyOn(internal as { tombstoneRefusalIsStale: (p: string) => Promise<boolean> }, 'tombstoneRefusalIsStale').mockImplementation(() => new Promise<boolean>(resolve => { release = resolve; }));
       const trace = vi.spyOn(internal.trace, 'markPath');
       const task = internal.handleDocTombstoned('doomed.md');
       // Complete the restart FIRST so the resumed continuation is caught by
@@ -4763,7 +4763,7 @@ describe('SyncEngine', () => {
       add.mockClear();
       renameFile.mockClear();
       notices.length = 0;
-      const getOrLoad = vi.spyOn((engine as any).docs, 'getOrLoad');
+      const getOrLoad = vi.spyOn((engine as any).docs as { getOrLoad: (p: string) => Promise<unknown> }, 'getOrLoad');
       return { renameFile, add, getOrLoad, stat };
     };
 

@@ -247,7 +247,7 @@ export class PushHandler {
   }
 
   private persistJournalInBackground(): void {
-    void this.persistJournal().catch(err => warn(`${this.tag} delete journal persist failed`, { err }));
+    void this.persistJournal().catch((err: unknown) => warn(`${this.tag} delete journal persist failed`, { err }));
   }
 
   /** Cancel disjoint local edits without sending them to the server. */
@@ -366,7 +366,7 @@ export class PushHandler {
     tombstoneSet: ReadonlySet<string>,
     activeSet: ReadonlySet<string>,
   ): void {
-    void this.ownership.reconcile(activeSet).catch(err => warn(`${this.tag} ownership persist failed`, { err }));
+    void this.ownership.reconcile(activeSet).catch((err: unknown) => warn(`${this.tag} ownership persist failed`, { err }));
     if (this.pendingDeletes.size === 0) return;
     const nextPending = new Map<string, DeleteJournalEntry>();
     const confirmed: string[] = [];

@@ -18,11 +18,16 @@ export class OwnershipCache {
     try {
       const raw = await this.storage.readRaw(OWNERSHIP_CACHE_FILE);
       if (raw === null) throw new Error('missing ownership cache');
-      const entries: unknown = JSON.parse(raw);
-      if (!Array.isArray(entries) || !entries.every(e =>
-        e && typeof e.path === 'string' && typeof e.token === 'number' && Number.isFinite(e.token),
-      )) throw new Error('corrupt ownership cache');
-      for (const { path, token } of entries) this.ownedTokens.set(path, token);
+      const parsed: unknown = JSON.parse(raw);
+      const isEntry = (e: unknown): e is { path: string; token: number } =>
+        typeof e === 'object' && e !== null &&
+        typeof (e as { path?: unknown }).path === 'string' &&
+        typeof (e as { token?: unknown }).token === 'number' &&
+        Number.isFinite((e as { token?: unknown }).token);
+      if (!Array.isArray(parsed) || !parsed.every(isEntry)) {
+        throw new Error('corrupt ownership cache');
+      }
+      for (const { path, token } of parsed) this.ownedTokens.set(path, token);
     } catch (err) {
       warn('[VCRDT] ownership cache unavailable; resolving deletes instead', { err });
     }

@@ -58,7 +58,7 @@ function fixture(files = new Map<string, string>(), authenticated = true) {
   if (authenticated) receive({ type: 'auth_ok', capabilities: ['delete_incarnation'] });
   const push = (engine as any).push;
   const docs = (engine as any).docs;
-  const clean = vi.spyOn(docs, 'removeAndClean');
+  const clean = vi.spyOn(docs as { removeAndClean: (p: string) => Promise<void> }, 'removeAndClean');
   const deletes = () => frames.filter(f => f.type === 'doc_delete');
   const starts = () => frames.filter(f => f.type === 'sync_start');
   const entry = (): DeleteJournalEntry => push.pendingDeletes.get('a.md');

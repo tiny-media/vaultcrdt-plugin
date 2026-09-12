@@ -13,7 +13,7 @@ function setup(pages: Record<string, unknown>[]) {
   const uploader = new BlobUploader({ listFiles: async () => [], index, serverUrl: () => '', peerId: () => '', getJwt: async () => '',
     blobsEnabled: async () => true, stat: async () => null, readBinary: async () => new ArrayBuffer(0),
     writeBinary: async () => {}, notify: () => {}, isMobile: false });
-  const http = vi.spyOn(uploader as any, 'http').mockImplementation(async () => ({ json: pages.shift() }));
+  const http = vi.spyOn(uploader as unknown as { http: (...args: unknown[]) => Promise<{ json: unknown }> }, 'http').mockImplementation(async () => ({ json: pages.shift() }));
   return { index, uploader, http, storage };
 }
 const row = (seq: number) => ({ seq, state: 'live', path_key: 'ignored' });
